@@ -66,6 +66,11 @@ async def build_strategy_endpoint(
         return await build_strategy_from_description(payload.description, payload.market, payload.timeframe, ai_client)
     except AIUnavailableError as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+    except ValueError as exc:
+        # The AI responded but its content wasn't usable (bad JSON, or JSON
+        # that fails the Strategy DSL schema) — not our fault, not the
+        # caller's; a bad gateway to the upstream AI provider.
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
     except StrategyBuilderError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
 

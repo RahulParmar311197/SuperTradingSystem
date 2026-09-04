@@ -3,13 +3,18 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 
+import bcrypt
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 
 from app.core.config import get_settings
 
 settings = get_settings()
-_pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# bcrypt's underlying algorithm silently ignores any bytes past 72 — reject
+# rather than truncate, so two different long passwords can never hash the
+# same way. Enforced here (not just at the request-schema layer) because
+# this function is the actual security boundary.
+_MAX_PASSWORD_BYTES = 72
 
 
 class TokenType(StrEnum):
@@ -17,12 +22,22 @@ class TokenType(StrEnum):
     REFRESH = "refresh"
 
 
+class PasswordTooLongError(ValueError):
+    pass
+
+
 def hash_password(password: str) -> str:
-    return _pwd_context.hash(password)
+    encoded = password.encode("utf-8")
+    if len(encoded) > _MAX_PASSWORD_BYTES:
+        raise PasswordTooLongError(f"Password must be at most {_MAX_PASSWORD_BYTES} bytes")
+    return bcrypt.hashpw(encoded, bcrypt.gensalt()).decode("utf-8")
 
 
 def verify_password(password: str, password_hash: str) -> bool:
-    return _pwd_context.verify(password, password_hash)
+    encoded = password.encode("utf-8")
+    if len(encoded) > _MAX_PASSWORD_BYTES:
+        return False
+    return bcrypt.checkpw(encoded, password_hash.encode("utf-8"))
 
 
 def _create_token(

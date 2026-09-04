@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from enum import StrEnum
 
-from sqlalchemy import Enum, ForeignKey, JSON, String
+from sqlalchemy import DateTime, Enum, ForeignKey, JSON, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -63,7 +63,7 @@ class UserSession(Base):
     refresh_token_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     device_info: Mapped[str | None] = mapped_column(String(500))
     revoked: Mapped[bool] = mapped_column(default=False)
-    expires_at: Mapped[datetime] = mapped_column(nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
     created_at: Mapped[datetime] = created_at_col()
 

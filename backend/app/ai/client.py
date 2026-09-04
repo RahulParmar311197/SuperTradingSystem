@@ -1,7 +1,8 @@
 """Pluggable AI client interface (blueprint §21 "Use an LLM for..." / §110
-"AI Failure"). No provider is wired up in this environment — supply an
-API key and a concrete `AIClient` implementation before enabling AI
-features in production."""
+"AI Failure"). Set AI_PROVIDER=anthropic and AI_API_KEY to enable the
+Claude-backed implementation (app.ai.providers.anthropic_client); with no
+key configured, `get_ai_client` returns `NullAIClient`, which fails closed
+per §110 ("no AI -> no trade") rather than faking a response."""
 
 from __future__ import annotations
 
@@ -33,6 +34,10 @@ class NullAIClient(AIClient):
 def get_ai_client(settings: Settings) -> AIClient:
     if settings.ai_provider == "none" or not settings.ai_api_key:
         return NullAIClient()
+    if settings.ai_provider == "anthropic":
+        from app.ai.providers.anthropic_client import AnthropicAIClient
+
+        return AnthropicAIClient(api_key=settings.ai_api_key, model=settings.ai_model)
     raise NotImplementedError(
         f"AI provider '{settings.ai_provider}' has no adapter implemented yet. "
         "Implement an AIClient subclass for it before enabling AI features."

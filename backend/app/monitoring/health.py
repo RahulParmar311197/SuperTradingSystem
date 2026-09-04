@@ -7,7 +7,8 @@ from enum import StrEnum
 from fastapi import APIRouter
 from sqlalchemy import text
 
-from app.database.session import engine
+from app.core.redis import ping as redis_ping
+from app.database.session import get_engine
 
 router = APIRouter(tags=["monitoring"])
 
@@ -21,7 +22,7 @@ class ComponentStatus(StrEnum):
 
 async def check_database() -> ComponentStatus:
     try:
-        async with engine.connect() as conn:
+        async with get_engine().connect() as conn:
             await conn.execute(text("SELECT 1"))
         return ComponentStatus.HEALTHY
     except Exception:
@@ -29,17 +30,7 @@ async def check_database() -> ComponentStatus:
 
 
 async def check_redis() -> ComponentStatus:
-    try:
-        import redis.asyncio as aioredis
-
-        from app.core.config import get_settings
-
-        client = aioredis.from_url(get_settings().redis_url, socket_connect_timeout=1)
-        await client.ping()
-        await client.aclose()
-        return ComponentStatus.HEALTHY
-    except Exception:
-        return ComponentStatus.DOWN
+    return ComponentStatus.HEALTHY if await redis_ping() else ComponentStatus.DOWN
 
 
 @router.get("/health")

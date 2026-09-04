@@ -15,7 +15,7 @@ android/           Android app scaffold (package structure only)
 infrastructure/    nginx/monitoring config examples (not yet wired in)
 scripts/           dev helper scripts
 docs/              architecture/status notes
-docker-compose.yml api + postgres + redis for local dev
+docker-compose.yml api + worker + postgres + redis for local dev
 ```
 
 ## Quickstart (backend)

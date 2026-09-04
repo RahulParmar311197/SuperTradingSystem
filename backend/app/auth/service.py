@@ -14,6 +14,7 @@ from app.auth.security import (
     hash_token,
     verify_password,
 )
+from app.core.audit import record_audit
 from app.core.config import get_settings
 from app.database.models.users import User, UserSession
 from app.users.service import create_user, get_user_by_email, get_user_by_id
@@ -31,6 +32,7 @@ async def register(db: AsyncSession, email: str, password: str, name: str) -> Us
         raise AuthError("An account with this email already exists")
     user = await create_user(db, email=email, password_hash=hash_password(password), name=name)
     await db.commit()
+    await record_audit(db, actor="user", action="user.registered", user_id=user.id, details={"email": email})
     return user
 
 
@@ -57,8 +59,11 @@ async def login(
 ) -> tuple[str, str]:
     user = await get_user_by_email(db, email)
     if user is None or not verify_password(password, user.password_hash):
+        await record_audit(db, actor="user", action="login.failed", details={"email": email})
         raise AuthError("Invalid email or password")
-    return await _issue_tokens(db, user, device_info=device_info)
+    tokens = await _issue_tokens(db, user, device_info=device_info)
+    await record_audit(db, actor="user", action="login.succeeded", user_id=user.id)
+    return tokens
 
 
 async def refresh(db: AsyncSession, refresh_token: str) -> tuple[str, str]:

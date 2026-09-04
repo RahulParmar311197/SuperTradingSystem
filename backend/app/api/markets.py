@@ -7,21 +7,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.dependencies import get_current_user
+from app.core.redis import get_latest_price
 from app.database.models.instruments import Instrument, MarketType
 from app.database.models.users import User
 from app.database.session import get_db
 from app.market.repository import get_candles
 
 router = APIRouter(tags=["markets"])
-
-# Simple in-process last-traded-price cache, populated by whatever feed is
-# running (see app.market.feed). A single-process dev deployment only —
-# swap for Redis (per blueprint §65) once running multiple workers.
-_LATEST_QUOTES: dict[str, float] = {}
-
-
-def set_latest_quote(symbol: str, ltp: float) -> None:
-    _LATEST_QUOTES[symbol] = ltp
 
 
 @router.get("/markets")
@@ -102,4 +94,4 @@ async def get_candles_endpoint(
 
 @router.get("/quotes")
 async def get_quotes(symbols: list[str] = Query(...), user: User = Depends(get_current_user)) -> dict[str, float | None]:
-    return {symbol: _LATEST_QUOTES.get(symbol) for symbol in symbols}
+    return {symbol: await get_latest_price(symbol) for symbol in symbols}

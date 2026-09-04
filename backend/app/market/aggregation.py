@@ -8,7 +8,7 @@ from app.market.timeframes import is_valid_upsample, timeframe_to_minutes
 from app.smc.types import Candle
 
 
-def _bucket_start(timestamp: datetime, target_minutes: int) -> datetime:
+def bucket_start(timestamp: datetime, target_minutes: int) -> datetime:
     epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
     minutes_since_epoch = int((timestamp - epoch).total_seconds() // 60)
     bucket_index = minutes_since_epoch // target_minutes
@@ -38,16 +38,16 @@ def resample_candles(candles: list[Candle], source_timeframe: str, target_timefr
     target_minutes = timeframe_to_minutes(target_timeframe)
     buckets: dict[datetime, list[Candle]] = {}
     for candle in candles:
-        bucket = _bucket_start(candle.timestamp, target_minutes)
+        bucket = bucket_start(candle.timestamp, target_minutes)
         buckets.setdefault(bucket, []).append(candle)
 
     result = []
-    for bucket_start in sorted(buckets):
-        group = sorted(buckets[bucket_start], key=lambda c: c.timestamp)
+    for bucket_ts in sorted(buckets):
+        group = sorted(buckets[bucket_ts], key=lambda c: c.timestamp)
         aggregated = aggregate_candles(group)
         result.append(
             Candle(
-                timestamp=bucket_start,
+                timestamp=bucket_ts,
                 open=aggregated.open,
                 high=aggregated.high,
                 low=aggregated.low,

@@ -29,6 +29,7 @@ class Settings(BaseSettings):
 
     ai_api_key: str | None = None
     ai_provider: str = "none"
+    ai_model: str = "claude-sonnet-4-5"
 
     dhan_client_id: str | None = None
     dhan_secret: str | None = None
@@ -36,7 +37,11 @@ class Settings(BaseSettings):
     upstox_client_id: str | None = None
     upstox_secret: str | None = None
 
-    cors_origins: list[str] = ["*"]
+    # Empty by default — deny cross-origin browser requests until an
+    # operator explicitly lists allowed origins. JWTs travel in the
+    # Authorization header (not cookies), so credentialed CORS isn't
+    # needed even once origins are configured.
+    cors_origins: list[str] = []
 
 
 @lru_cache

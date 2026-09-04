@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.security import InvalidTokenError, TokenType, decode_token
 from app.database.session import get_db
-from app.database.models.users import User, UserStatus, TradingPermission
+from app.database.models.users import TradingPermission, User, UserRole, UserStatus
 from app.users.service import get_user_by_id
 
 _bearer_scheme = HTTPBearer(auto_error=False)
@@ -38,3 +38,11 @@ def require_permission(permission: TradingPermission):
         return user
 
     return _checker
+
+
+async def require_admin(user: User = Depends(get_current_user)) -> User:
+    """Blueprint §115-116: an admin dashboard exists for monitoring, not
+    for every authenticated user."""
+    if user.role != UserRole.ADMIN:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Admin role required")
+    return user

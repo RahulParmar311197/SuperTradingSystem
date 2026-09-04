@@ -18,6 +18,14 @@ class RiskLimits:
     max_exposure_pct: float = 100.0
     max_position_size: float | None = None
     max_strategy_allocation_pct: float = 100.0
+    # Blueprint §85 "Correlation Engine": reject a new position when its
+    # notional plus every existing position correlated with it (at or
+    # above correlation_threshold) exceeds this share of the account.
+    # 100% is a no-op default — correlation data isn't always available
+    # (see app.risk.correlation), and this must never silently block
+    # trading where it hasn't been computed.
+    max_correlated_exposure_pct: float = 100.0
+    correlation_threshold: float = 0.7
 
     # System-level
     market_data_max_staleness_seconds: float = 10.0

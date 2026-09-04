@@ -8,7 +8,7 @@ what's built, that file is about what's actually safe to turn on.
 
 | Stage | Blueprint area | Status |
 |---|---|---|
-| 0 | Architecture | Backend scaffolded (`backend/app/*`), repo layout matches §129. Structured logging, request-id tracing, Prometheus `/metrics`, a startup health check (lifespan), audit logging (`audit_logs`, `risk_events`), and CI (`.github/workflows/ci.yml`, runs the full suite against Postgres/Redis on every push/PR) are wired in — see §72/§71. |
+| 0 | Architecture | Backend scaffolded (`backend/app/*`), repo layout matches §129. Structured logging, request-id tracing, Prometheus `/metrics`, a startup health check (lifespan), audit logging (`audit_logs`, `risk_events`), and CI (`.github/workflows/ci.yml`, runs the full suite against Postgres/Redis on every push/PR) are wired in — see §72/§71. `GET /health` now reports real **worker liveness** (blueprint §117 "Workers 🟢"): each of the `market_data`, `scanner`, and `auto_trade` loops in `app/workers/main.py` refreshes a short-TTL Redis heartbeat every pass (`app.core.redis.heartbeat`), so a stuck or never-started worker process reads `DOWN` honestly instead of an assumed `HEALTHY`. An **admin dashboard** (`app/api/admin.py`, blueprint §115-116) exposes users, broker connections (never `encrypted_credentials`), orders, risk events, and this same worker/component health, gated on `UserRole.ADMIN`. |
 | 1 | Market data | `app/market`: normalization, timeframe/candle aggregation, simulated feed. `app/workers/market_data_worker.py` + `candle_worker.py` consume a feed, update the Redis latest-price cache, persist closed candles, derive higher timeframes, and publish on `/ws/market` + `/ws/chart`. No *live* broker feed yet — `app/workers/main.py` runs these against `SimulatedFeed` with no data source configured, so the worker process is a real, tested pipeline waiting on a real feed. |
 | 2 | SMC/ICT | `app/smc`, `app/ict`: swings, BOS/CHoCH/MSS, liquidity + sweeps, FVG, order blocks, premium/discount, kill zones, opening ranges. Fully unit-tested, look-ahead safe by construction. |
 | 3 | Replay | `app/replay`: clock + manual BUY/SELL/SL/TP/CLOSE, statistics. Look-ahead safety proven by test (`tests/replay/test_engine.py`). Exposed over REST (`app/api/replay.py`) with a per-session in-memory store. |
@@ -19,6 +19,29 @@ what's built, that file is about what's actually safe to turn on.
 | 8 | Dhan/Upstox | `app/brokers/dhan`: adapter skeleton, every HTTP call still a `NotImplementedError` TODO. **`app/brokers/upstox` is a real implementation** — OAuth2 authorization-code flow (`app/brokers/upstox/oauth.py`, plus `GET /brokers/upstox/authorize` and `/callback`), and `UpstoxBroker` implements every `Broker` method against Upstox's documented v2 API. Built from search-result snippets, not a fetched/verified copy of the live docs (this sandbox's egress to upstox.com is blocked) — tested against a mocked HTTP transport (`tests/brokers/test_upstox_adapter.py`), **never against Upstox's real servers**. Verify every endpoint/field/status-string against the live docs or Postman collection before connecting a real account. |
 | 9 | Controlled live trading | `app/api/orders.py` exercises the full risk-gate -> execution -> position flow (currently against `MockBroker` — no live broker wired to a real account balance yet). Gated behind the `LIVE_TRADE` trading permission (blueprint §88), which — like `AUTO_TRADE` — isn't granted at registration; a user opts in via `POST /trading-permissions/grant` (`confirm: true`). Every order/fill is mirrored into Postgres (`app/trading/persistence.py`) into the real `orders`/`order_events`/`positions`/`trades` tables as it happens — a closing or reducing fill writes a `Trade` journal row (blueprint §61) the same way autonomous trading already did, and the risk engine's exposure check now sums real open-position notional instead of a hardcoded zero. Also: a Redis-backed **trading halt** checked before every order (`account_halt_reason`), real market-data-staleness lookups from the Redis price cache, and a **reconciliation worker** (`app/workers/reconciliation_worker.py`, blueprint §75) that compares local vs. broker state and halts new entries on any mismatch — resuming is a deliberate manual step, not automatic. `Order`/`Trade` rows carry `strategy_version` (blueprint §91) so a trade always names the exact strategy definition that produced it, even after the strategy is later edited (`PUT /strategies/{id}` bumps `version` rather than overwriting history). |
 | 10 | Autonomous trading | **The full loop runs now**, end-to-end, tested against real Postgres/Redis (`tests/workers/test_auto_trade_worker.py`): `ScannerWorker` runs WATCH/SCAN/DETECT; `AutoTradeSupervisor` (`app/workers/auto_trade_worker.py`) runs VALIDATE/RISK CHECK/TRADE/MONITOR/EXIT/JOURNAL for any (user, strategy) pair that has explicitly opted in — `user.auto_trading_enabled` (set only via `POST /auto-trading/enable` with `confirm: true`, blueprint §102) *and* the `AUTO_TRADE` permission *and* the strategy marked both `is_active` and `eligible_for_auto_trading`, checked against the Redis trading halt on every pass. It closes positions, writes a `Trade` journal row, and sends a notification. **This currently drives `MockBroker` for every account** (see Stage 9) — autonomous *paper* trading is real today; autonomous *live* trading needs a real broker wired to a real account first. |
+
+## Portfolio risk and the correlation engine (§85-86)
+
+Two pieces the blueprint calls out as their own engines, not folded into
+`app.risk.engine`'s per-trade checks:
+
+- **`app/risk/correlation.py`** — pure, DB-free math: Pearson correlation
+  from real close-to-close returns (`close_returns`, `pearson_correlation`,
+  `build_correlation_matrix`), and `correlated_exposure()` summing a
+  target position's notional plus every existing position correlated
+  with it at or above a configurable threshold. A pair with no computable
+  correlation (too little history, zero variance) contributes nothing —
+  this only flags concentration it has actual evidence for.
+- **`app/risk/portfolio.py`** — the integration layer: `compute_portfolio_exposure`
+  reads the real `positions` table for total exposure and a per-market-type
+  breakdown (exposed on `GET /portfolio`), and `compute_correlated_exposure`
+  fetches each open position's candle history (`app.market.repository.get_candles`)
+  to build a real correlation matrix before calling into `correlation.py`.
+- **`RiskEngine`** gained a `correlated_exposure_limit` check (blueprint
+  §85: "reject a new position when aggregate correlated exposure is too
+  high"), wired into `POST /orders`. `RiskLimits.max_correlated_exposure_pct`
+  defaults to 100% (a no-op) since correlation data isn't always available
+  and this must never silently block trading where it hasn't been computed.
 
 ## What's deliberately not implemented
 

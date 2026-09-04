@@ -148,6 +148,27 @@ async def account_halt_reason(account_id: str) -> str | None:
     return await get_redis().get(f"{_HALT_PREFIX}{account_id}")
 
 
+# --- Worker heartbeats (blueprint §117 "Workers 🟢") ----------------------
+#
+# The worker process (see app/workers/main.py) is separate from the API
+# process serving GET /health, so "is the scanner loop actually iterating"
+# has to be answered through shared state, same as the trading halt above.
+# A short TTL key that each worker's loop refreshes on every pass means a
+# stuck or crashed loop goes stale within one interval — no separate
+# liveness check to maintain.
+
+_HEARTBEAT_PREFIX = "heartbeat:worker:"
+_HEARTBEAT_TTL_SECONDS = 30
+
+
+async def heartbeat(worker_name: str) -> None:
+    await get_redis().set(f"{_HEARTBEAT_PREFIX}{worker_name}", "1", ex=_HEARTBEAT_TTL_SECONDS)
+
+
+async def worker_is_alive(worker_name: str) -> bool:
+    return await get_redis().exists(f"{_HEARTBEAT_PREFIX}{worker_name}") > 0
+
+
 # --- Rate limiting -------------------------------------------------------
 
 async def check_rate_limit(key: str, limit: int, window_seconds: int) -> bool:

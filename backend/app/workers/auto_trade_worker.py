@@ -32,7 +32,7 @@ from datetime import datetime
 from sqlalchemy import select
 
 from app.core.audit import record_audit
-from app.core.redis import account_halt_reason
+from app.core.redis import account_halt_reason, heartbeat
 from app.database.models.instruments import Instrument
 from app.database.models.strategy import Direction
 from app.database.models.strategy import Strategy as StrategyRow
@@ -202,4 +202,5 @@ class AutoTradeSupervisor:
                 await self.run_once()
             except Exception:
                 logger.exception("Auto-trade pass failed")
+            await heartbeat("auto_trade")
             await asyncio.sleep(self.interval_seconds)

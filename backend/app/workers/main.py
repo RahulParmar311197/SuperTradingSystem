@@ -17,6 +17,7 @@ import os
 import signal
 import uuid
 
+from app.core.redis import heartbeat
 from app.workers.auto_trade_worker import AutoTradeSupervisor
 from app.workers.candle_worker import CandleWorker
 from app.workers.market_data_worker import MarketDataWorker
@@ -40,6 +41,7 @@ async def _bridge_market_data_to_candles(market_worker: MarketDataWorker, candle
             await candle_worker.process_tick(tick)
         except Exception:
             logger.exception("Failed to process tick for %s", tick.symbol)
+        await heartbeat("market_data")
 
 
 async def main() -> None:

@@ -6,10 +6,17 @@ stays runnable anywhere.
 
 from __future__ import annotations
 
-import pytest
+import os
 
-from app.core.redis import get_redis
-from app.database.session import get_engine
+# Must be set before app.core.config.get_settings() is first called
+# (it's lru_cache'd) — every request in this suite shares one client "IP",
+# so a real rate limit would trip on test volume, not actual abuse.
+os.environ.setdefault("RATE_LIMIT_ENABLED", "false")
+
+import pytest  # noqa: E402
+
+from app.core.redis import get_redis  # noqa: E402
+from app.database.session import get_engine  # noqa: E402
 
 
 async def _postgres_available() -> bool:

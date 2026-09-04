@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from enum import StrEnum
 
-from sqlalchemy import DateTime, Enum, ForeignKey, JSON, String
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, JSON, Numeric, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -45,6 +45,15 @@ class User(Base):
     trading_permissions: Mapped[list[str]] = mapped_column(
         JSON, default=list
     )  # list[TradingPermission.value]
+
+    # Autonomous trading (blueprint §89, §102): OFF by default, and never
+    # flipped on by anything but an explicit user action — see
+    # app/api/auto_trading.py's `confirm: true` requirement.
+    auto_trading_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    auto_trading_risk_per_trade_pct: Mapped[float] = mapped_column(Numeric(6, 3), default=0.5, nullable=False)
+    auto_trading_daily_loss_limit_pct: Mapped[float] = mapped_column(Numeric(6, 3), default=2.0, nullable=False)
+    auto_trading_max_trades_per_day: Mapped[int] = mapped_column(Integer, default=10, nullable=False)
+    auto_trading_max_positions: Mapped[int] = mapped_column(Integer, default=5, nullable=False)
 
     created_at: Mapped[datetime] = created_at_col()
     updated_at: Mapped[datetime] = updated_at_col()

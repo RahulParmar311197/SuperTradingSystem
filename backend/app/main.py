@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from app.api import (
     ai,
     auth,
+    auto_trading,
     backtest,
     brokers,
     charts,
@@ -81,6 +82,7 @@ app.include_router(orders.router)
 app.include_router(positions.router)
 app.include_router(portfolio.router)
 app.include_router(brokers.router)
+app.include_router(auto_trading.router)
 app.include_router(websockets.router)
 
 

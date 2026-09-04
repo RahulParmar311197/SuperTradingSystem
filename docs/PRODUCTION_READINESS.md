@@ -21,7 +21,7 @@ money to this system.
 | Risk engine tested | ✅ | `tests/risk` — position sizing, all limit checks, kill switches |
 | Broker authentication tested | ⚠️ Partial | Upstox OAuth flow implemented and tested end-to-end (`tests/api/test_brokers_upstox_oauth.py`) with a mocked token endpoint — **never tested against Upstox's real servers** (no credentials, and this sandbox can't reach upstox.com). Dhan has no implementation at all yet. |
 | Order reconciliation tested | ⚠️ Partial | `ReconciliationWorker` + `app.trading.reconciliation` are tested (`tests/trading/test_reconciliation.py`, `tests/workers/test_reconciliation_worker.py`) — only against `MockBroker`, never a real broker's actual drift patterns |
-| Duplicate-order protection tested | ✅ | Idempotency keys, `tests/trading/test_execution.py` |
+| Duplicate-order protection tested | ✅ | Idempotency keys, `tests/trading/test_execution.py`; `POST /orders` now persists every order/fill to Postgres (`orders`/`order_events`/`positions`/`trades`, see `app/trading/persistence.py`) instead of only holding state in one API process's memory, and `tests/api/test_orders.py` proves a closing fill writes exactly one `Trade` journal row with the correct realized P&L |
 | Broker-disconnect handling tested | ⚠️ Partial | `broker_healthy` check + reconciliation-triggered halt exist and are tested against `MockBroker`; no real broker to actually disconnect from |
 | Market-data failure handling tested | ⚠️ Partial | Staleness check (`get_price_age_seconds`) is real and tested (`tests/test_core_redis.py`) against Redis; there's no live feed to actually go stale yet |
 | Kill switch tested | ✅ | Strategy/account/global — `tests/risk/test_engine.py` |
@@ -29,7 +29,7 @@ money to this system.
 | Paper trading successful | ✅ | `app/paper`, exercised end-to-end including inside the autonomous loop (`tests/workers/test_auto_trade_worker.py`) |
 | Out-of-sample testing completed | ⚠️ Mechanism exists, not "completed" | `POST /backtest/validate` runs train/validation/test splits — but this is a tool, not a result; no actual strategy has been through it against real market data |
 | Live trading limits configured | ❌ | No live account exists to configure limits *for* |
-| User explicitly enabled auto trading | ✅ (mechanism) | `POST /auto-trading/enable` requires `confirm: true` + the `AUTO_TRADE` permission — but it currently only ever drives `MockBroker`, so "enabling" it today enables autonomous **paper** trading, not real trading |
+| User explicitly enabled auto trading | ✅ (mechanism) | `POST /auto-trading/enable` requires `confirm: true` + the `AUTO_TRADE` permission, and `POST /orders` (manual live trading) now requires the `LIVE_TRADE` permission the same way — both are opted into via `POST /trading-permissions/grant` (`confirm: true`), never granted by default (`tests/api/test_trading_permissions.py`). It still only ever drives `MockBroker`, so "enabling" either today enables **paper** trading, not real trading |
 
 **Bottom line:** every item that can be verified without a live broker and
 live market data has been — with a real, running test, not a claim. The

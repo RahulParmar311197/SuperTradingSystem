@@ -21,6 +21,7 @@ from app.api import (
     replay,
     scanner,
     strategies,
+    trading_permissions,
     websockets,
 )
 from app.core.config import get_settings
@@ -83,6 +84,7 @@ app.include_router(positions.router)
 app.include_router(portfolio.router)
 app.include_router(brokers.router)
 app.include_router(auto_trading.router)
+app.include_router(trading_permissions.router)
 app.include_router(websockets.router)
 
 

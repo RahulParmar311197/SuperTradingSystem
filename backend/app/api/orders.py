@@ -2,36 +2,56 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth.dependencies import get_current_user
+from app.auth.dependencies import get_current_user, require_permission
 from app.brokers.mock import MockBroker
 from app.core.audit import record_audit
 from app.core.metrics import ORDER_COUNT, RISK_REJECTION_COUNT
 from app.core.redis import account_halt_reason, channel_name, get_price_age_seconds, publish
+from app.database.models.instruments import Instrument
 from app.database.models.risk import RiskDecision as RiskEventDecision
 from app.database.models.risk import RiskEvent
 from app.database.models.strategy import Direction
 from app.database.models.trading import OrderStatus, OrderType
-from app.database.models.users import User
+from app.database.models.users import TradingPermission, User
 from app.database.session import get_db
 from app.risk.engine import RiskEngine, TradeRiskProposal, calculate_position_size
 from app.risk.limits import RiskLimits
 from app.trading.execution import ExecutionEngine
 from app.trading.order_manager import OrderManager
+from app.trading.persistence import persist_order, persist_position, record_trade
 from app.trading.position_manager import PositionManager
 
 router = APIRouter(tags=["trading"])
 
 
-class _UserTradingStack:
-    """Per-user in-memory order/position/risk/broker stack.
+async def _get_instrument_by_symbol(db: AsyncSession, symbol: str) -> Instrument:
+    """Orders are persisted against a real `instruments` row (blueprint
+    §9-13), so the symbol must already be registered via
+    `POST /instruments` — this never silently creates one."""
+    instrument = (
+        await db.execute(select(Instrument).where(Instrument.symbol == symbol, Instrument.active.is_(True)))
+    ).scalar_one_or_none()
+    if instrument is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown instrument symbol: {symbol}")
+    return instrument
 
-    A real deployment persists orders/positions in Postgres and resolves
-    the broker from the user's connected `BrokerAccount` (Dhan/Upstox);
-    until those adapters are wired in (see app/brokers/dhan, app/brokers/upstox),
-    this uses `MockBroker` so the API surface and risk gate are exercisable
-    end-to-end today.
+
+class _UserTradingStack:
+    """Per-user order/position/risk/broker stack.
+
+    The order state machine and position math (`OrderManager`,
+    `PositionManager`) live in memory for the lifetime of the API process
+    — see `app.trading.persistence` for how their results get mirrored
+    into Postgres (`orders`/`order_events`/`positions`/`trades`) after
+    every transition, so a restart, the reconciliation worker, and the
+    trade journal (blueprint §61) all see real data. What's still missing
+    is a real broker: this resolves the broker from the user's connected
+    `BrokerAccount` (Dhan/Upstox) rather than always using `MockBroker`,
+    and until then the API surface and risk gate are only exercisable
+    end-to-end against the mock.
     """
 
     def __init__(self) -> None:
@@ -105,27 +125,33 @@ def _to_response(order) -> OrderResponse:
 
 @router.post("/orders", response_model=OrderResponse, status_code=status.HTTP_201_CREATED)
 async def place_order(
-    payload: PlaceOrderRequest, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
+    payload: PlaceOrderRequest,
+    user: User = Depends(require_permission(TradingPermission.LIVE_TRADE)),
+    db: AsyncSession = Depends(get_db),
 ) -> OrderResponse:
     halt_reason = await account_halt_reason(str(user.id))
     if halt_reason is not None:
         raise HTTPException(status.HTTP_423_LOCKED, f"New entries are halted for this account: {halt_reason}")
 
+    instrument = await _get_instrument_by_symbol(db, payload.symbol)
+
     stack = _stack_for(user)
     stack.broker.set_quote(payload.symbol, ltp=payload.entry)
 
     account = await stack.broker.get_account()
+    open_positions = stack.position_manager.open_positions(str(user.id))
+    current_exposure = sum(abs(p.quantity) * p.average_price for p in open_positions)
     proposal = TradeRiskProposal(
         account_id=str(user.id),
         strategy_id=None,
         entry=payload.entry,
         stop=payload.stop,
         account_balance=account.balance,
-        open_positions=len(stack.position_manager.open_positions(str(user.id))),
+        open_positions=len(open_positions),
         trades_today=stack.trades_today,
         daily_pnl=stack.daily_pnl,
         weekly_pnl=stack.weekly_pnl,
-        current_exposure=0.0,
+        current_exposure=current_exposure,
         strategy_allocation=0.0,
         # No live feed is wired for this symbol yet if this comes back None
         # (see app.workers.market_data_worker) — nothing to be stale
@@ -156,6 +182,28 @@ async def place_order(
     order, created = stack.order_manager.create_order(
         idempotency_key, str(user.id), payload.symbol, payload.direction, payload.order_type, quantity, payload.price
     )
+
+    # Snapshot the position *values* (not the PositionRecord reference —
+    # apply_fill mutates it in place, so holding the object itself would
+    # alias the post-fill state) before the fill, so a closing/reducing
+    # fill can be told apart from one that only opens or adds — that's
+    # what decides whether a `trades` journal row (blueprint §61) gets
+    # written below.
+    existing_position = stack.position_manager.get(str(user.id), payload.symbol)
+    position_before = (
+        {
+            "is_long": existing_position.is_long,
+            "quantity": existing_position.quantity,
+            "average_price": existing_position.average_price,
+            "stop": existing_position.stop,
+            "target": existing_position.target,
+            "realized_pnl": existing_position.realized_pnl,
+        }
+        if existing_position is not None
+        else None
+    )
+    realized_pnl_before = position_before["realized_pnl"] if position_before else 0.0
+
     if created:
         stack.order_manager.transition(order.id, OrderStatus.VALIDATING)
         stack.order_manager.transition(order.id, OrderStatus.RISK_APPROVED)
@@ -164,6 +212,28 @@ async def place_order(
 
     final_order = stack.order_manager.get(order.id)
     ORDER_COUNT.labels(final_order.status.value).inc()
+
+    await persist_order(db, final_order, user.id, instrument.id)
+
+    position_after = stack.position_manager.get(str(user.id), payload.symbol)
+    if position_after is not None:
+        position_row = await persist_position(db, user.id, instrument.id, position_after)
+        realized_delta = position_after.realized_pnl - realized_pnl_before
+        if realized_delta != 0 and position_before is not None:
+            await record_trade(
+                db,
+                user_id=user.id,
+                instrument_id=instrument.id,
+                direction=Direction.LONG if position_before["is_long"] else Direction.SHORT,
+                entry_price=position_before["average_price"],
+                exit_price=payload.entry,
+                quantity=abs(position_before["quantity"]),
+                pnl=realized_delta,
+                stop=position_before["stop"],
+                target=position_before["target"],
+                position_id=position_row.id,
+            )
+
     await record_audit(
         db,
         actor="user",
@@ -184,7 +254,9 @@ async def list_orders(user: User = Depends(get_current_user)) -> list[OrderRespo
 
 @router.post("/orders/{order_id}/cancel", response_model=OrderResponse)
 async def cancel_order(
-    order_id: uuid.UUID, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
+    order_id: uuid.UUID,
+    user: User = Depends(require_permission(TradingPermission.LIVE_TRADE)),
+    db: AsyncSession = Depends(get_db),
 ) -> OrderResponse:
     stack = _stack_for(user)
     order = stack.order_manager.get(order_id)
@@ -198,6 +270,10 @@ async def cancel_order(
     stack.order_manager.transition(order_id, OrderStatus.CANCELLED, "cancelled by user")
     final_order = stack.order_manager.get(order_id)
     ORDER_COUNT.labels(final_order.status.value).inc()
+
+    instrument = await _get_instrument_by_symbol(db, final_order.symbol)
+    await persist_order(db, final_order, user.id, instrument.id)
+
     await record_audit(db, actor="user", action="order.cancelled", user_id=user.id, details={"order_id": str(order_id)})
     await _publish_order_event(user, final_order)
     return _to_response(final_order)

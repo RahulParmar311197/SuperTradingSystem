@@ -1,3 +1,4 @@
+import dataclasses
 import uuid
 from datetime import datetime
 
@@ -125,7 +126,10 @@ async def run_backtest(
     )
     await db.commit()
 
-    return BacktestMetricsResponse(backtest_id=backtest_row.id, **metrics.__dict__)
+    # BacktestMetricsResult is `@dataclass(slots=True)` — no `__dict__`
+    # attribute; POST /backtest had never had a test hit it, so it 500'd
+    # on every call that reached this line.
+    return BacktestMetricsResponse(backtest_id=backtest_row.id, **dataclasses.asdict(metrics))
 
 
 class ValidateBacktestRequest(BaseModel):

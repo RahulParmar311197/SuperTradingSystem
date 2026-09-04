@@ -11,7 +11,7 @@ what's built, that file is about what's actually safe to turn on.
 | 0 | Architecture | Backend scaffolded (`backend/app/*`), repo layout matches §129. Structured logging, request-id tracing, Prometheus `/metrics`, a startup health check (lifespan), audit logging (`audit_logs`, `risk_events`), and CI (`.github/workflows/ci.yml`, runs the full suite against Postgres/Redis on every push/PR) are wired in — see §72/§71. `GET /health` now reports real **worker liveness** (blueprint §117 "Workers 🟢"): each of the `market_data`, `scanner`, and `auto_trade` loops in `app/workers/main.py` refreshes a short-TTL Redis heartbeat every pass (`app.core.redis.heartbeat`), so a stuck or never-started worker process reads `DOWN` honestly instead of an assumed `HEALTHY`. An **admin dashboard** (`app/api/admin.py`, blueprint §115-116) exposes users, broker connections (never `encrypted_credentials`), orders, risk events, AI decisions, this same worker/component health, and — via `GET /admin/halted-accounts` / `POST /admin/accounts/{id}/resume` — the deliberate manual resume step blueprint §75 requires after a reconciliation halt, which previously had no way to happen through the API at all (`app.core.redis.resume_account` existed but nothing ever called it). All gated on `UserRole.ADMIN`. |
 | 1 | Market data | `app/market`: normalization, timeframe/candle aggregation, simulated feed. `app/workers/market_data_worker.py` + `candle_worker.py` consume a feed, update the Redis latest-price cache, persist closed candles, derive higher timeframes, and publish on `/ws/market` + `/ws/chart`. No *live* broker feed yet — `app/workers/main.py` runs these against `SimulatedFeed` with no data source configured, so the worker process is a real, tested pipeline waiting on a real feed. |
 | 2 | SMC/ICT | `app/smc`, `app/ict`: swings, BOS/CHoCH/MSS, liquidity + sweeps, FVG, order blocks, premium/discount, kill zones, opening ranges. Fully unit-tested, look-ahead safe by construction. |
-| 3 | Replay | `app/replay`: clock + manual BUY/SELL/SL/TP/CLOSE, statistics. Look-ahead safety proven by test (`tests/replay/test_engine.py`). Exposed over REST (`app/api/replay.py`) with a per-session in-memory store. |
+| 3 | Replay | `app/replay`: clock + manual BUY/SELL/SL/TP/CLOSE, statistics. Look-ahead safety proven by test (`tests/replay/test_engine.py`). Exposed over REST (`app/api/replay.py`) with a per-session in-memory store (`_SESSIONS`) as the live process's working state, but every mutating action now also mirrors into Postgres (blueprint §9's `replay_sessions`/`replay_orders`, previously schema-only tables with zero writers — `app/replay/persistence.py`) so a session survives a restart and a per-user **ownership check** is enforced against a real row rather than trusting any authenticated caller with any session UUID they can guess (`tests/api/test_replay_persistence.py` proves a second user gets a 404, not the first user's state). See "The `.__dict__` bug" below for a real crash this work found and fixed along the way. |
 | 4 | Backtesting | `app/backtest`: event loop reusing the same SMC/ICT/Strategy code as replay, configurable cost model, full metrics report. **Out-of-sample validation** (`POST /backtest/validate`, blueprint §77-78) runs train/validation/test splits independently and flags overfitting smells (no trades or no edge on the held-out test period, a win-rate collapse from train to validation). Persists `backtests`/`backtest_trades`/`backtest_metrics` via `app/api/backtest.py`. |
 | 5 | AI | `app/ai`: structured context builder, Strategy-DSL JSON validation, AI trade-proposal validation against deterministic results, deterministic trade explanations. **A real provider is wired**: `app/ai/providers/anthropic_client.py` implements `AIClient` against the Claude API — set `AI_PROVIDER=anthropic` + `AI_API_KEY` to enable it. With no key configured, `NullAIClient` fails closed (§110 "no AI -> no trade"). **`POST /ai/propose-trade`** (blueprint §80-81, and §87's "Assisted" user mode — previously entirely unimplemented) asks the AI to confirm a trade for an already-detected setup, validates every stated number against the deterministic `StrategyEngine` result (`app.ai.validation.validate_ai_trade_proposal` — real, tested code that had no caller until now), and persists the outcome as an `AIDecision` row either way (blueprint §71 audit logging explicitly lists "AI decision"; `ai_decisions`/`ai_messages` were schema-only tables with zero writers before this). It never places an order itself — a validated proposal still goes through `POST /orders` like any other trade. |
 | 6 | Options | `app/options`: Black-Scholes Greeks, multi-leg payoff engine (max profit/loss/breakevens), liquidity filter, named strategy builders (spreads, condor, butterfly, straddle, strangle). **Execution exists now too**: `POST /options/execute` (blueprint §37-40) submits every leg of a chosen strategy as real orders — see "Multi-leg options execution" below. |
@@ -91,6 +91,40 @@ Two pieces the blueprint calls out as their own engines, not folded into
   rejection does not undo an earlier leg's fill — every leg's own outcome
   is in the response instead of a single pass/fail that would misrepresent
   what actually happened at the broker.
+
+## The `.__dict__` bug
+
+Five places in this codebase built an API response by calling `.__dict__`
+on a dataclass instance (`engine.statistics.__dict__`,
+`explanation.__dict__`, `metrics.__dict__`, `c.__dict__` for each candle).
+All five dataclasses are declared `@dataclass(slots=True)` (or
+`frozen=True, slots=True`) — and a slotted dataclass has no `__dict__`
+attribute at all; Python raises `AttributeError` the instant you touch it.
+Every one of these was a **guaranteed 500 on every single call**, not an
+edge case:
+
+- `app/api/replay.py` (`_state_response`, feeding every `/replay/*`
+  endpoint) and the parallel bug in this change's own new
+  `app/replay/persistence.py` (`sync_replay_session`) — caught by the new
+  `tests/api/test_replay_persistence.py`, which is what turned up the
+  whole bug class.
+- `app/api/ai.py`'s `POST /ai/explain-trade` — had never been exercised by
+  any test before now (`tests/api/test_ai_propose_trade.py::test_explain_trade_returns_explanation_without_crashing`
+  is new).
+- `app/api/backtest.py`'s `POST /backtest` (the *run* endpoint, distinct
+  from the already-tested `POST /backtest/validate`) — also never
+  exercised before now (`tests/api/test_backtest_run.py` is new).
+- `app/api/markets.py`'s `GET /candles` — also never exercised before now
+  (`tests/api/test_markets_candles.py` is new).
+
+All five were fixed the same way: `dataclasses.asdict(...)` instead of
+`.__dict__` (every field involved is a flat scalar/list/dict — no nested
+dataclasses — so `asdict`'s recursive conversion is a no-op difference,
+just a working one). The real lesson isn't the one-line fix; it's that
+four of these five endpoints had shipped through every prior stage of
+this project with **zero integration tests actually calling them**, so a
+100%-broken code path looked identical to a working one in every test run
+until something finally hit it.
 
 ## What's deliberately not implemented
 

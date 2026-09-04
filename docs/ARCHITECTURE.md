@@ -120,6 +120,40 @@ rows are `PAPER` for an account with no connected broker, and the new
 all before) proves `GET /portfolio` still reports real, non-zero exposure
 for such an account.
 
+## Portfolio snapshots (§9)
+
+`portfolio_snapshots` (balance/equity/exposure/net Greeks per account) was
+another schema-only table with zero writers. `app.trading.portfolio_snapshots.snapshot_all_stacks()`
+now journals one row per trading stack that currently has at least one
+open position, tagged with the correct `execution_mode` (see "Execution
+mode mislabeling" above), reusing `compute_portfolio_exposure` for the
+exposure figure and looking up real `OptionSnapshot` rows for net
+delta/gamma/theta/vega when one exists for a position's instrument
+(contributing 0 when it doesn't -- there's no options-chain ingestion
+pipeline in this environment, the same honest gap `app/risk/options_risk.py`
+already documents).
+
+This is exposed as `POST /admin/portfolio-snapshot` (ADMIN-only,
+on-demand) rather than an automatic background loop. A loop was tried
+first, wired into the API process's lifespan the same way
+`live_reconciliation` is — and dropped after it destabilized the test
+suite: unlike reconciliation, which is bounded by a small, DB-backed set
+(`BrokerAccount` rows with `status=ACTIVE`), the candidate set here is
+`app.api.orders._STACKS`, which only ever grows for the life of the
+process. An immediate on-startup pass over it doesn't stay cheap the way
+reconciliation's does — verified firsthand: wiring it into `main.py`'s
+lifespan made `pg_stat_activity` climb toward Postgres's connection limit
+partway through a full test run (each of ~180 `TestClient(app)` startups
+triggered an immediate pass over an ever-growing stack list, some of
+which referenced users/instruments already deleted by an earlier test's
+own cleanup). Skipping stacks with nothing open right now, and giving
+each account processed its own session/commit instead of one shared
+transaction for the whole pass, are both real, defensible design choices
+on their own — but they weren't sufficient by themselves to make a
+background loop safe here, so this stays on-demand until a real
+deployment wires it to an external scheduler instead of this process's
+own request/response lifecycle.
+
 ## Broker resolution and live reconciliation (§50, §53, §75)
 
 - **`app/trading/broker_resolver.py`** — the piece blueprint §53 "Broker

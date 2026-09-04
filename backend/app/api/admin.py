@@ -24,6 +24,7 @@ from app.database.models.trading import Order, OrderStatus
 from app.database.models.users import BrokerAccount, BrokerAccountStatus, BrokerName, User, UserRole, UserStatus
 from app.database.session import get_db
 from app.monitoring.health import ComponentStatus, check_database, check_redis, check_workers
+from app.trading.portfolio_snapshots import snapshot_all_stacks
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -223,3 +224,20 @@ async def resume_halted_account(
         details={"resumed_account_id": account_id, "previous_halt_reason": reason},
     )
     return HaltedAccountResponse(account_id=account_id, reason=reason)
+
+
+class PortfolioSnapshotTriggerResponse(BaseModel):
+    accounts_snapshotted: int
+
+
+@router.post("/portfolio-snapshot", response_model=PortfolioSnapshotTriggerResponse)
+async def trigger_portfolio_snapshot(user: User = Depends(require_admin), db: AsyncSession = Depends(get_db)) -> PortfolioSnapshotTriggerResponse:
+    """Blueprint §9 `portfolio_snapshots`: journals one row per account
+    with an open position right now (balance/equity/exposure/Greeks),
+    previously a schema-only table with zero writers. On-demand rather
+    than an automatic loop — see `app.trading.portfolio_snapshots`'s
+    module docstring for why a background loop was tried and dropped; a
+    real deployment should call this from an external scheduler."""
+    count = await snapshot_all_stacks()
+    await record_audit(db, actor="user", action="admin.portfolio_snapshot_triggered", user_id=user.id, details={"accounts_snapshotted": count})
+    return PortfolioSnapshotTriggerResponse(accounts_snapshotted=count)

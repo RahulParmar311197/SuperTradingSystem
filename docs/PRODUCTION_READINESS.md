@@ -14,8 +14,8 @@ money to this system.
 | Market-data timestamps validated | ❌ Not applicable yet | Same — no live feed to validate. |
 | No look-ahead bias | ✅ | Proven by test, not just claimed: `tests/replay/test_engine.py` runs the SMC engine on a truncated candle list and asserts future structure events are invisible. Every engine (replay, backtest, paper, auto-trade) only ever receives `candles[:t+1]`. |
 | SMC/ICT tests passing | ✅ | `tests/smc`, `tests/strategy` |
-| Replay tests passing | ✅ | `tests/replay` |
-| Backtest tests passing | ✅ | `tests/backtest`, including out-of-sample validation (`validate_out_of_sample`) |
+| Replay tests passing | ✅ | `tests/replay` (pure engine unit tests) plus `tests/api/test_replay_persistence.py` (the REST layer: `replay_sessions`/`replay_orders` now actually persist to Postgres, blueprint §9, and a session's owner is enforced — a second user gets 404, not another user's state). The API layer had zero integration tests before this and every `/replay/*` endpoint was crashing (see "The `.__dict__` bug" below) — `tests/replay` alone never would have caught it, since it never goes through `app/api/replay.py`. |
+| Backtest tests passing | ✅ | `tests/backtest`, including out-of-sample validation (`validate_out_of_sample`), plus `tests/api/test_backtest_run.py` for `POST /backtest` itself — which, like replay, had never been exercised by a test and was crashing on every call (see "The `.__dict__` bug" below) |
 | Slippage model implemented | ✅ | `app.backtest.cost_model.CostModel`; `MockBroker` also simulates slippage/partial fills/rejections |
 | Options execution tested | ⚠️ Partial | Greeks/payoff math is tested (`tests/options`). Both single-leg (`POST /orders`) and **multi-leg** (`POST /options/execute`, blueprint §37-40) execution are real and tested: the latter gates the whole combination's payoff (`app/risk/options_risk.py`) through one risk check — not a per-leg entry/stop, which doesn't apply to a defined-risk combination — checks each leg's liquidity via `OptionSnapshot` when it exists, and submits every leg through the same broker/persistence pipeline `POST /orders` uses (`tests/api/test_options_execute.py` proves a real 2-leg spread persists both `Order`/`Position` rows with the correct net premium and max loss). What's still honestly missing: no options-chain *ingestion* pipeline exists to populate `OptionContract`/`OptionSnapshot` in the first place (see Stage 1's note on `app/market`'s missing live feed), so the liquidity check only ever warns today, never actually rejects on real data; and multi-leg execution is **not atomic** — each leg is a separate broker order, and neither this codebase nor (unverified) Upstox/Dhan guarantee all-or-nothing fills, so a partial-leg failure is reported per-leg rather than rolled back. |
 | Risk engine tested | ✅ | `tests/risk` — position sizing, all limit checks, kill switches, plus the correlation engine (blueprint §85-86: `app/risk/correlation.py` pure math, `app/risk/portfolio.py` real-candle-history integration) and the `correlated_exposure_limit` check it feeds |
@@ -30,6 +30,26 @@ money to this system.
 | Out-of-sample testing completed | ⚠️ Mechanism exists, not "completed" | `POST /backtest/validate` runs train/validation/test splits — but this is a tool, not a result; no actual strategy has been through it against real market data |
 | Live trading limits configured | ❌ | No live account exists to configure limits *for* |
 | User explicitly enabled auto trading | ✅ (mechanism) | `POST /auto-trading/enable` requires `confirm: true` + the `AUTO_TRADE` permission, and `POST /orders` (manual live trading) now requires the `LIVE_TRADE` permission the same way — both are opted into via `POST /trading-permissions/grant` (`confirm: true`), never granted by default (`tests/api/test_trading_permissions.py`). It still only ever drives `MockBroker`, so "enabling" either today enables **paper** trading, not real trading |
+
+**The `.__dict__` bug:** five response-building call sites across this
+codebase (`app/api/replay.py`, `app/api/ai.py`, `app/api/backtest.py`,
+`app/api/markets.py`, and this change's own new
+`app/replay/persistence.py`) called `.__dict__` on a `@dataclass(slots=True)`
+instance — which has no `__dict__` and raises `AttributeError`
+unconditionally. `POST /replay`, every other `/replay/*` endpoint,
+`POST /ai/explain-trade`, `POST /backtest` (the run endpoint), and
+`GET /candles` were all a guaranteed 500 on every call. Four of those five
+endpoints had never once been hit by an integration test before this
+round, which is exactly how a 100%-broken code path survived every
+previous test run. All five are fixed (`dataclasses.asdict(...)`) and now
+have a passing regression test that actually calls the endpoint —
+`tests/api/test_replay_persistence.py`,
+`tests/api/test_ai_propose_trade.py::test_explain_trade_returns_explanation_without_crashing`,
+`tests/api/test_backtest_run.py`, `tests/api/test_markets_candles.py`.
+Worth stating plainly: this is not a reason to fully trust every other
+endpoint either — it's a reason to keep writing integration tests for any
+endpoint that doesn't have one yet, since "the code looks right" and "a
+real request against it works" are not the same claim.
 
 **Bottom line:** every item that can be verified without a live broker and
 live market data has been — with a real, running test, not a claim. The

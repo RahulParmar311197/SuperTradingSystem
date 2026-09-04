@@ -175,6 +175,28 @@ async def test_propose_trade_persists_a_valid_decision_when_ai_matches_determini
         await _cleanup(user_id, instrument_id, strategy_id)
 
 
+async def test_explain_trade_returns_explanation_without_crashing(require_infra):
+    # Regression test: POST /ai/explain-trade previously 500'd on every
+    # call (`TradeExplanation` is `@dataclass(slots=True)`, and
+    # `explanation.__dict__` raises AttributeError on it) because no test
+    # had ever actually exercised this endpoint before.
+    client, token, user_id, instrument_id, strategy_id = await _setup()
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        r = client.post(
+            "/ai/explain-trade",
+            json={"strategy_id": str(strategy_id), "instrument_id": str(instrument_id), "timeframe": "15m"},
+            headers=headers,
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        for field in ("market_context", "why_setup_exists", "conditions_satisfied", "conditions_missing", "risk", "invalidation", "potential_exit"):
+            assert field in body
+    finally:
+        client.__exit__(None, None, None)
+        await _cleanup(user_id, instrument_id, strategy_id)
+
+
 async def test_propose_trade_flags_a_hallucinated_entry(require_infra, monkeypatch):
     client, token, user_id, instrument_id, strategy_id = await _setup()
     headers = {"Authorization": f"Bearer {token}"}

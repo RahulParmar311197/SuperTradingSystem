@@ -6,7 +6,8 @@ simulated positions — exactly the flow described in §43.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, field
 from datetime import datetime
 
 from app.database.models.strategy import Direction
@@ -35,6 +36,10 @@ class ReplayTrade:
     closed_at: datetime | None = None
     pnl: float | None = None
     r_multiple: float | None = None
+    # Stable identity so app.replay.persistence can upsert the matching
+    # `replay_orders` row idempotently across repeated sync calls, the
+    # same way app.trading.persistence keys off OrderRecord.id.
+    id: uuid.UUID = field(default_factory=uuid.uuid4)
 
     @property
     def is_open(self) -> bool:

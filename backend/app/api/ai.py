@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import uuid
 
@@ -97,7 +98,9 @@ async def explain_trade(
     context = await _build_context(db, payload.instrument_id, payload.timeframe)
     result = StrategyEngine().evaluate(strategy, context)
     explanation = build_trade_explanation(context, result)
-    return explanation.__dict__
+    # TradeExplanation is `@dataclass(slots=True)` — no `__dict__` attribute;
+    # this endpoint had never had a test hit it, so it 500'd on every call.
+    return dataclasses.asdict(explanation)
 
 
 _TRADE_PROPOSAL_SYSTEM_PROMPT = (

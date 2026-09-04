@@ -1,3 +1,4 @@
+import dataclasses
 import uuid
 from datetime import datetime
 
@@ -89,7 +90,10 @@ async def get_candles_endpoint(
     db: AsyncSession = Depends(get_db),
 ) -> list[CandleResponse]:
     candles = await get_candles(db, instrument_id, timeframe, start, end)
-    return [CandleResponse(**c.__dict__) for c in candles]
+    # Candle is `@dataclass(frozen=True, slots=True)` — no `__dict__`
+    # attribute; GET /markets/candles had never had a test hit it, so it
+    # 500'd on every call with any candles to return.
+    return [CandleResponse(**dataclasses.asdict(c)) for c in candles]
 
 
 @router.get("/quotes")

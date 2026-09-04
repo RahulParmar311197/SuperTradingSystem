@@ -1,9 +1,11 @@
 import dataclasses
 import json
 import uuid
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.client import AIUnavailableError, get_ai_client
@@ -13,7 +15,7 @@ from app.ai.strategy_builder import StrategyBuilderError, build_strategy_from_de
 from app.ai.validation import validate_ai_trade_proposal
 from app.auth.dependencies import get_current_user
 from app.core.config import get_settings
-from app.database.models.ai import AIDecision, AIDecisionType
+from app.database.models.ai import AIDecision, AIDecisionType, AIMessage
 from app.database.models.instruments import Instrument
 from app.database.models.strategy import Strategy as StrategyRow
 from app.database.models.users import User
@@ -221,3 +223,75 @@ async def propose_trade(
         proposal=proposal,
         deterministic=deterministic_summary,
     )
+
+
+_CHAT_SYSTEM_PROMPT = (
+    "You are a trading assistant embedded in this platform (blueprint §96 'AI Screen'). "
+    "Answer the user's question about markets, setups, or strategies. If 'structured facts' are "
+    "provided, ground your answer only in those facts -- never invent a price, level, or indicator "
+    "value that isn't in them. If no facts are provided and the question needs specific market data "
+    "you don't have, say so plainly instead of guessing. "
+    'Respond with JSON only, in exactly this shape: {"reply": string}.'
+)
+
+
+class ChatRequest(BaseModel):
+    message: str
+    instrument_id: uuid.UUID | None = None
+    timeframe: str | None = None
+
+
+class ChatMessageResponse(BaseModel):
+    id: uuid.UUID
+    role: str
+    content: str
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+@router.post("/chat", response_model=ChatMessageResponse)
+async def chat(
+    payload: ChatRequest, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
+) -> AIMessage:
+    """Blueprint §96 "AI Screen": a single-turn, grounded Q&A endpoint --
+    not a full intent router across every other AI feature in this file.
+    Each call is independent (no prior turns are fed back as context);
+    `GET /ai/chat/history` exists so a frontend can render the
+    conversation, not so this endpoint can "remember" it.
+    """
+    db.add(AIMessage(user_id=user.id, role="user", content=payload.message))
+
+    prompt_context: dict | None = None
+    if payload.instrument_id is not None and payload.timeframe is not None:
+        context = await _build_context(db, payload.instrument_id, payload.timeframe)
+        prompt_context = build_ai_prompt_context(context)
+
+    prompt = payload.message
+    if prompt_context is not None:
+        prompt = f"Structured facts: {json.dumps(prompt_context, default=str)}\n\nQuestion: {payload.message}"
+
+    settings = get_settings()
+    ai_client = get_ai_client(settings)
+    try:
+        response = await ai_client.complete_json(prompt, system=_CHAT_SYSTEM_PROMPT)
+        reply = str(response.get("reply", "")) if isinstance(response, dict) else str(response)
+    except AIUnavailableError as exc:
+        assistant_message = AIMessage(user_id=user.id, role="assistant", content=f"AI unavailable: {exc}")
+        db.add(assistant_message)
+        await db.commit()
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+
+    assistant_message = AIMessage(user_id=user.id, role="assistant", content=reply)
+    db.add(assistant_message)
+    await db.commit()
+    await db.refresh(assistant_message)
+    return assistant_message
+
+
+@router.get("/chat/history", response_model=list[ChatMessageResponse])
+async def chat_history(
+    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db), limit: int = 50
+) -> list[AIMessage]:
+    stmt = select(AIMessage).where(AIMessage.user_id == user.id).order_by(AIMessage.created_at).limit(limit)
+    return (await db.execute(stmt)).scalars().all()

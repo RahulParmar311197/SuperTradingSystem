@@ -1,3 +1,5 @@
+import time
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -33,10 +35,19 @@ async def test_health_reports_worker_liveness(require_infra):
             assert body["workers"][name] == "DOWN"
         # `reconciliation` is different: it runs inside this API process's
         # own lifespan (app.trading.live_reconciliation) and heartbeats on
-        # its first pass, which has already happened by the time this
-        # request lands — proof the wiring actually runs, not just that
-        # the mechanism exists.
-        assert body["workers"]["reconciliation"] == "HEALTHY"
+        # its first pass — but `asyncio.create_task` only *schedules* that
+        # coroutine at startup, it doesn't guarantee any of its body has
+        # run by the time this first request lands (that's a real race,
+        # confirmed by CI: reliably HEALTHY on a fast local run, still
+        # DOWN on a slower scheduler). Poll briefly instead of assuming
+        # same-tick completion — this still proves the wiring actually
+        # runs, just without a flaky timing assumption.
+        for _ in range(50):
+            if client.get("/health").json()["workers"]["reconciliation"] == "HEALTHY":
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail("live reconciliation loop never heartbeated within ~2.5s of API startup")
 
         await heartbeat("scanner")
         r = client.get("/health")

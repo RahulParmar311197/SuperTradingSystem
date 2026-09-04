@@ -40,3 +40,30 @@ async def require_infra():
         pytest.skip("Postgres is not reachable at DATABASE_URL")
     if not await _redis_available():
         pytest.skip("Redis is not reachable at REDIS_URL")
+
+
+@pytest.fixture(autouse=True)
+async def _dispose_infra_clients_after_test():
+    """`get_engine()`/`get_redis()` cache one client per *running* event
+    loop (see their module docstrings) so a real deployment gets exactly
+    one client for the process's lifetime — but pytest-asyncio gives each
+    test function its own loop, and dropping a loop from that cache when
+    it's garbage collected does NOT close the connections its engine/client
+    were holding: SQLAlchemy's pool and redis-py's connections stay open
+    server-side until a TCP timeout eventually reaps them. Across a full
+    suite run that leaks a live Postgres connection per test — verified
+    firsthand: `pg_stat_activity` climbed from ~9 to 97 (of a 100 default
+    `max_connections`) over one run, silently *skipping* (not failing) any
+    `require_infra` test unlucky enough to run after the limit was hit.
+    Disposing both here, in the same loop the test just used and before
+    pytest-asyncio tears that loop down, closes the connections cleanly
+    instead of leaving them for Postgres/Redis to notice on their own."""
+    yield
+    try:
+        await get_engine().dispose()
+    except Exception:
+        pass
+    try:
+        await get_redis().aclose()
+    except Exception:
+        pass

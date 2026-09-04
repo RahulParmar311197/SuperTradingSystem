@@ -7,6 +7,7 @@ from app.core.redis import (
     get_price_age_seconds,
     halt_account,
     heartbeat,
+    list_halted_accounts,
     resume_account,
     set_latest_price,
     worker_is_alive,
@@ -43,3 +44,24 @@ async def test_worker_is_alive_only_after_a_heartbeat(require_infra):
 
     await heartbeat(name)
     assert await worker_is_alive(name) is True
+
+
+async def test_list_halted_accounts_includes_only_currently_halted_ones(require_infra):
+    account_a = f"halted-{uuid.uuid4().hex[:8]}"
+    account_b = f"halted-{uuid.uuid4().hex[:8]}"
+    assert account_a not in await list_halted_accounts()
+
+    try:
+        await halt_account(account_a, "reason A")
+        await halt_account(account_b, "reason B")
+        halted = await list_halted_accounts()
+        assert halted[account_a] == "reason A"
+        assert halted[account_b] == "reason B"
+
+        await resume_account(account_a)
+        halted = await list_halted_accounts()
+        assert account_a not in halted
+        assert halted[account_b] == "reason B"
+    finally:
+        await resume_account(account_a)
+        await resume_account(account_b)

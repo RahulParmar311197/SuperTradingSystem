@@ -148,6 +148,21 @@ async def account_halt_reason(account_id: str) -> str | None:
     return await get_redis().get(f"{_HALT_PREFIX}{account_id}")
 
 
+async def list_halted_accounts() -> dict[str, str]:
+    """Every account currently halted, keyed by account id. Blueprint
+    §75 says resuming is a deliberate manual step, not automatic — that
+    step needs somewhere to see *what's* halted and why first (see
+    `GET /admin/halted-accounts`), rather than only discovering a halt by
+    hitting it with an order and getting a 423."""
+    client = get_redis()
+    halted: dict[str, str] = {}
+    async for key in client.scan_iter(match=f"{_HALT_PREFIX}*"):
+        reason = await client.get(key)
+        if reason is not None:
+            halted[key[len(_HALT_PREFIX):]] = reason
+    return halted
+
+
 # --- Worker heartbeats (blueprint §117 "Workers 🟢") ----------------------
 #
 # The worker process (see app/workers/main.py) is separate from the API

@@ -10,12 +10,14 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, Query
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.dependencies import require_admin
+from app.core.audit import record_audit
+from app.core.redis import account_halt_reason, list_halted_accounts, resume_account
 from app.database.models.risk import RiskDecision, RiskEvent
 from app.database.models.trading import Order, OrderStatus
 from app.database.models.users import BrokerAccount, BrokerAccountStatus, BrokerName, User, UserRole, UserStatus
@@ -145,3 +147,52 @@ async def system_health(user: User = Depends(require_admin), db: AsyncSession = 
         total_users=len(total_users),
         active_broker_connections=len(active_connections),
     )
+
+
+class HaltedAccountResponse(BaseModel):
+    account_id: str
+    reason: str
+
+
+@router.get("/halted-accounts", response_model=list[HaltedAccountResponse])
+async def get_halted_accounts(user: User = Depends(require_admin)) -> list[HaltedAccountResponse]:
+    """Blueprint §116 "Trading status": which accounts are currently
+    blocked from new entries and why — previously only discoverable by
+    an affected user hitting a 423 on `POST /orders`, or by reading Redis
+    directly."""
+    halted = await list_halted_accounts()
+    return [HaltedAccountResponse(account_id=account_id, reason=reason) for account_id, reason in halted.items()]
+
+
+class ResumeAccountRequest(BaseModel):
+    confirm: bool = Field(description="Must be true — resuming a halted account requires explicit confirmation")
+
+
+@router.post("/accounts/{account_id}/resume", response_model=HaltedAccountResponse)
+async def resume_halted_account(
+    account_id: str,
+    payload: ResumeAccountRequest,
+    user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> HaltedAccountResponse:
+    """Blueprint §75: "Resuming is deliberate manual step, not automatic."
+    This is that step — previously nonexistent: `app.core.redis.resume_account`
+    was fully implemented but nothing in the API ever called it, so a
+    reconciliation-triggered halt had no way to be lifted short of
+    editing Redis by hand."""
+    if not payload.confirm:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Set confirm=true to resume this account")
+
+    reason = await account_halt_reason(account_id)
+    if reason is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Account {account_id} is not currently halted")
+
+    await resume_account(account_id)
+    await record_audit(
+        db,
+        actor="user",
+        action="admin.account_resumed",
+        user_id=user.id,
+        details={"resumed_account_id": account_id, "previous_halt_reason": reason},
+    )
+    return HaltedAccountResponse(account_id=account_id, reason=reason)

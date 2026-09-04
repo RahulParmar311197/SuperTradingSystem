@@ -9,7 +9,7 @@ from app.database.models.notifications import Notification, NotificationType
 from app.database.models.options import OptionChainSnapshot, OptionContract, OptionSnapshot
 from app.database.models.replay import ReplayOrder, ReplaySession, ReplayStatus
 from app.database.models.risk import AuditLog, RiskDecision, RiskEvent
-from app.database.models.strategy import Direction, Setup, Signal, Strategy
+from app.database.models.strategy import Direction, Setup, Signal, Strategy, StrategyVersion
 from app.database.models.trading import (
     ExecutionMode,
     Order,
@@ -68,6 +68,7 @@ __all__ = [
     "Setup",
     "Signal",
     "Strategy",
+    "StrategyVersion",
     "Tick",
     "Trade",
     "TradingPermission",

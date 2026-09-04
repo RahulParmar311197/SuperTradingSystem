@@ -104,6 +104,27 @@ async def subscribe(channel: str) -> AsyncIterator[dict]:
         await pubsub.aclose()
 
 
+# --- OAuth state (CSRF protection for the Upstox/Dhan authorize flow) ----
+
+_OAUTH_STATE_PREFIX = "oauth_state:"
+_OAUTH_STATE_TTL_SECONDS = 600
+
+
+async def store_oauth_state(state: str, user_id: str) -> None:
+    await get_redis().set(f"{_OAUTH_STATE_PREFIX}{state}", user_id, ex=_OAUTH_STATE_TTL_SECONDS)
+
+
+async def pop_oauth_state(state: str) -> str | None:
+    """Returns the user id that initiated this OAuth flow, and consumes
+    the state token so it can't be replayed."""
+    client = get_redis()
+    async with client.pipeline(transaction=True) as pipe:
+        pipe.get(f"{_OAUTH_STATE_PREFIX}{state}")
+        pipe.delete(f"{_OAUTH_STATE_PREFIX}{state}")
+        value, _ = await pipe.execute()
+    return value
+
+
 # --- Trading halts (blueprint §73-75) ------------------------------------
 #
 # A halt raised here must be visible to every process that can place an

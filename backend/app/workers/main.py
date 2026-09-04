@@ -17,9 +17,15 @@ import os
 import signal
 import uuid
 
+from app.workers.auto_trade_worker import AutoTradeSupervisor
 from app.workers.candle_worker import CandleWorker
 from app.workers.market_data_worker import MarketDataWorker
 from app.workers.scanner_worker import ScannerWorker
+
+# ReconciliationWorker isn't started here: it runs per live-broker account
+# (it needs that account's authenticated Broker instance), and there is no
+# live broker connected to any account yet. Instantiate one per account
+# once app/brokers/upstox or app/brokers/dhan is wired to real credentials.
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("workers.main")
@@ -54,6 +60,7 @@ async def main() -> None:
     market_worker = MarketDataWorker(feed, symbols)
     candle_worker = CandleWorker(instrument_ids, base_timeframe="1m", derived_timeframes=["5m", "15m"])
     scanner_worker = ScannerWorker(timeframe="15m", interval_seconds=60.0)
+    auto_trade_supervisor = AutoTradeSupervisor(timeframe="15m", interval_seconds=60.0)
 
     stop_event = asyncio.Event()
 
@@ -71,6 +78,7 @@ async def main() -> None:
     tasks = [
         asyncio.create_task(_bridge_market_data_to_candles(market_worker, candle_worker), name="market_data+candles"),
         asyncio.create_task(scanner_worker.run(), name="scanner"),
+        asyncio.create_task(auto_trade_supervisor.run(), name="autotrade"),
     ]
 
     await stop_event.wait()

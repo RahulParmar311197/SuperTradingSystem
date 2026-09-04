@@ -36,12 +36,18 @@ class Settings(BaseSettings):
 
     upstox_client_id: str | None = None
     upstox_secret: str | None = None
+    upstox_redirect_uri: str = "http://localhost:8000/brokers/upstox/callback"
 
     # Empty by default — deny cross-origin browser requests until an
     # operator explicitly lists allowed origins. JWTs travel in the
     # Authorization header (not cookies), so credentialed CORS isn't
     # needed even once origins are configured.
     cors_origins: list[str] = []
+
+    # Off in tests/CI by default (see tests/conftest.py) — every request
+    # from a test suite shares one client "IP", so a real limit would trip
+    # on nothing but test volume rather than actual abuse.
+    rate_limit_enabled: bool = True
 
 
 @lru_cache

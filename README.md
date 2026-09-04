@@ -5,6 +5,7 @@ strategy building, replay/backtest/paper trading, Dhan/Upstox execution under
 a deterministic risk engine). Full product spec: [`AI_TRADING_PLATFORM_BLUEPRINT.md`](AI_TRADING_PLATFORM_BLUEPRINT.md).
 
 Current implementation status: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+Before connecting a real broker or real money: [`docs/PRODUCTION_READINESS.md`](docs/PRODUCTION_READINESS.md).
 
 ## Layout
 

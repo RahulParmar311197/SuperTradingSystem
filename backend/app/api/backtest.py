@@ -9,7 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth.dependencies import get_current_user
 from app.backtest.cost_model import CostModel
 from app.backtest.engine import BacktestEngine
-from app.backtest.metrics import compute_metrics
+from app.backtest.metrics import BacktestMetricsResult, compute_metrics
+from app.backtest.validation import validate_out_of_sample
 from app.database.models.backtest import Backtest as BacktestRow
 from app.database.models.backtest import BacktestMetrics as BacktestMetricsRow
 from app.database.models.backtest import BacktestStatus
@@ -125,6 +126,94 @@ async def run_backtest(
     await db.commit()
 
     return BacktestMetricsResponse(backtest_id=backtest_row.id, **metrics.__dict__)
+
+
+class ValidateBacktestRequest(BaseModel):
+    strategy_id: uuid.UUID
+    instrument_id: uuid.UUID
+    timeframe: str
+    start_date: datetime
+    end_date: datetime
+    starting_capital: float = 100_000.0
+    cost_model: dict = {}
+    train_pct: float = 0.6
+    validation_pct: float = 0.2
+
+
+class SplitMetricsResponse(BaseModel):
+    total_return: float
+    net_profit: float
+    win_rate: float
+    profit_factor: float | None
+    expectancy: float | None
+    max_drawdown: float
+    sharpe: float | None
+    sortino: float | None
+    total_trades: int
+
+
+def _to_split_response(m: BacktestMetricsResult) -> SplitMetricsResponse:
+    return SplitMetricsResponse(
+        total_return=m.total_return,
+        net_profit=m.net_profit,
+        win_rate=m.win_rate,
+        profit_factor=m.profit_factor,
+        expectancy=m.expectancy,
+        max_drawdown=m.max_drawdown,
+        sharpe=m.sharpe,
+        sortino=m.sortino,
+        total_trades=m.total_trades,
+    )
+
+
+class OutOfSampleResponse(BaseModel):
+    train: SplitMetricsResponse
+    validation: SplitMetricsResponse
+    test: SplitMetricsResponse
+    consistent: bool
+    warnings: list[str]
+
+
+@router.post("/validate", response_model=OutOfSampleResponse)
+async def validate_backtest(
+    payload: ValidateBacktestRequest, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
+) -> OutOfSampleResponse:
+    """Out-of-sample validation (blueprint §77-78): runs the strategy
+    independently over train/validation/test splits of the same history
+    rather than one pass over the whole thing, and flags the simple
+    overfitting smells. Nothing here is persisted — it's an analysis step
+    you run before ever marking a strategy `eligible_for_auto_trading`."""
+    strategy_row = await db.get(StrategyRow, payload.strategy_id)
+    if strategy_row is None or strategy_row.user_id != user.id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Strategy not found")
+    strategy = StrategyDefinition.model_validate(strategy_row.definition)
+
+    candles = await get_candles(db, payload.instrument_id, payload.timeframe, payload.start_date, payload.end_date)
+    if len(candles) < 30:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "Not enough historical candles to split into train/validation/test"
+        )
+
+    try:
+        report = validate_out_of_sample(
+            strategy,
+            candles,
+            symbol=str(payload.instrument_id),
+            starting_capital=payload.starting_capital,
+            cost_model=CostModel(**payload.cost_model),
+            train_pct=payload.train_pct,
+            validation_pct=payload.validation_pct,
+        )
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+
+    return OutOfSampleResponse(
+        train=_to_split_response(report.train),
+        validation=_to_split_response(report.validation),
+        test=_to_split_response(report.test),
+        consistent=report.consistent,
+        warnings=report.warnings,
+    )
 
 
 @router.get("/{backtest_id}", response_model=BacktestMetricsResponse)

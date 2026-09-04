@@ -5,7 +5,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.orders import _stack_for
+from app.api.orders import _execution_mode_for, _stack_for
 from app.auth.dependencies import get_current_user, require_permission
 from app.brokers.mock import MockBroker
 from app.core.audit import record_audit
@@ -271,6 +271,7 @@ async def execute_options_strategy(
         raise HTTPException(status.HTTP_403_FORBIDDEN, f"Risk engine rejected this strategy: {decision.reason}")
 
     batch_id = uuid.uuid4()
+    execution_mode = _execution_mode_for(stack)
     leg_results: list[LegExecutionResult] = []
     for leg in payload.legs:
         instrument = instruments[leg.symbol]
@@ -300,11 +301,11 @@ async def execute_options_strategy(
             await stack.execution_engine.submit(order.id)
 
         final_order = stack.order_manager.get(order.id)
-        await persist_order(db, final_order, user.id, instrument.id)
+        await persist_order(db, final_order, user.id, instrument.id, execution_mode=execution_mode)
 
         position_after = stack.position_manager.get(str(user.id), leg.symbol)
         if position_after is not None:
-            position_row = await persist_position(db, user.id, instrument.id, position_after)
+            position_row = await persist_position(db, user.id, instrument.id, position_after, execution_mode=execution_mode)
             realized_delta = position_after.realized_pnl - realized_pnl_before
             if realized_delta != 0 and position_before is not None:
                 await record_trade(
@@ -317,6 +318,7 @@ async def execute_options_strategy(
                     quantity=abs(position_before["quantity"]),
                     pnl=realized_delta,
                     position_id=position_row.id,
+                    execution_mode=execution_mode,
                 )
 
         await record_audit(

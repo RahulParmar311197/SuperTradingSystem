@@ -88,6 +88,38 @@ over unchanged candles doesn't duplicate rows). `GET /setups` gives it a
 real reader too — the kind of thing blueprint §96's "Explain this FVG."
 chat prompt would query against.
 
+## Execution mode mislabeling (§101)
+
+`persist_order`/`persist_position`/`record_trade` (`app/trading/persistence.py`)
+all take an `execution_mode` parameter, but every call site in
+`app/api/orders.py` and `app/api/options.py` (both `POST /orders` and
+`POST /options/execute`) called them with no `execution_mode` argument at
+all, so every one silently defaulted to `ExecutionMode.LIVE` --
+`persist_order` didn't even have a parameter for it; the row was
+hardcoded to `LIVE` at construction. This meant **every manual trade ever
+placed against `MockBroker`** (Stage 9's honest default for any user with
+no connected broker account -- which is every account in this
+environment) was journaled in `orders`/`positions`/`trades` as `LIVE`,
+exactly the "paper and live look identical" blueprint §101 explicitly
+forbids, even though the broker-selection logic itself (see below) was
+already doing the right thing.
+
+Fixed by resolving the real execution mode from the stack's actual broker
+(`_execution_mode_for`: `PAPER` for `MockBroker`, `LIVE` otherwise) at
+every call site, and adding the missing parameter to `persist_order`.
+This surfaced a second, dependent bug: `GET /portfolio` computed exposure
+via `compute_portfolio_exposure(db, user.id)` with no `execution_mode`
+argument either, defaulting to `LIVE` -- which had "worked" by accident
+only because positions were always mislabeled `LIVE` too. Once positions
+started being labeled correctly, a paper account's real exposure would
+have silently gone to zero without also passing the caller's actual mode
+through there. Both fixes are proven by test:
+`tests/api/test_orders.py`/`test_options_execute.py` assert the persisted
+rows are `PAPER` for an account with no connected broker, and the new
+`tests/api/test_portfolio.py` (this endpoint had never been tested at
+all before) proves `GET /portfolio` still reports real, non-zero exposure
+for such an account.
+
 ## Broker resolution and live reconciliation (§50, §53, §75)
 
 - **`app/trading/broker_resolver.py`** — the piece blueprint §53 "Broker

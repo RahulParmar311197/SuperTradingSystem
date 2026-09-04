@@ -39,10 +39,16 @@ async def persist_order(
     instrument_id: uuid.UUID,
     strategy_id: uuid.UUID | None = None,
     strategy_version: int | None = None,
+    execution_mode: ExecutionMode = ExecutionMode.LIVE,
 ) -> OrderRow:
     """Insert-or-update the DB mirror of `order`, appending any
     `OrderEvent` rows not yet persisted. Safe to call after every state
-    transition — idempotent on `order.idempotency_key`."""
+    transition — idempotent on `order.idempotency_key`.
+
+    `execution_mode` only takes effect when the row is first created (an
+    order's execution mode can't change across its own state transitions)
+    — callers must pass the same value on every call for a given order.
+    """
     row = (
         await db.execute(select(OrderRow).where(OrderRow.idempotency_key == order.idempotency_key))
     ).scalar_one_or_none()
@@ -55,7 +61,7 @@ async def persist_order(
             strategy_id=strategy_id,
             strategy_version=strategy_version,
             idempotency_key=order.idempotency_key,
-            execution_mode=ExecutionMode.LIVE,
+            execution_mode=execution_mode,
             direction=order.direction,
             order_type=order.order_type,
             quantity=order.quantity,

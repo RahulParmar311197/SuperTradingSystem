@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.orders import _stack_for
+from app.api.orders import _execution_mode_for, _stack_for
 from app.auth.dependencies import get_current_user
 from app.database.models.users import User
 from app.database.session import get_db
@@ -31,7 +31,11 @@ async def get_portfolio(user: User = Depends(get_current_user), db: AsyncSession
     stack = await _stack_for(user, db)
     account = await stack.broker.get_account()
     positions = stack.position_manager.open_positions(str(user.id))
-    exposure = await compute_portfolio_exposure(db, user.id)
+    # Positions are persisted under whichever execution_mode actually
+    # produced them (blueprint §101) -- a user with no connected broker
+    # trades PAPER against MockBroker, and querying the LIVE default here
+    # would silently report zero exposure for every such account.
+    exposure = await compute_portfolio_exposure(db, user.id, execution_mode=_execution_mode_for(stack))
     return PortfolioResponse(
         balance=account.balance,
         equity=account.equity,

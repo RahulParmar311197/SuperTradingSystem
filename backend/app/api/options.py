@@ -1,3 +1,4 @@
+import dataclasses
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -56,7 +57,9 @@ async def compute_greeks(payload: GreeksRequest, user: User = Depends(get_curren
         )
     except ValueError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
-    return GreeksResponse(price=price, **greeks.__dict__)
+    # Greeks is `@dataclass(slots=True)` -- no `__dict__` attribute; this
+    # endpoint had never had a test hit it, so it 500'd on every call.
+    return GreeksResponse(price=price, **dataclasses.asdict(greeks))
 
 
 class StrategyLegInput(BaseModel):

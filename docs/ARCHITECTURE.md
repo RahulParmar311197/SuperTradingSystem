@@ -67,6 +67,27 @@ three successive edits leave all three prior definitions independently
 readable, and that a second user gets 404 rather than another user's
 version history.
 
+## Raw setup journaling (§9)
+
+`setups` (blueprint §9's core table list, distinct from `signals`) is
+meant to hold raw SMC pattern detections — structure breaks, fair value
+gaps, order blocks — independent of whether any strategy actually matched
+on them. It had zero writers anywhere in `app/` before this round: the
+same "looks done, is disconnected" bug class as `replay_sessions` and
+`strategy_versions` before their fixes.
+
+`ScannerWorker` (`app/workers/scanner_worker.py`) now journals it on every
+scan pass, and was restructured to compute SMC/ICT analysis once per
+`(instrument, timeframe)` rather than once per `(strategy, instrument)` —
+a genuine inefficiency fix along the way, since raw structure detection
+never depended on any particular strategy. Persistence is idempotent
+across passes: every historical candle gets re-analyzed each time, so
+only `(setup_type, detected_at)` combinations not already in the table
+get inserted (`tests/workers/test_scanner_worker.py` proves a second pass
+over unchanged candles doesn't duplicate rows). `GET /setups` gives it a
+real reader too — the kind of thing blueprint §96's "Explain this FVG."
+chat prompt would query against.
+
 ## Broker resolution and live reconciliation (§50, §53, §75)
 
 - **`app/trading/broker_resolver.py`** — the piece blueprint §53 "Broker

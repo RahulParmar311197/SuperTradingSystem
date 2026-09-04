@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import delete, select
 
 from app.auth.security import hash_password
+from app.database.models.strategy import Setup as SetupRow
 from app.database.models.strategy import Signal as SignalRow
 from app.database.models.strategy import Strategy as StrategyRow
 from app.database.models.users import User
@@ -91,3 +92,32 @@ async def test_scanner_finds_a_match_and_persists_a_signal(db_instrument):
             await db.execute(delete(StrategyRow).where(StrategyRow.id == strategy_id))
             await db.execute(delete(User).where(User.id == user_id))
             await db.commit()
+
+
+async def test_scanner_persists_setups_and_dedups_across_passes(db_instrument):
+    # Regression test for the `setups` table (blueprint §9): raw SMC
+    # detections behind a scan (structure breaks, FVGs, order blocks) had
+    # zero writers anywhere before this -- they're independent of whether
+    # any strategy actually matched, so this needs no active strategy at
+    # all to exercise.
+    start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
+    candles = [Candle(start + timedelta(minutes=i), o, h, l, c, 100) for i, (o, h, l, c) in enumerate(SETUP)]
+
+    async with async_session_factory() as db:
+        await upsert_candles(db, db_instrument.id, "15m", candles)
+
+    worker = ScannerWorker(timeframe="15m")
+    await worker.run_once()
+
+    async with async_session_factory() as db:
+        setups = (await db.execute(select(SetupRow).where(SetupRow.instrument_id == db_instrument.id))).scalars().all()
+    assert setups, "expected the scan pass to journal at least one raw SMC detection"
+    assert any(s.setup_type == "fair_value_gap" for s in setups)
+    first_pass_count = len(setups)
+
+    # A second pass over the same, unchanged candle history must not
+    # duplicate rows for detections already journaled.
+    await worker.run_once()
+    async with async_session_factory() as db:
+        setups_after = (await db.execute(select(SetupRow).where(SetupRow.instrument_id == db_instrument.id))).scalars().all()
+    assert len(setups_after) == first_pass_count

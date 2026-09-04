@@ -1,0 +1,12 @@
+# Example Prometheus scrape config (blueprint §72). Not wired into
+# docker-compose.yml yet — the API doesn't currently expose a /metrics
+# endpoint; add one (e.g. via prometheus-fastapi-instrumentator) before
+# using this.
+
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: "ai-trading-api"
+    static_configs:
+      - targets: ["api:8000"]

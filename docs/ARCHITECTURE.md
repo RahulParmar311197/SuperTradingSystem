@@ -205,11 +205,11 @@ own request/response lifecycle.
 
 ## The `.__dict__` bug
 
-Five places in this codebase built an API response by calling `.__dict__`
+Six places in this codebase built an API response by calling `.__dict__`
 on a dataclass instance (`engine.statistics.__dict__`,
-`explanation.__dict__`, `metrics.__dict__`, `c.__dict__` for each candle).
-All five dataclasses are declared `@dataclass(slots=True)` (or
-`frozen=True, slots=True`) — and a slotted dataclass has no `__dict__`
+`explanation.__dict__`, `metrics.__dict__`, `c.__dict__` for each candle,
+`greeks.__dict__`). All six dataclasses are declared `@dataclass(slots=True)`
+(or `frozen=True, slots=True`) — and a slotted dataclass has no `__dict__`
 attribute at all; Python raises `AttributeError` the instant you touch it.
 Every one of these was a **guaranteed 500 on every single call**, not an
 edge case:
@@ -227,15 +227,21 @@ edge case:
   exercised before now (`tests/api/test_backtest_run.py` is new).
 - `app/api/markets.py`'s `GET /candles` — also never exercised before now
   (`tests/api/test_markets_candles.py` is new).
+- `app/api/options.py`'s `POST /options/greeks` — found in a later round,
+  missed by the original sweep, and (same story) had never been exercised
+  by any test before (`tests/api/test_options_greeks.py` is new).
 
-All five were fixed the same way: `dataclasses.asdict(...)` instead of
+All six were fixed the same way: `dataclasses.asdict(...)` instead of
 `.__dict__` (every field involved is a flat scalar/list/dict — no nested
 dataclasses — so `asdict`'s recursive conversion is a no-op difference,
 just a working one). The real lesson isn't the one-line fix; it's that
-four of these five endpoints had shipped through every prior stage of
+five of these six endpoints had shipped through every prior stage of
 this project with **zero integration tests actually calling them**, so a
 100%-broken code path looked identical to a working one in every test run
-until something finally hit it.
+until something finally hit it — and even a dedicated sweep for this
+exact bug class missed one of the six on the first pass, which is itself
+worth remembering: "we already checked for this" is not the same claim as
+"we tested every call site."
 
 ## What's deliberately not implemented
 

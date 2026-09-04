@@ -7,7 +7,7 @@ from sqlalchemy import delete, select
 
 from app.database.models.instruments import Instrument, MarketType, OptionType
 from app.database.models.risk import AuditLog, RiskEvent
-from app.database.models.trading import Order, OrderEvent, Position, Trade
+from app.database.models.trading import ExecutionMode, Order, OrderEvent, Position, Trade
 from app.database.models.users import User, UserSession
 from app.database.session import async_session_factory
 from app.main import app
@@ -105,6 +105,11 @@ async def test_place_and_close_order_persists_to_database(require_infra):
                 order_row = (await db.execute(select(Order).where(Order.user_id == user_id))).scalar_one()
                 assert order_row.instrument_id == instrument_id
                 assert order_row.status.value in ("FILLED", "MONITORING")
+                # No broker account is connected for this user, so the
+                # stack trades against MockBroker -- this must never be
+                # journaled as LIVE (blueprint §101: "Never make paper and
+                # live look identical").
+                assert order_row.execution_mode == ExecutionMode.PAPER
 
                 events = (await db.execute(select(OrderEvent).where(OrderEvent.order_id == order_row.id))).scalars().all()
                 assert len(events) >= 4  # CREATED -> VALIDATING -> RISK_APPROVED -> SUBMITTED -> ...
@@ -112,6 +117,7 @@ async def test_place_and_close_order_persists_to_database(require_infra):
                 position_row = (await db.execute(select(Position).where(Position.user_id == user_id))).scalar_one()
                 assert position_row.is_open is True
                 assert float(position_row.quantity) > 0
+                assert position_row.execution_mode == ExecutionMode.PAPER
 
             # Close it with an opposing SHORT fill at a higher price -> realized profit.
             r = client.post(
@@ -129,6 +135,7 @@ async def test_place_and_close_order_persists_to_database(require_infra):
                 # 100 shares bought at 100, sold at 110 -> 1000 realized profit.
                 assert float(trade_row.pnl) == pytest.approx(1000.0, rel=1e-6)
                 assert trade_row.direction.value == "LONG"
+                assert trade_row.execution_mode == ExecutionMode.PAPER
         finally:
             await _cleanup(user_id, instrument_id)
 

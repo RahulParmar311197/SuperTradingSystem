@@ -7,7 +7,7 @@ from sqlalchemy import delete, select
 
 from app.database.models.instruments import Instrument, MarketType, OptionType
 from app.database.models.risk import AuditLog, RiskEvent
-from app.database.models.trading import Order, OrderEvent, Position, Trade
+from app.database.models.trading import ExecutionMode, Order, OrderEvent, Position, Trade
 from app.database.models.users import User, UserSession
 from app.database.session import async_session_factory
 from app.main import app
@@ -118,10 +118,14 @@ async def test_execute_bull_call_spread_persists_both_legs(require_infra):
                 assert {o.instrument_id for o in orders} == {long_leg.id, short_leg.id}
                 for order in orders:
                     assert float(order.quantity) == 50.0  # 1 lot * lot_size 50
+                    # No broker account is connected -> MockBroker -> must
+                    # never be journaled as LIVE (blueprint §101).
+                    assert order.execution_mode == ExecutionMode.PAPER
 
                 positions = (await db.execute(select(Position).where(Position.user_id == user_id))).scalars().all()
                 assert len(positions) == 2
                 assert all(p.is_open for p in positions)
+                assert all(p.execution_mode == ExecutionMode.PAPER for p in positions)
         finally:
             await _cleanup(user_id, [long_leg.id, short_leg.id])
 

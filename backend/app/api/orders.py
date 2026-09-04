@@ -14,7 +14,7 @@ from app.database.models.instruments import Instrument
 from app.database.models.risk import RiskDecision as RiskEventDecision
 from app.database.models.risk import RiskEvent
 from app.database.models.strategy import Direction
-from app.database.models.trading import OrderStatus, OrderType
+from app.database.models.trading import ExecutionMode, OrderStatus, OrderType
 from app.database.models.users import TradingPermission, User
 from app.database.session import get_db
 from app.risk.engine import RiskEngine, TradeRiskProposal, calculate_position_size
@@ -88,6 +88,14 @@ def all_stacks() -> dict[uuid.UUID, _UserTradingStack]:
     connected accounts have actually placed an order this process
     lifetime. Not for mutation; callers get a shallow copy."""
     return dict(_STACKS)
+
+
+def _execution_mode_for(stack: "_UserTradingStack") -> ExecutionMode:
+    """Blueprint §101: "Never make paper and live look identical" — a
+    stack with no connected broker account trades against `MockBroker`
+    (Stage 9's honest default), so anything it persists is PAPER, not
+    LIVE, regardless of which trading permission gated the request."""
+    return ExecutionMode.PAPER if isinstance(stack.broker, MockBroker) else ExecutionMode.LIVE
 
 
 class PlaceOrderRequest(BaseModel):
@@ -245,11 +253,12 @@ async def place_order(
     final_order = stack.order_manager.get(order.id)
     ORDER_COUNT.labels(final_order.status.value).inc()
 
-    await persist_order(db, final_order, user.id, instrument.id)
+    execution_mode = _execution_mode_for(stack)
+    await persist_order(db, final_order, user.id, instrument.id, execution_mode=execution_mode)
 
     position_after = stack.position_manager.get(str(user.id), payload.symbol)
     if position_after is not None:
-        position_row = await persist_position(db, user.id, instrument.id, position_after)
+        position_row = await persist_position(db, user.id, instrument.id, position_after, execution_mode=execution_mode)
         realized_delta = position_after.realized_pnl - realized_pnl_before
         if realized_delta != 0 and position_before is not None:
             await record_trade(
@@ -264,6 +273,7 @@ async def place_order(
                 stop=position_before["stop"],
                 target=position_before["target"],
                 position_id=position_row.id,
+                execution_mode=execution_mode,
             )
 
     await record_audit(
@@ -304,7 +314,7 @@ async def cancel_order(
     ORDER_COUNT.labels(final_order.status.value).inc()
 
     instrument = await _get_instrument_by_symbol(db, final_order.symbol)
-    await persist_order(db, final_order, user.id, instrument.id)
+    await persist_order(db, final_order, user.id, instrument.id, execution_mode=_execution_mode_for(stack))
 
     await record_audit(db, actor="user", action="order.cancelled", user_id=user.id, details={"order_id": str(order_id)})
     await _publish_order_event(user, final_order)

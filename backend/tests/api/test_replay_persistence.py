@@ -176,8 +176,17 @@ async def test_user_cannot_access_another_users_replay_session(require_infra):
             r = client.post(f"/replay/{session_id}/order", json={"action": "buy", "quantity": 1}, headers=other_headers)
             assert r.status_code == 404, r.text
 
+            r = client.delete(f"/replay/{session_id}", headers=other_headers)
+            assert r.status_code == 404, r.text
+
             # The owner can still use their own session.
-            r = client.get(f"/replay/{session_id}", headers={"Authorization": f"Bearer {owner_token}"})
+            owner_headers = {"Authorization": f"Bearer {owner_token}"}
+            r = client.get(f"/replay/{session_id}", headers=owner_headers)
             assert r.status_code == 200, r.text
+
+            r = client.delete(f"/replay/{session_id}", headers=owner_headers)
+            assert r.status_code == 204, r.text
+            r = client.get(f"/replay/{session_id}", headers=owner_headers)
+            assert r.status_code == 404, r.text
         finally:
             await _cleanup([owner_id, other_id], instrument.id)

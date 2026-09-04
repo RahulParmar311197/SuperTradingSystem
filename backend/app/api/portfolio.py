@@ -1,9 +1,12 @@
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.orders import _stack_for
 from app.auth.dependencies import get_current_user
 from app.database.models.users import User
+from app.database.session import get_db
+from app.risk.portfolio import compute_portfolio_exposure
 
 router = APIRouter(tags=["portfolio"])
 
@@ -14,17 +17,27 @@ class PortfolioResponse(BaseModel):
     open_position_count: int
     total_unrealized_pnl: float
     total_realized_pnl: float
+    # Blueprint §86 "Portfolio Risk": total exposure and market-type
+    # breakdown, read from the persisted `positions` table (see
+    # app.trading.persistence) rather than the in-memory position
+    # manager above — this is what a restart, an admin, or another
+    # process would also see.
+    total_exposure: float
+    exposure_by_market: dict[str, float]
 
 
 @router.get("/portfolio", response_model=PortfolioResponse)
-async def get_portfolio(user: User = Depends(get_current_user)) -> PortfolioResponse:
+async def get_portfolio(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> PortfolioResponse:
     stack = _stack_for(user)
     account = await stack.broker.get_account()
     positions = stack.position_manager.open_positions(str(user.id))
+    exposure = await compute_portfolio_exposure(db, user.id)
     return PortfolioResponse(
         balance=account.balance,
         equity=account.equity,
         open_position_count=len(positions),
         total_unrealized_pnl=sum(p.unrealized_pnl for p in positions),
         total_realized_pnl=sum(p.realized_pnl for p in positions),
+        total_exposure=exposure.total_exposure,
+        exposure_by_market=exposure.exposure_by_market,
     )

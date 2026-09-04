@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api import (
+    admin,
     ai,
     auth,
     auto_trading,
@@ -85,6 +86,7 @@ app.include_router(portfolio.router)
 app.include_router(brokers.router)
 app.include_router(auto_trading.router)
 app.include_router(trading_permissions.router)
+app.include_router(admin.router)
 app.include_router(websockets.router)
 
 

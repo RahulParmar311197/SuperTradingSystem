@@ -19,6 +19,7 @@ from app.database.models.users import TradingPermission, User
 from app.database.session import get_db
 from app.risk.engine import RiskEngine, TradeRiskProposal, calculate_position_size
 from app.risk.limits import RiskLimits
+from app.risk.portfolio import compute_correlated_exposure
 from app.trading.execution import ExecutionEngine
 from app.trading.order_manager import OrderManager
 from app.trading.persistence import persist_order, persist_position, record_trade
@@ -141,6 +142,16 @@ async def place_order(
     account = await stack.broker.get_account()
     open_positions = stack.position_manager.open_positions(str(user.id))
     current_exposure = sum(abs(p.quantity) * p.average_price for p in open_positions)
+    other_position_notionals = {
+        p.symbol: abs(p.quantity) * p.average_price for p in open_positions if p.symbol != payload.symbol
+    }
+    correlated_exposure = await compute_correlated_exposure(
+        db,
+        target_symbol=payload.symbol,
+        target_notional=0.0,  # the engine adds this trade's own sized notional itself
+        open_position_notionals=other_position_notionals,
+        threshold=stack.risk_engine.limits.correlation_threshold,
+    )
     proposal = TradeRiskProposal(
         account_id=str(user.id),
         strategy_id=None,
@@ -159,6 +170,7 @@ async def place_order(
         # every order in a system with no broker connected.
         market_data_age_seconds=await get_price_age_seconds(payload.symbol) or 0.0,
         broker_healthy=await stack.broker.is_healthy(),
+        correlated_exposure=correlated_exposure,
     )
     decision = stack.risk_engine.evaluate(proposal)
     db.add(

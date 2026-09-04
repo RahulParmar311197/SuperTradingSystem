@@ -79,6 +79,21 @@ def test_rejects_when_market_data_stale():
     assert result.decision == RiskDecision.REJECT
 
 
+def test_correlated_exposure_defaults_to_a_no_op():
+    # correlated_exposure defaults to 0.0 — a clean trade must still
+    # approve even though max_correlated_exposure_pct exists.
+    result = RiskEngine().evaluate(_base_proposal())
+    assert any(c.name == "correlated_exposure_limit" and c.passed for c in result.checks)
+
+
+def test_rejects_when_correlated_exposure_limit_exceeded():
+    limits = RiskLimits(max_correlated_exposure_pct=10.0)
+    proposal = _base_proposal(correlated_exposure=50_000.0)  # 50% of 100k balance
+    result = RiskEngine(limits=limits).evaluate(proposal)
+    assert result.decision == RiskDecision.REJECT
+    assert any(c.name == "correlated_exposure_limit" and not c.passed for c in result.checks)
+
+
 def test_rejects_when_broker_unhealthy():
     result = RiskEngine().evaluate(_base_proposal(broker_healthy=False))
     assert result.decision == RiskDecision.REJECT

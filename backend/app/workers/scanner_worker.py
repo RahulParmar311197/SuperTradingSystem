@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import select
 
-from app.core.redis import channel_name, publish
+from app.core.redis import channel_name, heartbeat, publish
 from app.database.models.instruments import Instrument
 from app.database.models.strategy import Direction, Signal
 from app.database.models.strategy import Strategy as StrategyRow
@@ -115,4 +115,5 @@ class ScannerWorker:
                 await self.run_once()
             except Exception:
                 logger.exception("Scanner pass failed")
+            await heartbeat("scanner")
             await asyncio.sleep(self.interval_seconds)

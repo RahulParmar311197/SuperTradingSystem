@@ -2,7 +2,15 @@
 
 import uuid
 
-from app.core.redis import account_halt_reason, get_price_age_seconds, halt_account, resume_account, set_latest_price
+from app.core.redis import (
+    account_halt_reason,
+    get_price_age_seconds,
+    halt_account,
+    heartbeat,
+    resume_account,
+    set_latest_price,
+    worker_is_alive,
+)
 
 
 async def test_price_age_is_none_when_never_set(require_infra):
@@ -27,3 +35,11 @@ async def test_halt_and_resume_account(require_infra):
 
     await resume_account(account_id)
     assert await account_halt_reason(account_id) is None
+
+
+async def test_worker_is_alive_only_after_a_heartbeat(require_infra):
+    name = f"testworker-{uuid.uuid4().hex[:8]}"
+    assert await worker_is_alive(name) is False
+
+    await heartbeat(name)
+    assert await worker_is_alive(name) is True

@@ -31,6 +31,13 @@ class TradeRiskProposal:
     broker_healthy: bool
     repeated_rejections: int = 0
     recent_price_jump_pct: float = 0.0
+    # Blueprint §85: notional of every *other* open position correlated
+    # with this one at or above RiskLimits.correlation_threshold (see
+    # app.risk.correlation.correlated_exposure) — this trade's own sized
+    # notional is added internally below, the same way current_exposure
+    # and strategy_allocation are. 0.0, the default, makes the check a
+    # no-op, since correlation data isn't always available.
+    correlated_exposure: float = 0.0
     liquidity_acceptable: bool = True
 
     proposed_quantity: float | None = None  # if None, engine sizes the position
@@ -116,6 +123,19 @@ class RiskEngine:
                 "strategy_allocation_limit",
                 strategy_allocation_pct <= limits.max_strategy_allocation_pct,
                 f"Strategy allocation {strategy_allocation_pct:.2f}% vs limit {limits.max_strategy_allocation_pct}%",
+            )
+        )
+
+        correlated_exposure_pct = (
+            (proposal.correlated_exposure + position_notional) / proposal.account_balance * 100
+            if proposal.account_balance
+            else 100.0
+        )
+        checks.append(
+            RiskCheck(
+                "correlated_exposure_limit",
+                correlated_exposure_pct <= limits.max_correlated_exposure_pct,
+                f"Correlated exposure {correlated_exposure_pct:.2f}% vs limit {limits.max_correlated_exposure_pct}%",
             )
         )
 

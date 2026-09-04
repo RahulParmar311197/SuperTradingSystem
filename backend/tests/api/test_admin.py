@@ -47,6 +47,7 @@ async def test_admin_endpoints_reject_non_admin_users(require_infra):
                 "/admin/risk-events",
                 "/admin/system-health",
                 "/admin/halted-accounts",
+                "/admin/ai-decisions",
             ):
                 r = client.get(path, headers=headers)
                 assert r.status_code == 403, f"{path}: {r.text}"
@@ -83,6 +84,9 @@ async def test_admin_endpoints_return_data_for_admin_user(require_infra):
             assert r.status_code == 200, r.text
 
             r = client.get("/admin/risk-events", headers=headers)
+            assert r.status_code == 200, r.text
+
+            r = client.get("/admin/ai-decisions", headers=headers)
             assert r.status_code == 200, r.text
 
             r = client.get("/admin/system-health", headers=headers)

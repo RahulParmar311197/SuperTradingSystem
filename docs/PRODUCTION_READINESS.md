@@ -25,7 +25,7 @@ money to this system.
 | Broker-disconnect handling tested | ⚠️ Partial | `broker_healthy` check + reconciliation-triggered halt exist and are tested against `MockBroker` and now actually run continuously for connected accounts (see Order reconciliation above); no real broker to actually disconnect from |
 | Market-data failure handling tested | ⚠️ Partial | Staleness check (`get_price_age_seconds`) is real and tested (`tests/test_core_redis.py`) against Redis; there's no live feed to actually go stale yet |
 | Kill switch tested | ✅ | Strategy/account/global — `tests/risk/test_engine.py` |
-| Audit logs working | ✅ | `audit_logs` + `risk_events` tables, wired into auth, orders, auto-trading, reconciliation; visible cross-account via `GET /admin/*` (blueprint §116) for the `ADMIN` role, which never exposes `encrypted_credentials` |
+| Audit logs working | ✅ | `audit_logs` + `risk_events` tables, wired into auth, orders, auto-trading, reconciliation; `ai_decisions` now has a real writer too (`POST /ai/propose-trade`) where before the table existed with zero rows ever written to it; visible cross-account via `GET /admin/*` (blueprint §116) for the `ADMIN` role, which never exposes `encrypted_credentials` |
 | Paper trading successful | ✅ | `app/paper`, exercised end-to-end including inside the autonomous loop (`tests/workers/test_auto_trade_worker.py`) |
 | Out-of-sample testing completed | ⚠️ Mechanism exists, not "completed" | `POST /backtest/validate` runs train/validation/test splits — but this is a tool, not a result; no actual strategy has been through it against real market data |
 | Live trading limits configured | ❌ | No live account exists to configure limits *for* |

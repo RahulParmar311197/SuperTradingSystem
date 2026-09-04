@@ -11,7 +11,7 @@ pytestmark = pytest.mark.asyncio
 # real worker process sharing this Redis instance) may have left behind,
 # since these are fixed, well-known worker names, not per-test-unique ones.
 _HEARTBEAT_PREFIX = "heartbeat:worker:"
-_WORKER_NAMES = ("market_data", "scanner", "auto_trade")
+_WORKER_NAMES = ("market_data", "scanner", "auto_trade", "reconciliation")
 
 
 async def test_health_reports_worker_liveness(require_infra):
@@ -25,9 +25,18 @@ async def test_health_reports_worker_liveness(require_infra):
         assert set(body.keys()) >= {"api", "database", "redis", "ai", "dhan", "upstox", "workers"}
         assert body["database"] == "HEALTHY"
         assert body["redis"] == "HEALTHY"
-        # No worker process is running in this test suite, so every
-        # worker should honestly read DOWN rather than a false HEALTHY.
-        assert set(body["workers"].values()) == {"DOWN"}
+        # market_data/scanner/auto_trade only ever heartbeat from the
+        # separate `worker` process (see app/workers/main.py) — never
+        # started here — so with none running they should honestly read
+        # DOWN rather than a false HEALTHY.
+        for name in ("market_data", "scanner", "auto_trade"):
+            assert body["workers"][name] == "DOWN"
+        # `reconciliation` is different: it runs inside this API process's
+        # own lifespan (app.trading.live_reconciliation) and heartbeats on
+        # its first pass, which has already happened by the time this
+        # request lands — proof the wiring actually runs, not just that
+        # the mechanism exists.
+        assert body["workers"]["reconciliation"] == "HEALTHY"
 
         await heartbeat("scanner")
         r = client.get("/health")

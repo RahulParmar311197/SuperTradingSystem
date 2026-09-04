@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -31,6 +32,7 @@ from app.core.metrics import metrics_response
 from app.core.middleware import RequestContextMiddleware
 from app.monitoring.health import check_database, check_redis
 from app.monitoring.health import router as health_router
+from app.trading.live_reconciliation import run as run_live_reconciliation
 
 settings = get_settings()
 configure_logging("DEBUG" if settings.debug else "INFO")
@@ -46,7 +48,16 @@ async def lifespan(_app: FastAPI):
         logger.warning("Database is not reachable at startup — API will serve requests but most will fail")
     if redis_status.value != "HEALTHY":
         logger.warning("Redis is not reachable at startup — caching, pub/sub and rate limiting will fail")
+
+    # Runs in this process, not the separate `worker` process — see
+    # app.trading.live_reconciliation's module docstring for why.
+    reconciliation_task = asyncio.create_task(run_live_reconciliation(), name="live_reconciliation")
     yield
+    reconciliation_task.cancel()
+    try:
+        await reconciliation_task
+    except asyncio.CancelledError:
+        pass
     logger.info("Shutting down")
 
 

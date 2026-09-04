@@ -23,10 +23,12 @@ from app.workers.candle_worker import CandleWorker
 from app.workers.market_data_worker import MarketDataWorker
 from app.workers.scanner_worker import ScannerWorker
 
-# ReconciliationWorker isn't started here: it runs per live-broker account
-# (it needs that account's authenticated Broker instance), and there is no
-# live broker connected to any account yet. Instantiate one per account
-# once app/brokers/upstox or app/brokers/dhan is wired to real credentials.
+# ReconciliationWorker isn't started here: it needs the same
+# OrderManager/PositionManager instances a user's live orders were placed
+# through, which only exist inside the API process's memory (see
+# app/api/orders.py's `_STACKS`) — a separate `worker` process has no way
+# to reach them. See app/trading/live_reconciliation.py, started from
+# app/main.py's lifespan instead.
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("workers.main")

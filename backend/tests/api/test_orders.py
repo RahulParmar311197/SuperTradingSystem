@@ -1,10 +1,11 @@
 import uuid
+from datetime import date, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import delete, select
 
-from app.database.models.instruments import Instrument, MarketType
+from app.database.models.instruments import Instrument, MarketType, OptionType
 from app.database.models.risk import AuditLog, RiskEvent
 from app.database.models.trading import Order, OrderEvent, Position, Trade
 from app.database.models.users import User, UserSession
@@ -128,6 +129,64 @@ async def test_place_and_close_order_persists_to_database(require_infra):
                 # 100 shares bought at 100, sold at 110 -> 1000 realized profit.
                 assert float(trade_row.pnl) == pytest.approx(1000.0, rel=1e-6)
                 assert trade_row.direction.value == "LONG"
+        finally:
+            await _cleanup(user_id, instrument_id)
+
+
+async def test_single_leg_option_order_persists_like_any_other_instrument(require_infra):
+    """Blueprint §12 gives `instruments` strike/expiry/option_type
+    directly — nothing in the order/execution/persistence pipeline
+    branches on market type, so a single option contract should already
+    place and close exactly like an equity does. (Multi-leg *strategy*
+    execution — atomically submitting several legs together — is the
+    real gap; see docs/PRODUCTION_READINESS.md.)"""
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        async with async_session_factory() as db:
+            instrument = Instrument(
+                symbol=f"OPT{uuid.uuid4().hex[:6].upper()}",
+                exchange="NSE",
+                market=MarketType.OPTIONS,
+                instrument_type="OPTION",
+                underlying="NIFTY",
+                expiry=date.today() + timedelta(days=7),
+                strike=25000.0,
+                option_type=OptionType.CALL,
+                lot_size=50,
+            )
+            db.add(instrument)
+            await db.commit()
+            await db.refresh(instrument)
+            instrument_id = instrument.id
+
+        try:
+            r = client.post(
+                "/orders",
+                json={"symbol": instrument.symbol, "direction": "LONG", "entry": 150.0, "stop": 100.0},
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+            assert r.json()["status"] in ("FILLED", "MONITORING")
+
+            async with async_session_factory() as db:
+                order_row = (await db.execute(select(Order).where(Order.user_id == user_id))).scalar_one()
+                assert order_row.instrument_id == instrument_id
+
+                position_row = (await db.execute(select(Position).where(Position.user_id == user_id))).scalar_one()
+                assert position_row.is_open is True
+
+            r = client.post(
+                "/orders",
+                json={"symbol": instrument.symbol, "direction": "SHORT", "entry": 180.0, "stop": 220.0},
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+
+            async with async_session_factory() as db:
+                trade_row = (await db.execute(select(Trade).where(Trade.user_id == user_id))).scalar_one()
+                assert float(trade_row.pnl) > 0  # bought the premium at 150, sold at 180
         finally:
             await _cleanup(user_id, instrument_id)
 

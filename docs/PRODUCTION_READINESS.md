@@ -17,12 +17,12 @@ money to this system.
 | Replay tests passing | ✅ | `tests/replay` |
 | Backtest tests passing | ✅ | `tests/backtest`, including out-of-sample validation (`validate_out_of_sample`) |
 | Slippage model implemented | ✅ | `app.backtest.cost_model.CostModel`; `MockBroker` also simulates slippage/partial fills/rejections |
-| Options execution tested | ⚠️ Partial | Greeks/payoff math is tested (`tests/options`); there is no options *order* execution path — no broker connects real options orders yet |
+| Options execution tested | ⚠️ Partial | Greeks/payoff math is tested (`tests/options`). A **single** option contract already places and closes through `POST /orders` exactly like an equity does — nothing in the order/execution/persistence pipeline branches on market type, proven by `tests/api/test_orders.py::test_single_leg_option_order_persists_like_any_other_instrument`. What's still missing is **multi-leg strategy execution**: submitting a spread/condor/etc. (`app/options/strategies.py`) as one atomic set of orders, with the options liquidity filter (`app/options/liquidity_filter.py`) gating each leg first — that orchestration doesn't exist yet. |
 | Risk engine tested | ✅ | `tests/risk` — position sizing, all limit checks, kill switches, plus the correlation engine (blueprint §85-86: `app/risk/correlation.py` pure math, `app/risk/portfolio.py` real-candle-history integration) and the `correlated_exposure_limit` check it feeds |
-| Broker authentication tested | ⚠️ Partial | Upstox OAuth flow implemented and tested end-to-end (`tests/api/test_brokers_upstox_oauth.py`) with a mocked token endpoint — **never tested against Upstox's real servers** (no credentials, and this sandbox can't reach upstox.com). Dhan has no implementation at all yet. |
-| Order reconciliation tested | ⚠️ Partial | `ReconciliationWorker` + `app.trading.reconciliation` are tested (`tests/trading/test_reconciliation.py`, `tests/workers/test_reconciliation_worker.py`) — only against `MockBroker`, never a real broker's actual drift patterns |
+| Broker authentication tested | ⚠️ Partial | Upstox OAuth flow implemented and tested end-to-end (`tests/api/test_brokers_upstox_oauth.py`) with a mocked token endpoint — **never tested against Upstox's real servers** (no credentials, and this sandbox can't reach upstox.com). Dhan has no implementation at all yet. `app/trading/broker_resolver.py` (tested: `tests/trading/test_broker_resolver.py`) now actually selects the right adapter for a connected account instead of always `MockBroker` — the untested part is specifically Upstox's/Dhan's own HTTP calls against real servers, not the selection logic. |
+| Order reconciliation tested | ⚠️ Partial | `ReconciliationWorker` + `app.trading.reconciliation` are tested (`tests/trading/test_reconciliation.py`, `tests/workers/test_reconciliation_worker.py`) — only against `MockBroker`, never a real broker's actual drift patterns. It's now actually wired up and running (`app/trading/live_reconciliation.py`, tested end-to-end in `tests/trading/test_live_reconciliation.py`: a broker-side position with no local match really does halt the account), which it previously wasn't — "isn't started here" was a comment in `app/workers/main.py`, not a real gap in the reconciliation logic itself. |
 | Duplicate-order protection tested | ✅ | Idempotency keys, `tests/trading/test_execution.py`; `POST /orders` now persists every order/fill to Postgres (`orders`/`order_events`/`positions`/`trades`, see `app/trading/persistence.py`) instead of only holding state in one API process's memory, and `tests/api/test_orders.py` proves a closing fill writes exactly one `Trade` journal row with the correct realized P&L |
-| Broker-disconnect handling tested | ⚠️ Partial | `broker_healthy` check + reconciliation-triggered halt exist and are tested against `MockBroker`; no real broker to actually disconnect from |
+| Broker-disconnect handling tested | ⚠️ Partial | `broker_healthy` check + reconciliation-triggered halt exist and are tested against `MockBroker` and now actually run continuously for connected accounts (see Order reconciliation above); no real broker to actually disconnect from |
 | Market-data failure handling tested | ⚠️ Partial | Staleness check (`get_price_age_seconds`) is real and tested (`tests/test_core_redis.py`) against Redis; there's no live feed to actually go stale yet |
 | Kill switch tested | ✅ | Strategy/account/global — `tests/risk/test_engine.py` |
 | Audit logs working | ✅ | `audit_logs` + `risk_events` tables, wired into auth, orders, auto-trading, reconciliation; visible cross-account via `GET /admin/*` (blueprint §116) for the `ADMIN` role, which never exposes `encrypted_credentials` |
@@ -103,7 +103,12 @@ For real deployment:
 7. Add a reverse proxy in front of the API for TLS termination — see
    `infrastructure/nginx/nginx.conf.example` (not wired into
    docker-compose.yml — add it once you're running more than one API
-   replica).
+   replica). **Run exactly one API replica** if any account has a
+   connected broker: the order/position state and the live reconciliation
+   loop that protects it (`app/trading/broker_resolver.py`,
+   `app/trading/live_reconciliation.py`) both live in that one process's
+   memory — see docs/ARCHITECTURE.md's "Multiple API replicas for the
+   manual /orders path".
 8. **Do not set `auto_trading_enabled=true` on any real account** until
    the §119 compliance items above are resolved and you've watched that
    account's strategy behave correctly in paper mode for a meaningful

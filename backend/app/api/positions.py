@@ -1,9 +1,11 @@
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.orders import _stack_for
 from app.auth.dependencies import get_current_user
 from app.database.models.users import User
+from app.database.session import get_db
 
 router = APIRouter(tags=["trading"])
 
@@ -17,8 +19,8 @@ class PositionResponse(BaseModel):
 
 
 @router.get("/positions", response_model=list[PositionResponse])
-async def list_positions(user: User = Depends(get_current_user)) -> list[PositionResponse]:
-    stack = _stack_for(user)
+async def list_positions(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> list[PositionResponse]:
+    stack = await _stack_for(user, db)
     positions = stack.position_manager.open_positions(str(user.id))
     return [
         PositionResponse(

@@ -22,9 +22,11 @@ class ComponentStatus(StrEnum):
 
 
 # The worker names each loop actually heartbeats under — see
-# app/workers/main.py, app/workers/scanner_worker.py, and
-# app/workers/auto_trade_worker.py.
-_WORKER_NAMES = ("market_data", "scanner", "auto_trade")
+# app/workers/main.py, app/workers/scanner_worker.py,
+# app/workers/auto_trade_worker.py, and app/trading/live_reconciliation.py
+# (the last one runs inside this API process, not the separate `worker`
+# process, but is still worth reporting here for the same reason).
+_WORKER_NAMES = ("market_data", "scanner", "auto_trade", "reconciliation")
 
 
 async def check_database() -> ComponentStatus:

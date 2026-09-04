@@ -20,6 +20,7 @@ from app.database.session import get_db
 from app.risk.engine import RiskEngine, TradeRiskProposal, calculate_position_size
 from app.risk.limits import RiskLimits
 from app.risk.portfolio import compute_correlated_exposure
+from app.trading.broker_resolver import resolve_broker
 from app.trading.execution import ExecutionEngine
 from app.trading.order_manager import OrderManager
 from app.trading.persistence import persist_order, persist_position, record_trade
@@ -48,15 +49,14 @@ class _UserTradingStack:
     — see `app.trading.persistence` for how their results get mirrored
     into Postgres (`orders`/`order_events`/`positions`/`trades`) after
     every transition, so a restart, the reconciliation worker, and the
-    trade journal (blueprint §61) all see real data. What's still missing
-    is a real broker: this resolves the broker from the user's connected
-    `BrokerAccount` (Dhan/Upstox) rather than always using `MockBroker`,
-    and until then the API surface and risk gate are only exercisable
-    end-to-end against the mock.
+    trade journal (blueprint §61) all see real data. `broker` comes from
+    `app.trading.broker_resolver.resolve_broker` — `MockBroker` for a user
+    with no connected account (Stage 9's honest default), a real
+    `UpstoxBroker`/`DhanBroker` for one who has connected one.
     """
 
-    def __init__(self) -> None:
-        self.broker = MockBroker(starting_balance=100_000.0)
+    def __init__(self, broker) -> None:
+        self.broker = broker
         self.order_manager = OrderManager()
         self.position_manager = PositionManager()
         self.risk_engine = RiskEngine(limits=RiskLimits())
@@ -69,10 +69,25 @@ class _UserTradingStack:
 _STACKS: dict[uuid.UUID, _UserTradingStack] = {}
 
 
-def _stack_for(user: User) -> _UserTradingStack:
+async def _stack_for(user: User, db: AsyncSession) -> _UserTradingStack:
+    """Resolves (and caches) the trading stack for `user`. The broker is
+    resolved once, at first use — connecting or disconnecting a broker
+    account takes effect on this stack's next process restart, the same
+    documented limitation as the rest of this in-memory stack (see
+    docs/ARCHITECTURE.md's "Multiple API replicas for the manual /orders
+    path")."""
     if user.id not in _STACKS:
-        _STACKS[user.id] = _UserTradingStack()
+        broker = await resolve_broker(db, user)
+        _STACKS[user.id] = _UserTradingStack(broker)
     return _STACKS[user.id]
+
+
+def all_stacks() -> dict[uuid.UUID, _UserTradingStack]:
+    """A snapshot of every trading stack this API process currently holds
+    — used by `app.trading.live_reconciliation` to reconcile whichever
+    connected accounts have actually placed an order this process
+    lifetime. Not for mutation; callers get a shallow copy."""
+    return dict(_STACKS)
 
 
 class PlaceOrderRequest(BaseModel):
@@ -136,8 +151,13 @@ async def place_order(
 
     instrument = await _get_instrument_by_symbol(db, payload.symbol)
 
-    stack = _stack_for(user)
-    stack.broker.set_quote(payload.symbol, ltp=payload.entry)
+    stack = await _stack_for(user, db)
+    if isinstance(stack.broker, MockBroker):
+        # Only MockBroker needs a quote fed in — a real broker gets its
+        # own price from the market, not from what the client submitted
+        # as "entry". Never let a real order's fill price be dictated by
+        # the caller.
+        stack.broker.set_quote(payload.symbol, ltp=payload.entry)
 
     account = await stack.broker.get_account()
     open_positions = stack.position_manager.open_positions(str(user.id))
@@ -259,8 +279,8 @@ async def place_order(
 
 
 @router.get("/orders", response_model=list[OrderResponse])
-async def list_orders(user: User = Depends(get_current_user)) -> list[OrderResponse]:
-    stack = _stack_for(user)
+async def list_orders(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> list[OrderResponse]:
+    stack = await _stack_for(user, db)
     return [_to_response(o) for o in stack.order_manager.list_all(str(user.id))]
 
 
@@ -270,7 +290,7 @@ async def cancel_order(
     user: User = Depends(require_permission(TradingPermission.LIVE_TRADE)),
     db: AsyncSession = Depends(get_db),
 ) -> OrderResponse:
-    stack = _stack_for(user)
+    stack = await _stack_for(user, db)
     order = stack.order_manager.get(order_id)
     if order is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Order not found")

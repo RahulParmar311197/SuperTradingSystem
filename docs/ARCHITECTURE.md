@@ -17,8 +17,8 @@ what's built, that file is about what's actually safe to turn on.
 | 6 | Options | `app/options`: Black-Scholes Greeks, multi-leg payoff engine (max profit/loss/breakevens), liquidity filter, named strategy builders (spreads, condor, butterfly, straddle, strangle). |
 | 7 | Paper trading | `app/paper`: strategy -> risk -> broker -> position manager -> portfolio, built on the same order/broker stack as live trading. Now also runs unattended inside the autonomous loop (Stage 10). |
 | 8 | Dhan/Upstox | `app/brokers/dhan`: adapter skeleton, every HTTP call still a `NotImplementedError` TODO. **`app/brokers/upstox` is a real implementation** — OAuth2 authorization-code flow (`app/brokers/upstox/oauth.py`, plus `GET /brokers/upstox/authorize` and `/callback`), and `UpstoxBroker` implements every `Broker` method against Upstox's documented v2 API. Built from search-result snippets, not a fetched/verified copy of the live docs (this sandbox's egress to upstox.com is blocked) — tested against a mocked HTTP transport (`tests/brokers/test_upstox_adapter.py`), **never against Upstox's real servers**. Verify every endpoint/field/status-string against the live docs or Postman collection before connecting a real account. |
-| 9 | Controlled live trading | `app/api/orders.py` exercises the full risk-gate -> execution -> position flow (currently against `MockBroker` — no live broker wired to a real account balance yet). Gated behind the `LIVE_TRADE` trading permission (blueprint §88), which — like `AUTO_TRADE` — isn't granted at registration; a user opts in via `POST /trading-permissions/grant` (`confirm: true`). Every order/fill is mirrored into Postgres (`app/trading/persistence.py`) into the real `orders`/`order_events`/`positions`/`trades` tables as it happens — a closing or reducing fill writes a `Trade` journal row (blueprint §61) the same way autonomous trading already did, and the risk engine's exposure check now sums real open-position notional instead of a hardcoded zero. Also: a Redis-backed **trading halt** checked before every order (`account_halt_reason`), real market-data-staleness lookups from the Redis price cache, and a **reconciliation worker** (`app/workers/reconciliation_worker.py`, blueprint §75) that compares local vs. broker state and halts new entries on any mismatch — resuming is a deliberate manual step, not automatic. `Order`/`Trade` rows carry `strategy_version` (blueprint §91) so a trade always names the exact strategy definition that produced it, even after the strategy is later edited (`PUT /strategies/{id}` bumps `version` rather than overwriting history). |
-| 10 | Autonomous trading | **The full loop runs now**, end-to-end, tested against real Postgres/Redis (`tests/workers/test_auto_trade_worker.py`): `ScannerWorker` runs WATCH/SCAN/DETECT; `AutoTradeSupervisor` (`app/workers/auto_trade_worker.py`) runs VALIDATE/RISK CHECK/TRADE/MONITOR/EXIT/JOURNAL for any (user, strategy) pair that has explicitly opted in — `user.auto_trading_enabled` (set only via `POST /auto-trading/enable` with `confirm: true`, blueprint §102) *and* the `AUTO_TRADE` permission *and* the strategy marked both `is_active` and `eligible_for_auto_trading`, checked against the Redis trading halt on every pass. It closes positions, writes a `Trade` journal row, and sends a notification. **This currently drives `MockBroker` for every account** (see Stage 9) — autonomous *paper* trading is real today; autonomous *live* trading needs a real broker wired to a real account first. |
+| 9 | Controlled live trading | `app/api/orders.py` exercises the full risk-gate -> execution -> position flow. **The broker is no longer hardcoded**: `app/trading/broker_resolver.py` looks up the user's connected `BrokerAccount` and returns a real `UpstoxBroker`/`DhanBroker` built from their stored (decrypted) credentials for an ACTIVE connection, or `MockBroker` when nothing is connected — the honest Stage 9 default, not a workaround. A broken connection (missing/malformed stored credentials) raises rather than silently falling back to Mock (blueprint §101: "Never make paper and live look identical"). Gated behind the `LIVE_TRADE` trading permission (blueprint §88), which — like `AUTO_TRADE` — isn't granted at registration; a user opts in via `POST /trading-permissions/grant` (`confirm: true`). Every order/fill is mirrored into Postgres (`app/trading/persistence.py`) into the real `orders`/`order_events`/`positions`/`trades` tables as it happens — a closing or reducing fill writes a `Trade` journal row (blueprint §61), and the risk engine's exposure check sums real open-position notional. Also: a Redis-backed **trading halt** checked before every order (`account_halt_reason`), real market-data-staleness lookups from the Redis price cache, and **live reconciliation** (`app/trading/live_reconciliation.py`, blueprint §75) — a loop inside the API process's own lifespan (it needs the same `OrderManager`/`PositionManager` instances a user's orders were placed through, which only exist there) that runs `ReconciliationWorker` for every connected account with an active trading stack and halts new entries on any mismatch; resuming is a deliberate manual step, not automatic. `Order`/`Trade` rows carry `strategy_version` (blueprint §91) so a trade always names the exact strategy definition that produced it, even after the strategy is later edited (`PUT /strategies/{id}` bumps `version` rather than overwriting history). |
+| 10 | Autonomous trading | **The full loop runs now**, end-to-end, tested against real Postgres/Redis (`tests/workers/test_auto_trade_worker.py`): `ScannerWorker` runs WATCH/SCAN/DETECT; `AutoTradeSupervisor` (`app/workers/auto_trade_worker.py`) runs VALIDATE/RISK CHECK/TRADE/MONITOR/EXIT/JOURNAL for any (user, strategy) pair that has explicitly opted in — `user.auto_trading_enabled` (set only via `POST /auto-trading/enable` with `confirm: true`, blueprint §102) *and* the `AUTO_TRADE` permission *and* the strategy marked both `is_active` and `eligible_for_auto_trading`, checked against the Redis trading halt on every pass. It closes positions, writes a `Trade` journal row, and sends a notification. **This still always drives `MockBroker`** — unlike Stage 9's manual path, `PaperTradingEngine` calls `broker.set_quote(...)` directly to inject each candle's price into the fill simulation, a method only `MockBroker` has; wiring a real broker in here needs the execution flow itself redesigned (a real fill price comes from the broker's own market access, not from the local candle), not just a broker swap — autonomous *paper* trading is real today, autonomous *live* trading is a bigger change than Stage 9's was. |
 
 ## Portfolio risk and the correlation engine (§85-86)
 
@@ -43,6 +43,27 @@ Two pieces the blueprint calls out as their own engines, not folded into
   defaults to 100% (a no-op) since correlation data isn't always available
   and this must never silently block trading where it hasn't been computed.
 
+## Broker resolution and live reconciliation (§50, §53, §75)
+
+- **`app/trading/broker_resolver.py`** — the piece blueprint §53 "Broker
+  Abstraction" implies but that didn't exist until now: something has to
+  pick *which* `Broker` a specific user's orders go through.
+  `resolve_broker(db, user)` looks up that user's most recent ACTIVE
+  `BrokerAccount`, decrypts its stored credentials, and constructs the
+  matching adapter — `UpstoxBroker` for Upstox, `DhanBroker` for Dhan
+  (still real code, still ending in `NotImplementedError` on any actual
+  call, honestly). No connected account means `MockBroker`. A connected
+  account with broken credentials raises rather than quietly falling back
+  to Mock.
+- **`app/trading/live_reconciliation.py`** — runs `ReconciliationWorker`
+  (blueprint §75) for every ACTIVE `BrokerAccount` that also has a live
+  trading stack in this process, on a loop started from `app/main.py`'s
+  lifespan. It runs inside the **API** process rather than the separate
+  `worker` process (see `app/workers/main.py`) because it needs the exact
+  `OrderManager`/`PositionManager` instances a user's orders were placed
+  through — those live in `app/api/orders.py`'s in-memory `_STACKS`,
+  which the `worker` process can never see.
+
 ## What's deliberately not implemented
 
 - **Android app** — `android/` is a package-structure scaffold (§6), not a
@@ -50,12 +71,16 @@ Two pieces the blueprint calls out as their own engines, not folded into
   environment).
 - **Real Dhan connectivity** — still a skeleton; see Stage 8. Upstox has a
   real (unverified-against-live-servers) implementation.
-- **A live broker tied to a real account balance** — `UpstoxBroker` can
-  authenticate and call every endpoint it implements, but nothing in
-  `app/api/orders.py` or the autonomous loop selects it over `MockBroker`
-  yet for a specific user's connected `BrokerAccount`. That wiring (plus
-  the SEBI compliance steps in `PRODUCTION_READINESS.md`) is what's left
-  between "autonomous paper trading" and "autonomous live trading."
+- **A live broker tied to a real account balance, verified end-to-end** —
+  `app/api/orders.py` (Stage 9) now selects `UpstoxBroker`/`DhanBroker`
+  for a user's connected `BrokerAccount` instead of always `MockBroker`
+  (see `app/trading/broker_resolver.py`), but that adapter itself is
+  still untested against Upstox's real servers (this sandbox's egress to
+  upstox.com is blocked — see Stage 8) and Dhan's HTTP calls are still
+  `NotImplementedError` TODOs. Autonomous trading (Stage 10) hasn't been
+  wired to a real broker at all — see that stage's row for why it's a
+  bigger change than Stage 9's was. The SEBI compliance steps in
+  `PRODUCTION_READINESS.md` are the remaining non-code blocker either way.
 - **Multi-instance coordination beyond Redis** — the API and worker
   processes already share state correctly through Postgres/Redis (see
   "Cross-process design" below), but there's no leader election, so

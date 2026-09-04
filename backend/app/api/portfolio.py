@@ -28,7 +28,7 @@ class PortfolioResponse(BaseModel):
 
 @router.get("/portfolio", response_model=PortfolioResponse)
 async def get_portfolio(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> PortfolioResponse:
-    stack = _stack_for(user)
+    stack = await _stack_for(user, db)
     account = await stack.broker.get_account()
     positions = stack.position_manager.open_positions(str(user.id))
     exposure = await compute_portfolio_exposure(db, user.id)

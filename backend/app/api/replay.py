@@ -156,3 +156,16 @@ async def submit_replay_order(
 
     await sync_replay_session(db, session_id, engine)
     return _state_response(session_id, engine)
+
+
+@router.delete("/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def close_replay_session(
+    session_id: uuid.UUID, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
+) -> None:
+    """Ends a replay session, freeing its in-memory engine. `_SESSIONS`
+    has no automatic eviction — every created session stays in process
+    memory until this is called or the process restarts. The persisted
+    `replay_sessions`/`replay_orders` rows are left alone -- this only
+    closes the live working copy, not the history."""
+    await _get_owned_session(session_id, user, db)
+    del _SESSIONS[session_id]

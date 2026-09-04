@@ -158,6 +158,7 @@ class AutoTradeSupervisor:
                     user_id=user.id,
                     instrument_id=instrument.id,
                     strategy_id=strategy_row.id,
+                    strategy_version=strategy_row.version,
                     execution_mode=ExecutionMode.PAPER,
                     direction=snapshot["direction"],
                     entry_price=snapshot["entry_price"],

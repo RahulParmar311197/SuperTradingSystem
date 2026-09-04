@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from enum import StrEnum
 
-from sqlalchemy import DateTime, Enum, ForeignKey, JSON, Numeric, String
+from sqlalchemy import DateTime, Enum, ForeignKey, Integer, JSON, Numeric, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -57,6 +57,12 @@ class Order(Base):
     strategy_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("strategies.id")
     )
+    # Strategy.version at the moment this order was created — Strategy rows
+    # are mutated in place on update (see app/api/strategies.py), so without
+    # this an order's strategy_id alone can't say which definition produced
+    # it (blueprint §91: "a live trading account should always know exactly
+    # which version created a trade").
+    strategy_version: Mapped[int | None] = mapped_column(Integer)
     signal_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("signals.id"))
 
     idempotency_key: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
@@ -130,6 +136,7 @@ class Trade(Base):
         UUID(as_uuid=True), ForeignKey("instruments.id"), nullable=False, index=True
     )
     strategy_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("strategies.id"))
+    strategy_version: Mapped[int | None] = mapped_column(Integer)
     execution_mode: Mapped[ExecutionMode] = mapped_column(
         Enum(ExecutionMode, name="trade_execution_mode"), nullable=False
     )

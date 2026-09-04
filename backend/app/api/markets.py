@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth.dependencies import get_current_user
 from app.core.redis import get_latest_price
 from app.database.models.instruments import Instrument, MarketType
+from app.database.models.strategy import Setup
 from app.database.models.users import User
 from app.database.session import get_db
 from app.market.repository import get_candles
@@ -94,6 +95,35 @@ async def get_candles_endpoint(
     # attribute; GET /markets/candles had never had a test hit it, so it
     # 500'd on every call with any candles to return.
     return [CandleResponse(**dataclasses.asdict(c)) for c in candles]
+
+
+class SetupResponse(BaseModel):
+    setup_type: str
+    data: dict
+    detected_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+@router.get("/setups", response_model=list[SetupResponse])
+async def list_setups(
+    instrument_id: uuid.UUID,
+    timeframe: str,
+    limit: int = 50,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> list[Setup]:
+    """Raw SMC pattern detections journaled by `ScannerWorker` (blueprint
+    §9 `setups`) -- structure breaks, fair value gaps, order blocks --
+    independent of whether any strategy matched on them. Backs blueprint
+    §96 "AI Screen" prompts like "Explain this FVG."""
+    stmt = (
+        select(Setup)
+        .where(Setup.instrument_id == instrument_id, Setup.timeframe == timeframe)
+        .order_by(Setup.detected_at.desc())
+        .limit(limit)
+    )
+    return (await db.execute(stmt)).scalars().all()
 
 
 @router.get("/quotes")

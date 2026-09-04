@@ -1,11 +1,28 @@
+import uuid
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth.dependencies import get_current_user
-from app.database.models.users import User
+from app.api.orders import _stack_for
+from app.auth.dependencies import get_current_user, require_permission
+from app.brokers.mock import MockBroker
+from app.core.audit import record_audit
+from app.core.redis import account_halt_reason
+from app.database.models.instruments import Instrument
+from app.database.models.instruments import MarketType as InstrumentMarketType
+from app.database.models.options import OptionContract, OptionSnapshot
+from app.database.models.strategy import Direction
+from app.database.models.trading import OrderStatus, OrderType
+from app.database.models.users import TradingPermission, User
+from app.database.session import get_db
 from app.options.greeks import OptionType, black_scholes_greeks, black_scholes_price
-from app.options.payoff import compute_payoff_summary
+from app.options.liquidity_filter import evaluate_liquidity
+from app.options.payoff import OptionLeg, compute_payoff_summary
 from app.options.strategies import BIAS_STRATEGIES, build_strategy
+from app.risk.options_risk import OptionsRiskProposal, evaluate_options_risk
+from app.trading.persistence import persist_order, persist_position, record_trade
 
 router = APIRouter(prefix="/options", tags=["options"])
 
@@ -108,4 +125,225 @@ async def build_option_strategy(payload: BuildStrategyRequest, user: User = Depe
         breakevens=summary.breakevens,
         net_premium=summary.net_premium,
         capital_requirement=summary.capital_requirement,
+    )
+
+
+class ExecuteOptionLegRequest(BaseModel):
+    symbol: str
+    direction: Direction
+    quantity: float  # number of lots
+    # Current market price per unit for this leg — no live options feed
+    # exists in this environment (see docs/ARCHITECTURE.md), so this
+    # mirrors POST /orders's `entry` field: MockBroker is fed this price
+    # directly; a real broker ignores it and prices its own fill.
+    premium: float
+
+
+class ExecuteOptionsStrategyRequest(BaseModel):
+    strategy_name: str
+    legs: list[ExecuteOptionLegRequest]
+
+
+class LegExecutionResult(BaseModel):
+    symbol: str
+    order_id: uuid.UUID
+    status: str
+    rejection_reason: str | None
+
+
+class ExecuteOptionsStrategyResponse(BaseModel):
+    batch_id: uuid.UUID
+    max_profit: float | None
+    max_loss: float | None
+    net_premium: float
+    capital_requirement: float
+    liquidity_warnings: list[str]
+    legs: list[LegExecutionResult]
+
+
+async def _latest_option_snapshot(db: AsyncSession, instrument_id: uuid.UUID) -> OptionSnapshot | None:
+    contract = (
+        await db.execute(select(OptionContract).where(OptionContract.instrument_id == instrument_id))
+    ).scalar_one_or_none()
+    if contract is None:
+        return None
+    return (
+        await db.execute(
+            select(OptionSnapshot)
+            .where(OptionSnapshot.option_contract_id == contract.id)
+            .order_by(OptionSnapshot.snapshot_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+
+@router.post("/execute", response_model=ExecuteOptionsStrategyResponse, status_code=status.HTTP_201_CREATED)
+async def execute_options_strategy(
+    payload: ExecuteOptionsStrategyRequest,
+    user: User = Depends(require_permission(TradingPermission.LIVE_TRADE)),
+    db: AsyncSession = Depends(get_db),
+) -> ExecuteOptionsStrategyResponse:
+    """Submits every leg of a multi-leg options strategy (blueprint §37,
+    §120) as real orders through the same broker/risk/persistence
+    pipeline `POST /orders` uses — gated once, together, by the
+    strategy's combined payoff (blueprint §38-40) rather than the
+    single-trade entry/stop shape `POST /orders` uses for a directional
+    trade, which doesn't apply to a defined-risk combination.
+
+    Each leg is still a *separate* order once submitted — neither this
+    codebase nor (as far as it's been verified) Upstox/Dhan guarantee
+    exchange-level atomic multi-leg fills, so a later leg's rejection
+    does not undo an earlier leg's fill. Every leg's own outcome is
+    reported in the response; nothing here pretends this is atomic.
+    """
+    if not payload.legs:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "At least one leg is required")
+
+    halt_reason = await account_halt_reason(str(user.id))
+    if halt_reason is not None:
+        raise HTTPException(status.HTTP_423_LOCKED, f"New entries are halted for this account: {halt_reason}")
+
+    instruments: dict[str, Instrument] = {}
+    for leg in payload.legs:
+        instrument = (
+            await db.execute(select(Instrument).where(Instrument.symbol == leg.symbol, Instrument.active.is_(True)))
+        ).scalar_one_or_none()
+        if instrument is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown instrument symbol: {leg.symbol}")
+        if instrument.market != InstrumentMarketType.OPTIONS or instrument.option_type is None or instrument.strike is None:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"{leg.symbol} is not an options contract")
+        instruments[leg.symbol] = instrument
+
+    option_legs = [
+        OptionLeg(
+            option_type=OptionType(instruments[leg.symbol].option_type.value),
+            strike=float(instruments[leg.symbol].strike),
+            premium=leg.premium,
+            quantity=leg.quantity,
+            direction=leg.direction,
+            lot_size=instruments[leg.symbol].lot_size,
+        )
+        for leg in payload.legs
+    ]
+    try:
+        payoff = compute_payoff_summary(option_legs)
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+
+    # Liquidity (blueprint §40): a leg with no snapshot data at all only
+    # produces a warning — this environment has no options-chain
+    # ingestion pipeline yet (see docs/ARCHITECTURE.md), so treating
+    # "never populated" the same as "actually illiquid" would make this
+    # endpoint permanently unusable rather than honestly degraded.
+    liquidity_warnings: list[str] = []
+    liquidity_acceptable = True
+    for leg in payload.legs:
+        snapshot = await _latest_option_snapshot(db, instruments[leg.symbol].id)
+        if snapshot is None:
+            liquidity_warnings.append(f"{leg.symbol}: no liquidity data available — not evaluated")
+            continue
+        assessment = evaluate_liquidity(
+            volume=float(snapshot.volume),
+            open_interest=float(snapshot.open_interest),
+            bid=float(snapshot.bid) if snapshot.bid is not None else None,
+            ask=float(snapshot.ask) if snapshot.ask is not None else None,
+            quote_timestamp=snapshot.snapshot_at,
+        )
+        liquidity_warnings.extend(f"{leg.symbol}: {w}" for w in assessment.warnings)
+        if not assessment.acceptable:
+            liquidity_acceptable = False
+            liquidity_warnings.extend(f"{leg.symbol}: {r}" for r in assessment.rejections)
+
+    stack = await _stack_for(user, db)
+    open_positions = stack.position_manager.open_positions(str(user.id))
+    current_exposure = sum(abs(p.quantity) * p.average_price for p in open_positions)
+
+    risk_proposal = OptionsRiskProposal(
+        account_id=str(user.id),
+        account_balance=(await stack.broker.get_account()).balance,
+        current_exposure=current_exposure,
+        payoff=payoff,
+        broker_healthy=await stack.broker.is_healthy(),
+        liquidity_acceptable=liquidity_acceptable,
+    )
+    decision = evaluate_options_risk(risk_proposal, limits=stack.risk_engine.limits)
+    if not decision.approved:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, f"Risk engine rejected this strategy: {decision.reason}")
+
+    batch_id = uuid.uuid4()
+    leg_results: list[LegExecutionResult] = []
+    for leg in payload.legs:
+        instrument = instruments[leg.symbol]
+        if isinstance(stack.broker, MockBroker):
+            stack.broker.set_quote(leg.symbol, ltp=leg.premium)
+
+        existing_position = stack.position_manager.get(str(user.id), leg.symbol)
+        realized_pnl_before = existing_position.realized_pnl if existing_position is not None else 0.0
+        position_before = (
+            {
+                "is_long": existing_position.is_long,
+                "average_price": existing_position.average_price,
+                "quantity": existing_position.quantity,
+            }
+            if existing_position is not None
+            else None
+        )
+
+        idempotency_key = f"{user.id}:{batch_id}:{leg.symbol}"
+        total_quantity = leg.quantity * instrument.lot_size
+        order, created = stack.order_manager.create_order(
+            idempotency_key, str(user.id), leg.symbol, leg.direction, OrderType.MARKET, total_quantity
+        )
+        if created:
+            stack.order_manager.transition(order.id, OrderStatus.VALIDATING)
+            stack.order_manager.transition(order.id, OrderStatus.RISK_APPROVED, f"options strategy batch {batch_id}")
+            await stack.execution_engine.submit(order.id)
+
+        final_order = stack.order_manager.get(order.id)
+        await persist_order(db, final_order, user.id, instrument.id)
+
+        position_after = stack.position_manager.get(str(user.id), leg.symbol)
+        if position_after is not None:
+            position_row = await persist_position(db, user.id, instrument.id, position_after)
+            realized_delta = position_after.realized_pnl - realized_pnl_before
+            if realized_delta != 0 and position_before is not None:
+                await record_trade(
+                    db,
+                    user_id=user.id,
+                    instrument_id=instrument.id,
+                    direction=Direction.LONG if position_before["is_long"] else Direction.SHORT,
+                    entry_price=position_before["average_price"],
+                    exit_price=leg.premium,
+                    quantity=abs(position_before["quantity"]),
+                    pnl=realized_delta,
+                    position_id=position_row.id,
+                )
+
+        await record_audit(
+            db,
+            actor="user",
+            action="options_strategy.leg_placed",
+            user_id=user.id,
+            details={
+                "batch_id": str(batch_id),
+                "strategy_name": payload.strategy_name,
+                "symbol": leg.symbol,
+                "direction": leg.direction.value,
+                "status": final_order.status.value,
+            },
+        )
+        leg_results.append(
+            LegExecutionResult(
+                symbol=leg.symbol, order_id=final_order.id, status=final_order.status.value, rejection_reason=final_order.rejection_reason
+            )
+        )
+
+    return ExecuteOptionsStrategyResponse(
+        batch_id=batch_id,
+        max_profit=payoff.max_profit,
+        max_loss=payoff.max_loss,
+        net_premium=payoff.net_premium,
+        capital_requirement=payoff.capital_requirement,
+        liquidity_warnings=liquidity_warnings,
+        legs=leg_results,
     )

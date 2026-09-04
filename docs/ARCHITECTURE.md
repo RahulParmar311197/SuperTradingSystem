@@ -14,7 +14,7 @@ what's built, that file is about what's actually safe to turn on.
 | 3 | Replay | `app/replay`: clock + manual BUY/SELL/SL/TP/CLOSE, statistics. Look-ahead safety proven by test (`tests/replay/test_engine.py`). Exposed over REST (`app/api/replay.py`) with a per-session in-memory store. |
 | 4 | Backtesting | `app/backtest`: event loop reusing the same SMC/ICT/Strategy code as replay, configurable cost model, full metrics report. **Out-of-sample validation** (`POST /backtest/validate`, blueprint §77-78) runs train/validation/test splits independently and flags overfitting smells (no trades or no edge on the held-out test period, a win-rate collapse from train to validation). Persists `backtests`/`backtest_trades`/`backtest_metrics` via `app/api/backtest.py`. |
 | 5 | AI | `app/ai`: structured context builder, Strategy-DSL JSON validation, AI trade-proposal validation against deterministic results, deterministic trade explanations. **A real provider is wired**: `app/ai/providers/anthropic_client.py` implements `AIClient` against the Claude API — set `AI_PROVIDER=anthropic` + `AI_API_KEY` to enable it. With no key configured, `NullAIClient` fails closed (§110 "no AI -> no trade"). |
-| 6 | Options | `app/options`: Black-Scholes Greeks, multi-leg payoff engine (max profit/loss/breakevens), liquidity filter, named strategy builders (spreads, condor, butterfly, straddle, strangle). |
+| 6 | Options | `app/options`: Black-Scholes Greeks, multi-leg payoff engine (max profit/loss/breakevens), liquidity filter, named strategy builders (spreads, condor, butterfly, straddle, strangle). **Execution exists now too**: `POST /options/execute` (blueprint §37-40) submits every leg of a chosen strategy as real orders — see "Multi-leg options execution" below. |
 | 7 | Paper trading | `app/paper`: strategy -> risk -> broker -> position manager -> portfolio, built on the same order/broker stack as live trading. Now also runs unattended inside the autonomous loop (Stage 10). |
 | 8 | Dhan/Upstox | `app/brokers/dhan`: adapter skeleton, every HTTP call still a `NotImplementedError` TODO. **`app/brokers/upstox` is a real implementation** — OAuth2 authorization-code flow (`app/brokers/upstox/oauth.py`, plus `GET /brokers/upstox/authorize` and `/callback`), and `UpstoxBroker` implements every `Broker` method against Upstox's documented v2 API. Built from search-result snippets, not a fetched/verified copy of the live docs (this sandbox's egress to upstox.com is blocked) — tested against a mocked HTTP transport (`tests/brokers/test_upstox_adapter.py`), **never against Upstox's real servers**. Verify every endpoint/field/status-string against the live docs or Postman collection before connecting a real account. |
 | 9 | Controlled live trading | `app/api/orders.py` exercises the full risk-gate -> execution -> position flow. **The broker is no longer hardcoded**: `app/trading/broker_resolver.py` looks up the user's connected `BrokerAccount` and returns a real `UpstoxBroker`/`DhanBroker` built from their stored (decrypted) credentials for an ACTIVE connection, or `MockBroker` when nothing is connected — the honest Stage 9 default, not a workaround. A broken connection (missing/malformed stored credentials) raises rather than silently falling back to Mock (blueprint §101: "Never make paper and live look identical"). Gated behind the `LIVE_TRADE` trading permission (blueprint §88), which — like `AUTO_TRADE` — isn't granted at registration; a user opts in via `POST /trading-permissions/grant` (`confirm: true`). Every order/fill is mirrored into Postgres (`app/trading/persistence.py`) into the real `orders`/`order_events`/`positions`/`trades` tables as it happens — a closing or reducing fill writes a `Trade` journal row (blueprint §61), and the risk engine's exposure check sums real open-position notional. Also: a Redis-backed **trading halt** checked before every order (`account_halt_reason`), real market-data-staleness lookups from the Redis price cache, and **live reconciliation** (`app/trading/live_reconciliation.py`, blueprint §75) — a loop inside the API process's own lifespan (it needs the same `OrderManager`/`PositionManager` instances a user's orders were placed through, which only exist there) that runs `ReconciliationWorker` for every connected account with an active trading stack and halts new entries on any mismatch; resuming is a deliberate manual step, not automatic. `Order`/`Trade` rows carry `strategy_version` (blueprint §91) so a trade always names the exact strategy definition that produced it, even after the strategy is later edited (`PUT /strategies/{id}` bumps `version` rather than overwriting history). |
@@ -64,6 +64,34 @@ Two pieces the blueprint calls out as their own engines, not folded into
   through — those live in `app/api/orders.py`'s in-memory `_STACKS`,
   which the `worker` process can never see.
 
+## Multi-leg options execution (§37-40)
+
+`POST /options/execute` takes the legs a client already built via
+`POST /options/strategy` (or its own logic) and actually places them:
+
+- **`app/risk/options_risk.py`** — a small, dedicated risk gate, not a
+  retrofit of `app.risk.engine.TradeRiskProposal`. A directional trade's
+  risk is entry/stop distance; a multi-leg options strategy's risk is
+  whatever `app.options.payoff.compute_payoff_summary` already computed
+  for the whole combination (`max_loss`, or `capital_requirement` when
+  the loss is technically unbounded) — forcing that through an entry/stop
+  shape would mean inventing a stop price with no real meaning.
+- **Liquidity** is checked per leg against `OptionSnapshot` (via
+  `OptionContract.instrument_id`) when one exists — but nothing in this
+  codebase populates `option_chains`/`option_contracts`/`option_snapshots`
+  yet (no ingestion pipeline exists, the same gap Stage 1 has for a live
+  candle feed), so today every leg reports a "no liquidity data available"
+  warning rather than ever actually rejecting on real data. That's
+  reported honestly in the response (`liquidity_warnings`), not hidden.
+- **Not atomic.** Once the strategy-level risk check approves, each leg
+  is submitted as its own order through the same broker/persistence path
+  `POST /orders` uses (`app.trading.persistence`, the resolved broker from
+  `app.trading.broker_resolver`). Neither this codebase nor (unverified)
+  Upstox/Dhan guarantee all-or-nothing multi-leg fills, so a later leg's
+  rejection does not undo an earlier leg's fill — every leg's own outcome
+  is in the response instead of a single pass/fail that would misrepresent
+  what actually happened at the broker.
+
 ## What's deliberately not implemented
 
 - **Android app** — `android/` is a package-structure scaffold (§6), not a
@@ -106,7 +134,18 @@ talking to each other directly:
   holds a connection pool pinned to the asyncio event loop that created
   it, cached per-loop with a `WeakKeyDictionary`. This matters for
   correctness under pytest (a fresh loop per test) as much as for the
-  worker process (its own loop, separate from the API's).
+  worker process (its own loop, separate from the API's). It also means
+  a test's engine/client is never explicitly closed when that test's loop
+  is garbage collected — only the Python-side cache entry disappears, not
+  the live Postgres/Redis connection underneath it. A real deployment
+  never notices (one loop, one engine, for the process's whole life), but
+  a full pytest run churns through one loop per test; left unmanaged this
+  measurably climbed `pg_stat_activity` from ~9 to 97 (of Postgres's
+  default 100 `max_connections`) over one run, silently *skipping*
+  (`require_infra`, not failing) whichever tests ran after the limit was
+  hit. `tests/conftest.py`'s autouse `_dispose_infra_clients_after_test`
+  fixture disposes both at the end of every test, in the same loop, before
+  pytest-asyncio tears it down.
 - **Trading halts are a Redis flag** (`app.core.redis.halt_account`), not
   an in-memory `KillSwitchState` — a reconciliation mismatch found by the
   `worker` process has to block order placement in the `api` process, so

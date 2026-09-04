@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth.dependencies import require_admin
 from app.core.audit import record_audit
 from app.core.redis import account_halt_reason, list_halted_accounts, resume_account
+from app.database.models.ai import AIDecision, AIDecisionType
 from app.database.models.risk import RiskDecision, RiskEvent
 from app.database.models.trading import Order, OrderStatus
 from app.database.models.users import BrokerAccount, BrokerAccountStatus, BrokerName, User, UserRole, UserStatus
@@ -120,6 +121,32 @@ async def list_risk_events(
     db: AsyncSession = Depends(get_db),
 ) -> list[RiskEvent]:
     stmt = select(RiskEvent).order_by(RiskEvent.created_at.desc()).limit(limit)
+    return (await db.execute(stmt)).scalars().all()
+
+
+class AdminAIDecisionResponse(BaseModel):
+    id: uuid.UUID
+    user_id: uuid.UUID
+    decision_type: AIDecisionType
+    validated: bool
+    validation_errors: list
+    model: str | None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+@router.get("/ai-decisions", response_model=list[AdminAIDecisionResponse])
+async def list_ai_decisions(
+    limit: int = Query(default=100, le=500),
+    user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> list[AIDecision]:
+    """Blueprint §71 audit logging ("AI decision" is explicitly listed)
+    and §79 "AI Model Evaluation" — neither is possible without a record
+    of what the AI actually said, which `POST /ai/propose-trade` now
+    persists (see `app.database.models.ai.AIDecision`)."""
+    stmt = select(AIDecision).order_by(AIDecision.created_at.desc()).limit(limit)
     return (await db.execute(stmt)).scalars().all()
 
 

@@ -10,6 +10,7 @@ from app.database.models.ai import AIDecision
 from app.database.models.instruments import Instrument, MarketType
 from app.database.models.risk import AuditLog
 from app.database.models.strategy import Strategy as StrategyRow
+from app.database.models.strategy import StrategyVersion as StrategyVersionRow
 from app.database.models.users import User, UserSession
 from app.database.session import async_session_factory
 from app.main import app
@@ -47,6 +48,7 @@ async def _cleanup(user_id: uuid.UUID, instrument_id: uuid.UUID, strategy_id: uu
 
         await db.execute(delete(CandleRow).where(CandleRow.instrument_id == instrument_id))
         await db.execute(delete(AIDecision).where(AIDecision.user_id == user_id))
+        await db.execute(delete(StrategyVersionRow).where(StrategyVersionRow.strategy_id == strategy_id))
         await db.execute(delete(StrategyRow).where(StrategyRow.id == strategy_id))
         await db.execute(delete(AuditLog).where(AuditLog.user_id == user_id))
         await db.execute(delete(UserSession).where(UserSession.user_id == user_id))

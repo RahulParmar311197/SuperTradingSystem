@@ -39,8 +39,11 @@ async def test_no_connected_account_resolves_to_mock_broker(require_infra):
         user = await _make_user(db)
         await db.commit()
         try:
-            broker = await resolve_broker(db, user)
+            broker, broker_account_id = await resolve_broker(db, user)
             assert isinstance(broker, MockBroker)
+            # No connected account -- nothing to attribute a paper order's
+            # Order.broker_account_id to.
+            assert broker_account_id is None
         finally:
             await _cleanup(user.id)
 
@@ -48,19 +51,25 @@ async def test_no_connected_account_resolves_to_mock_broker(require_infra):
 async def test_active_upstox_account_resolves_to_a_real_upstox_broker(require_infra):
     async with async_session_factory() as db:
         user = await _make_user(db)
-        db.add(
-            BrokerAccount(
-                user_id=user.id,
-                broker=BrokerName.UPSTOX,
-                encrypted_credentials=encrypt_credentials({"access_token": "test-token-123"}),
-                status=BrokerAccountStatus.ACTIVE,
-            )
+        account = BrokerAccount(
+            user_id=user.id,
+            broker=BrokerName.UPSTOX,
+            encrypted_credentials=encrypt_credentials({"access_token": "test-token-123"}),
+            status=BrokerAccountStatus.ACTIVE,
         )
+        db.add(account)
         await db.commit()
         try:
-            broker = await resolve_broker(db, user)
+            broker, broker_account_id = await resolve_broker(db, user)
             assert isinstance(broker, UpstoxBroker)
             assert broker.access_token == "test-token-123"
+            # Regression test: resolve_broker used to discard `account.id`
+            # once the adapter was built, so nothing could ever populate
+            # Order.broker_account_id -- a real FK column that existed
+            # purely to trace a placed order back to the connected account
+            # that executed it, permanently NULL for every order ever
+            # placed.
+            assert broker_account_id == account.id
         finally:
             await _cleanup(user.id)
 
@@ -68,20 +77,20 @@ async def test_active_upstox_account_resolves_to_a_real_upstox_broker(require_in
 async def test_active_dhan_account_resolves_to_a_dhan_broker(require_infra):
     async with async_session_factory() as db:
         user = await _make_user(db)
-        db.add(
-            BrokerAccount(
-                user_id=user.id,
-                broker=BrokerName.DHAN,
-                encrypted_credentials=encrypt_credentials({"client_id": "cid-1", "access_token": "tok-1"}),
-                status=BrokerAccountStatus.ACTIVE,
-            )
+        account = BrokerAccount(
+            user_id=user.id,
+            broker=BrokerName.DHAN,
+            encrypted_credentials=encrypt_credentials({"client_id": "cid-1", "access_token": "tok-1"}),
+            status=BrokerAccountStatus.ACTIVE,
         )
+        db.add(account)
         await db.commit()
         try:
-            broker = await resolve_broker(db, user)
+            broker, broker_account_id = await resolve_broker(db, user)
             assert isinstance(broker, DhanBroker)
             assert broker.client_id == "cid-1"
             assert broker.access_token == "tok-1"
+            assert broker_account_id == account.id
         finally:
             await _cleanup(user.id)
 
@@ -99,8 +108,9 @@ async def test_disconnected_account_is_ignored(require_infra):
         )
         await db.commit()
         try:
-            broker = await resolve_broker(db, user)
+            broker, broker_account_id = await resolve_broker(db, user)
             assert isinstance(broker, MockBroker)
+            assert broker_account_id is None
         finally:
             await _cleanup(user.id)
 

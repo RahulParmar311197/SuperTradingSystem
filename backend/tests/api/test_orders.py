@@ -6,11 +6,12 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import delete, select
 
+from app.core.encryption import encrypt_credentials
 from app.database.models.instruments import Instrument, MarketType, OptionType
 from app.database.models.notifications import Notification, NotificationType
 from app.database.models.risk import AuditLog, RiskEvent
 from app.database.models.trading import ExecutionMode, Order, OrderEvent, Position, Trade
-from app.database.models.users import User, UserSession
+from app.database.models.users import BrokerAccount, BrokerAccountStatus, BrokerName, User, UserSession
 from app.database.session import async_session_factory
 from app.main import app
 from app.risk.engine import RiskEngine
@@ -31,6 +32,7 @@ async def _cleanup(user_id: uuid.UUID, instrument_id: uuid.UUID) -> None:
         await db.execute(delete(Notification).where(Notification.user_id == user_id))
         await db.execute(delete(AuditLog).where(AuditLog.user_id == user_id))
         await db.execute(delete(UserSession).where(UserSession.user_id == user_id))
+        await db.execute(delete(BrokerAccount).where(BrokerAccount.user_id == user_id))
         await db.execute(delete(User).where(User.id == user_id))
         await db.execute(delete(Instrument).where(Instrument.id == instrument_id))
         await db.commit()
@@ -141,6 +143,52 @@ async def test_place_and_close_order_persists_to_database(require_infra):
                 assert float(trade_row.pnl) == pytest.approx(1000.0, rel=1e-6)
                 assert trade_row.direction.value == "LONG"
                 assert trade_row.execution_mode == ExecutionMode.PAPER
+        finally:
+            await _cleanup(user_id, instrument_id)
+
+
+async def test_place_order_records_which_broker_account_executed_it(require_infra):
+    # Regression test: `Order.broker_account_id` is a real FK column that
+    # existed purely to trace a placed order back to whichever connected
+    # BrokerAccount executed it, but `resolve_broker` used to discard
+    # `account.id` once it built the adapter, so this column was NULL for
+    # every order ever placed -- silently. Uses an ACTIVE PAPER account
+    # (resolves to MockBroker, same as the no-account default) specifically
+    # so this test doesn't need real Upstox/Dhan credentials to prove the
+    # id survives end-to-end through place_order -> persist_order.
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        async with async_session_factory() as db:
+            instrument = Instrument(
+                symbol=f"ORDBA{uuid.uuid4().hex[:6].upper()}", exchange="NSE", market=MarketType.EQUITY, instrument_type="EQ"
+            )
+            db.add(instrument)
+            account = BrokerAccount(
+                user_id=user_id,
+                broker=BrokerName.PAPER,
+                encrypted_credentials=encrypt_credentials({}),
+                status=BrokerAccountStatus.ACTIVE,
+            )
+            db.add(account)
+            await db.commit()
+            await db.refresh(instrument)
+            await db.refresh(account)
+            instrument_id = instrument.id
+            account_id = account.id
+
+        try:
+            r = client.post(
+                "/orders",
+                json={"symbol": instrument.symbol, "direction": "LONG", "entry": 100.0, "stop": 95.0},
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+
+            async with async_session_factory() as db:
+                order_row = (await db.execute(select(Order).where(Order.user_id == user_id))).scalar_one()
+                assert order_row.broker_account_id == account_id
         finally:
             await _cleanup(user_id, instrument_id)
 

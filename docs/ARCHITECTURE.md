@@ -120,6 +120,59 @@ rows are `PAPER` for an account with no connected broker, and the new
 all before) proves `GET /portfolio` still reports real, non-zero exposure
 for such an account.
 
+## `/ws/replay` had no publisher, and no ownership check (§64)
+
+Every other websocket channel (`market`/`chart`/`scanner`/`signals`/
+`orders`/`positions`) has a matching `publish()` call somewhere a worker
+or API route actually changes that data. `replay` didn't: `step_replay`,
+`submit_replay_order`, and `reset_replay` in `app/api/replay.py` all
+mutated the engine and persisted it, but never published anything, so a
+client connected to `/ws/replay?session_id=...` would authenticate fine,
+get a 101 upgrade, and then simply hang forever no matter what the
+session did — the only way to see anything was polling `GET
+/replay/{id}`. Fixed by having every mutating action publish the same
+state `_state_response` already builds.
+
+`ws_replay` also had no ownership check at all — it authenticated the
+caller as *some* valid user but never verified they owned `session_id`,
+the same class of bug already fixed twice this project for the REST
+endpoints (`/replay/*`, `/paper/*`), just missed in the websocket layer.
+Fixed the same way: a non-owner's connection is closed (4404) rather than
+relayed. `tests/api/test_websockets_replay.py` is new — this project's
+first websocket test — and proves both: a step actually broadcasts, and
+a second user's connection is rejected while the owner's still works.
+
+## A real Postgres connection leak, finally found (not just the known one)
+
+`tests/conftest.py`'s `_dispose_infra_clients_after_test` fixture (added
+several rounds ago) disposes `get_engine()`/`get_redis()` as called from
+a **test's own** async context after each test. That's real and still
+needed, but writing `tests/api/test_websockets_replay.py` surfaced a
+second, larger, previously-misdiagnosed leak behind the same recurring
+symptom (`pg_stat_activity` climbing toward Postgres's connection limit
+partway through a full local suite run, first blamed — incorrectly — on
+this being a long-lived sandbox session in an earlier round's PR).
+
+The real mechanism: `get_engine()`/`get_redis()` cache one client per
+*running* event loop. `TestClient(app)` runs the entire ASGI app —
+lifespan, every request, the reconciliation background task — on its
+**own internal event loop**, and creates a **fresh one on every use**,
+even many times within a single outer Python process. Confirmed directly:
+repeatedly opening and closing `with TestClient(app):` in a single
+process, with no test logic at all beyond `client.get("/health")`, leaked
+a brand new cached engine and real, permanently-open Postgres connections
+on every single iteration — something no test-loop-scoped fixture could
+ever catch, since none of those connections were ever on the *test's*
+loop to begin with. `app/main.py`'s lifespan shutdown never disposed
+anything at all before this — not a test-only gap, a real one: a
+production instance shutting down should release its pool too. Fixed by
+disposing both `get_engine()` and `get_redis()` in the lifespan's
+shutdown, verified directly (the same repeated-`TestClient` script now
+holds Postgres's connection count flat across 10 iterations instead of
+leaking 2 per iteration), and by two full local `pytest tests -q` runs
+(189 passed, both times) where the exact same run had been intermittently
+failing 8-15 tests with `TooManyConnectionsError` before this fix.
+
 ## Notifications (§63, §104)
 
 `app.notifications.service.create_notification` is real, tested code
@@ -172,6 +225,18 @@ on their own — but they weren't sufficient by themselves to make a
 background loop safe here, so this stays on-demand until a real
 deployment wires it to an external scheduler instead of this process's
 own request/response lifecycle.
+
+**Correction from a later round:** the diagnosis above was real but
+incomplete. The dominant leak wasn't specific to this feature's extra
+per-`TestClient` work at all — it was `app/main.py`'s lifespan never
+disposing `get_engine()`/`get_redis()` on shutdown, a bug present the
+whole time that this feature's extra work just made visible faster (more
+work per `TestClient` cycle before its portal loop closed and its
+connections were abandoned). See "A real Postgres connection leak,
+finally found" below for the actual fix. This background-loop-vs-on-demand
+tradeoff is still the right call on its own merits (`_STACKS` genuinely
+never shrinks), just not for the reason originally given as the primary
+one.
 
 ## Broker resolution and live reconciliation (§50, §53, §75)
 

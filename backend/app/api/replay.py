@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.dependencies import get_current_user
+from app.core.redis import channel_name, publish
 from app.database.session import get_db
 from app.database.models.users import User
 from app.market.repository import get_candles
@@ -82,6 +83,17 @@ def _state_response(session_id: uuid.UUID, engine: ReplayEngine) -> ReplayStateR
     )
 
 
+async def _publish_state(session_id: uuid.UUID, engine: ReplayEngine) -> ReplayStateResponse:
+    """Broadcasts the post-mutation state on `/ws/replay?session_id=...`
+    (blueprint §64). Every other websocket channel (market/chart/scanner/
+    signals/orders/positions) has a matching publisher; this one didn't --
+    `ws_replay` would accept a connection and then simply hang forever,
+    since nothing ever called `publish` on its channel."""
+    response = _state_response(session_id, engine)
+    await publish(channel_name("replay", str(session_id)), response.model_dump())
+    return response
+
+
 @router.post("", response_model=ReplayStateResponse)
 async def create_replay_session(
     payload: CreateReplayRequest, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
@@ -94,7 +106,7 @@ async def create_replay_session(
     engine = ReplayEngine(candles, starting_balance=payload.starting_balance, smc_config=SMCConfig(swing_length=payload.swing_length))
     await create_replay_session_row(db, session_id, user.id, payload.instrument_id, payload.timeframe, engine)
     _SESSIONS[session_id] = engine
-    return _state_response(session_id, engine)
+    return await _publish_state(session_id, engine)
 
 
 @router.get("/{session_id}", response_model=ReplayStateResponse)
@@ -111,7 +123,7 @@ async def step_replay(
     engine = await _get_owned_session(session_id, user, db)
     engine.advance(steps)
     await sync_replay_session(db, session_id, engine)
-    return _state_response(session_id, engine)
+    return await _publish_state(session_id, engine)
 
 
 @router.post("/{session_id}/reset", response_model=ReplayStateResponse)
@@ -124,7 +136,7 @@ async def reset_replay(
     engine.closed_trades = []
     engine.balance = engine.starting_balance
     await reset_replay_session(db, session_id, engine)
-    return _state_response(session_id, engine)
+    return await _publish_state(session_id, engine)
 
 
 class ReplayOrderRequest(BaseModel):
@@ -155,7 +167,7 @@ async def submit_replay_order(
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
 
     await sync_replay_session(db, session_id, engine)
-    return _state_response(session_id, engine)
+    return await _publish_state(session_id, engine)
 
 
 @router.delete("/{session_id}", status_code=status.HTTP_204_NO_CONTENT)

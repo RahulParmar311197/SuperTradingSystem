@@ -19,6 +19,7 @@ from app.auth.security import InvalidTokenError, TokenType, decode_token
 from app.core.redis import channel_name, subscribe
 from app.database.models.users import User, UserStatus
 from app.database.session import async_session_factory
+from app.replay.persistence import get_owned_replay_session
 from app.users.service import get_user_by_id
 
 router = APIRouter(tags=["websocket"])
@@ -103,4 +104,23 @@ async def ws_positions(websocket: WebSocket) -> None:
 
 @router.websocket("/ws/replay")
 async def ws_replay(websocket: WebSocket, session_id: str) -> None:
-    await _authenticated_relay(websocket, channel_name("replay", session_id))
+    user = await _authenticate(websocket)
+    if user is None:
+        await websocket.close(code=4401, reason="Unauthorized")
+        return
+    try:
+        session_uuid = uuid.UUID(session_id)
+    except ValueError:
+        await websocket.close(code=4404, reason="Replay session not found")
+        return
+    # A replay session is private state (balance, trades, P&L) -- unlike
+    # market/chart/scanner/signals, which are shared market data with
+    # nothing to own, this needs the same ownership check the REST
+    # /replay/* endpoints enforce, or any authenticated user could watch
+    # another user's session just by knowing its UUID.
+    async with async_session_factory() as db:
+        owned = await get_owned_replay_session(db, session_uuid, user.id)
+    if owned is None:
+        await websocket.close(code=4404, reason="Replay session not found")
+        return
+    await _relay(websocket, channel_name("replay", session_id))

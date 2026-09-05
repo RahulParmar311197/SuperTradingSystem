@@ -31,6 +31,8 @@ from app.core.config import get_settings
 from app.core.logging import configure_logging
 from app.core.metrics import metrics_response
 from app.core.middleware import RequestContextMiddleware
+from app.core.redis import get_redis
+from app.database.session import get_engine
 from app.monitoring.health import check_database, check_redis
 from app.monitoring.health import router as health_router
 from app.trading.live_reconciliation import run as run_live_reconciliation
@@ -58,6 +60,33 @@ async def lifespan(_app: FastAPI):
     try:
         await reconciliation_task
     except asyncio.CancelledError:
+        pass
+
+    # `get_engine()`/`get_redis()` cache one client per *running* event
+    # loop (see their module docstrings). That loop is normally this
+    # process's only one and lives for the process's whole lifetime -- but
+    # every `with TestClient(app):` block runs this entire lifespan on its
+    # own fresh internal event loop (a new one on every use, even within
+    # a single outer process), and neither client was ever disposed here.
+    # Concretely: a Postgres connection opened by `check_database()` above,
+    # by the reconciliation task, or by any request this instance served,
+    # stayed open server-side for as long as it took Postgres to notice
+    # and reap it -- verified firsthand, repeatedly instantiating
+    # `TestClient(app)` in a single Python process (one outer event loop
+    # the whole time) leaked one new cached engine, and two new live
+    # Postgres connections, every single time, something no per-test
+    # fixture disposing its own loop's engine could ever catch since the
+    # app's connections were never on that loop to begin with. Disposing
+    # both here — the same loop this instance's connections actually used
+    # — is what a graceful shutdown should always do anyway, not just a
+    # test-suite accommodation.
+    try:
+        await get_engine().dispose()
+    except Exception:
+        pass
+    try:
+        await get_redis().aclose()
+    except Exception:
         pass
     logger.info("Shutting down")
 

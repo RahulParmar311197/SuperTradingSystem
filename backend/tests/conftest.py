@@ -57,7 +57,14 @@ async def _dispose_infra_clients_after_test():
     `require_infra` test unlucky enough to run after the limit was hit.
     Disposing both here, in the same loop the test just used and before
     pytest-asyncio tears that loop down, closes the connections cleanly
-    instead of leaving them for Postgres/Redis to notice on their own."""
+    instead of leaving them for Postgres/Redis to notice on their own.
+
+    This only covers connections opened on *this test's own* event loop
+    (e.g. its own `async_session_factory()` calls for setup/cleanup) --
+    it does nothing for connections opened inside the app during a
+    `with TestClient(app):` block, since that runs the whole app on its
+    own separate, freshly-created event loop every time. See
+    `app/main.py`'s lifespan shutdown for the fix to that half."""
     yield
     try:
         await get_engine().dispose()

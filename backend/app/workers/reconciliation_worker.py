@@ -30,7 +30,7 @@ import httpx
 
 from app.brokers.base import Broker, BrokerError
 from app.core.audit import record_audit
-from app.core.redis import halt_account
+from app.core.redis import account_halt_reason, halt_account
 from app.database.models.notifications import NotificationType
 from app.database.session import async_session_factory
 from app.notifications.service import create_notification
@@ -63,24 +63,35 @@ class ReconciliationWorker:
         except (BrokerError, httpx.HTTPError, NotImplementedError) as exc:
             reason = f"Broker unreachable during reconciliation: {exc}"
             logger.warning("Reconciliation could not reach the broker for account %s: %s", self.account_id, exc)
+            # This worker runs on a 60-second loop for as long as an
+            # account stays ACTIVE and connected -- resuming is a
+            # deliberate manual admin action (see this module's own
+            # docstring), so an outage that isn't noticed immediately
+            # keeps this same `except` branch firing every single pass.
+            # Without this check, every pass wrote a fresh AuditLog row
+            # and Notification for the exact same, still-unresolved
+            # incident -- flooding GET /notifications and the audit trail
+            # with duplicates for one outage instead of recording it once.
+            already_halted = await account_halt_reason(self.account_id) is not None
             await halt_account(self.account_id, reason)
 
-            async with async_session_factory() as db:
-                await record_audit(
-                    db,
-                    actor="system",
-                    action="reconciliation.broker_unreachable",
-                    user_id=self.user_id,
-                    details={"error": str(exc)},
-                )
-                await create_notification(
-                    db,
-                    user_id=self.user_id,
-                    notification_type=NotificationType.BROKER_DISCONNECTED,
-                    title="Broker disconnected",
-                    body="Could not reach the broker during reconciliation — new entries are halted until this is resolved.",
-                    data={"error": str(exc)},
-                )
+            if not already_halted:
+                async with async_session_factory() as db:
+                    await record_audit(
+                        db,
+                        actor="system",
+                        action="reconciliation.broker_unreachable",
+                        user_id=self.user_id,
+                        details={"error": str(exc)},
+                    )
+                    await create_notification(
+                        db,
+                        user_id=self.user_id,
+                        notification_type=NotificationType.BROKER_DISCONNECTED,
+                        title="Broker disconnected",
+                        body="Could not reach the broker during reconciliation — new entries are halted until this is resolved.",
+                        data={"error": str(exc)},
+                    )
             return ReconciliationReport(order_mismatches=[reason])
 
         local_orders = self.order_manager.list_all(self.account_id)
@@ -91,23 +102,29 @@ class ReconciliationWorker:
         if not report.in_sync:
             reason = "; ".join(report.order_mismatches + report.position_mismatches)
             logger.warning("Reconciliation mismatch for account %s: %s", self.account_id, reason)
+            # Same repeat-fire problem as the broker-unreachable branch
+            # above -- an unresolved mismatch stays `not in_sync` on every
+            # subsequent pass until an admin resolves and resumes it, so
+            # this must only alert once per incident, not once per minute.
+            already_halted = await account_halt_reason(self.account_id) is not None
             await halt_account(self.account_id, f"Reconciliation mismatch: {reason}")
 
-            async with async_session_factory() as db:
-                await record_audit(
-                    db,
-                    actor="system",
-                    action="reconciliation.mismatch",
-                    user_id=self.user_id,
-                    details={"order_mismatches": report.order_mismatches, "position_mismatches": report.position_mismatches},
-                )
-                await create_notification(
-                    db,
-                    user_id=self.user_id,
-                    notification_type=NotificationType.RECONCILIATION_REQUIRED,
-                    title="Reconciliation required",
-                    body="Local and broker state disagree — new entries are halted until this is resolved.",
-                    data={"order_mismatches": report.order_mismatches, "position_mismatches": report.position_mismatches},
-                )
+            if not already_halted:
+                async with async_session_factory() as db:
+                    await record_audit(
+                        db,
+                        actor="system",
+                        action="reconciliation.mismatch",
+                        user_id=self.user_id,
+                        details={"order_mismatches": report.order_mismatches, "position_mismatches": report.position_mismatches},
+                    )
+                    await create_notification(
+                        db,
+                        user_id=self.user_id,
+                        notification_type=NotificationType.RECONCILIATION_REQUIRED,
+                        title="Reconciliation required",
+                        body="Local and broker state disagree — new entries are halted until this is resolved.",
+                        data={"order_mismatches": report.order_mismatches, "position_mismatches": report.position_mismatches},
+                    )
 
         return report

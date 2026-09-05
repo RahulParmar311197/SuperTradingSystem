@@ -347,3 +347,75 @@ async def test_execute_records_which_broker_account_executed_it(require_infra):
                 await db.execute(delete(BrokerAccount).where(BrokerAccount.id == account_id))
                 await db.commit()
             await _cleanup(user_id, [long_leg.id, short_leg.id])
+
+
+async def test_closing_leg_records_the_real_fill_price_not_the_claimed_premium(require_infra):
+    # Regression test: the `trades` journal row's `exit_price` was set to
+    # `leg.premium` -- the client-supplied field -- even though `pnl` on
+    # the same row is computed from `PositionManager.apply_fill`'s `price`
+    # parameter, which is `final_order.average_fill_price`, the broker's
+    # actual fill. Same bug and fix as
+    # tests/api/test_orders.py::test_closing_trade_records_the_real_fill_price_not_the_claimed_entry,
+    # in this endpoint's sibling code path. For a real broker those two
+    # values are independent, so any real fill produced an internally
+    # inconsistent trades row. Invisible with a zero-slippage MockBroker
+    # because its quote is always seeded from `leg.premium` right before
+    # the fill (line `stack.broker.set_quote(leg.symbol, ltp=leg.premium)`)
+    # -- mutating the existing MockBroker's `slippage_pct` in place (no
+    # need to swap the broker object itself, unlike test_orders.py's
+    # `_FakeRealBroker`, since MockBroker's fill logic itself is what needs
+    # to diverge from its own quote here) reproduces what any nonzero
+    # spread/slippage on a real broker would do.
+    from app.api import orders as orders_module
+
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+        long_leg, short_leg = await _make_two_leg_instruments(f"FILL{uuid.uuid4().hex[:5].upper()}")
+
+        try:
+            # Opens a defined-risk bull call spread (same shape as
+            # test_execute_bull_call_spread_persists_both_legs above).
+            r = client.post(
+                "/options/execute",
+                json={
+                    "strategy_name": "bull_call_spread",
+                    "legs": [
+                        {"symbol": long_leg.symbol, "direction": "LONG", "quantity": 1, "premium": 120.0},
+                        {"symbol": short_leg.symbol, "direction": "SHORT", "quantity": 1, "premium": 50.0},
+                    ],
+                },
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+
+            stack = orders_module._STACKS[user_id]
+            stack.broker.slippage_pct = 2.0
+
+            # Closes it with the exact reversal (a bear call spread, same
+            # defined-risk shape, so this stays under the exposure limit
+            # the way a naked single-leg reversal wouldn't). The quote for
+            # long_leg gets seeded to the claimed 125.0, but the 2%
+            # slippage now configured on the broker makes the actual SHORT
+            # fill 122.5, not 125.0.
+            r = client.post(
+                "/options/execute",
+                json={
+                    "strategy_name": "bull_call_spread_close",
+                    "legs": [
+                        {"symbol": long_leg.symbol, "direction": "SHORT", "quantity": 1, "premium": 125.0},
+                        {"symbol": short_leg.symbol, "direction": "LONG", "quantity": 1, "premium": 55.0},
+                    ],
+                },
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+
+            async with async_session_factory() as db:
+                trade = (
+                    await db.execute(select(Trade).where(Trade.user_id == user_id, Trade.instrument_id == long_leg.id))
+                ).scalar_one()
+                assert float(trade.exit_price) == pytest.approx(122.5)
+                assert float(trade.exit_price) != pytest.approx(125.0)
+        finally:
+            await _cleanup(user_id, [long_leg.id, short_leg.id])

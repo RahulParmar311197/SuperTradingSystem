@@ -363,7 +363,11 @@ async def execute_options_strategy(
                     instrument_id=instrument.id,
                     direction=Direction.LONG if position_before["is_long"] else Direction.SHORT,
                     entry_price=position_before["average_price"],
-                    exit_price=leg.premium,
+                    # Same fix as app/api/orders.py's record_trade call --
+                    # the real broker fill price, not the client-supplied
+                    # `leg.premium`, which `pnl` above was actually computed
+                    # from (via PositionManager.apply_fill).
+                    exit_price=final_order.average_fill_price,
                     quantity=abs(position_before["quantity"]),
                     pnl=realized_delta,
                     position_id=position_row.id,

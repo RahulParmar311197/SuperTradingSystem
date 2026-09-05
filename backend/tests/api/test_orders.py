@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 from datetime import date, timedelta
 
@@ -196,6 +197,50 @@ async def test_single_leg_option_order_persists_like_any_other_instrument(requir
                 assert float(trade_row.pnl) > 0  # bought the premium at 150, sold at 180
         finally:
             await _cleanup(user_id, instrument_id)
+
+
+async def test_concurrent_stack_for_calls_share_one_stack(require_infra, monkeypatch):
+    # Regression test: `_stack_for` checked `user.id not in _STACKS`, then
+    # awaited `resolve_broker` (a real DB query), then wrote `_STACKS[user.id]`
+    # -- with no lock across that await, two concurrent first calls for the
+    # same user could each build their own `_UserTradingStack`, and the
+    # second write would silently clobber the first, discarding whatever
+    # in-memory order/position state the first stack already held.
+    from app.api import orders as orders_module
+
+    with TestClient(app) as client:
+        email = f"orders-race-{uuid.uuid4().hex[:8]}@example.com"
+        r = client.post("/auth/register", json={"email": email, "password": "testpass123", "name": "Race Test"})
+        assert r.status_code == 201, r.text
+
+    async with async_session_factory() as db:
+        user = (await db.execute(select(User).where(User.email == email))).scalar_one()
+
+    real_resolve_broker = orders_module.resolve_broker
+
+    async def _slow_resolve_broker(db, user):
+        await asyncio.sleep(0.05)
+        return await real_resolve_broker(db, user)
+
+    monkeypatch.setattr(orders_module, "resolve_broker", _slow_resolve_broker)
+    orders_module._STACKS.pop(user.id, None)
+    orders_module._STACK_LOCKS.pop(user.id, None)
+
+    try:
+        async with async_session_factory() as db1, async_session_factory() as db2:
+            stack1, stack2 = await asyncio.gather(
+                orders_module._stack_for(user, db1), orders_module._stack_for(user, db2)
+            )
+        assert stack1 is stack2
+        assert orders_module._STACKS[user.id] is stack1
+    finally:
+        orders_module._STACKS.pop(user.id, None)
+        orders_module._STACK_LOCKS.pop(user.id, None)
+        async with async_session_factory() as db:
+            await db.execute(delete(AuditLog).where(AuditLog.user_id == user.id))
+            await db.execute(delete(UserSession).where(UserSession.user_id == user.id))
+            await db.execute(delete(User).where(User.id == user.id))
+            await db.commit()
 
 
 async def test_place_order_unknown_symbol_returns_404(require_infra):

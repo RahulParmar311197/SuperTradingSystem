@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -67,6 +68,7 @@ class _UserTradingStack:
 
 
 _STACKS: dict[uuid.UUID, _UserTradingStack] = {}
+_STACK_LOCKS: dict[uuid.UUID, asyncio.Lock] = {}
 
 
 async def _stack_for(user: User, db: AsyncSession) -> _UserTradingStack:
@@ -75,10 +77,24 @@ async def _stack_for(user: User, db: AsyncSession) -> _UserTradingStack:
     account takes effect on this stack's next process restart, the same
     documented limitation as the rest of this in-memory stack (see
     docs/ARCHITECTURE.md's "Multiple API replicas for the manual /orders
-    path")."""
+    path").
+
+    `resolve_broker` awaits a real DB query, so two concurrent first
+    requests for the same user (e.g. two browser tabs opening right after
+    login) could both see `user.id not in _STACKS`, each build their own
+    `_UserTradingStack`, and have the second silently clobber the first in
+    the dict — losing whatever the first stack's `OrderManager` already
+    knew about (an order it had just placed becomes invisible to every
+    later `GET /orders`/`GET /positions`, since those read the in-memory
+    manager, not Postgres). A per-user lock serializes stack creation;
+    `dict.setdefault` for the lock itself is safe since plain dict access
+    between two `await` points can't interleave on one event loop."""
     if user.id not in _STACKS:
-        broker = await resolve_broker(db, user)
-        _STACKS[user.id] = _UserTradingStack(broker)
+        lock = _STACK_LOCKS.setdefault(user.id, asyncio.Lock())
+        async with lock:
+            if user.id not in _STACKS:
+                broker = await resolve_broker(db, user)
+                _STACKS[user.id] = _UserTradingStack(broker)
     return _STACKS[user.id]
 
 

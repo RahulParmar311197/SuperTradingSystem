@@ -78,6 +78,96 @@ async def test_reconciliation_halts_account_on_mismatch(require_infra):
             await db.commit()
 
 
+async def test_reconciliation_does_not_repeat_the_mismatch_alert_on_every_pass(require_infra):
+    # Regression test: `run_once` unconditionally wrote a fresh AuditLog
+    # row and Notification on *every* pass a mismatch was detected, with
+    # no check for whether the account was already halted for this same,
+    # still-unresolved incident. Resuming is a deliberate manual admin
+    # action (this worker's own docstring), and `live_reconciliation.run()`
+    # calls this every 60 seconds indefinitely -- so a single mismatch
+    # that isn't immediately resolved used to flood GET /notifications and
+    # the audit trail with a duplicate row every minute for as long as it
+    # went unnoticed.
+    account_id = f"acct-{uuid.uuid4().hex[:8]}"
+    broker = MockBroker()
+    order_manager = OrderManager()
+    position_manager = PositionManager()
+    position_manager.apply_fill(account_id, "NIFTY", Direction.LONG, 10, 25000)
+
+    async with async_session_factory() as db:
+        user = User(
+            id=uuid.uuid4(),
+            email=f"reconcile-repeat-{uuid.uuid4().hex[:8]}@example.com",
+            password_hash=hash_password("irrelevant123"),
+            name="Reconciliation Repeat Test",
+        )
+        db.add(user)
+        await db.commit()
+        user_id = user.id
+
+    try:
+        worker = ReconciliationWorker(account_id, user_id, broker, order_manager, position_manager)
+        await worker.run_once()
+        # A second pass over the exact same, still-unresolved mismatch --
+        # no `resume_account` call in between.
+        report = await worker.run_once()
+        assert report.in_sync is False
+
+        async with async_session_factory() as db:
+            notifications = (await db.execute(select(Notification).where(Notification.user_id == user_id))).scalars().all()
+            audits = (await db.execute(select(AuditLog).where(AuditLog.user_id == user_id))).scalars().all()
+        assert len(notifications) == 1
+        assert len(audits) == 1
+    finally:
+        await resume_account(account_id)
+        async with async_session_factory() as db:
+            await db.execute(delete(AuditLog).where(AuditLog.user_id == user_id))
+            await db.execute(delete(Notification).where(Notification.user_id == user_id))
+            await db.execute(delete(User).where(User.id == user_id))
+            await db.commit()
+
+
+async def test_reconciliation_does_not_repeat_the_broker_unreachable_alert_on_every_pass(require_infra):
+    # Same fix, other branch: a sustained broker outage keeps raising on
+    # every pass for as long as it lasts, and must alert once per
+    # incident, not once per pass.
+    account_id = f"acct-{uuid.uuid4().hex[:8]}"
+    broker = _UnreachableBroker()
+    order_manager = OrderManager()
+    position_manager = PositionManager()
+
+    async with async_session_factory() as db:
+        user = User(
+            id=uuid.uuid4(),
+            email=f"reconcile-unreachable-repeat-{uuid.uuid4().hex[:8]}@example.com",
+            password_hash=hash_password("irrelevant123"),
+            name="Reconciliation Unreachable Repeat Test",
+        )
+        db.add(user)
+        await db.commit()
+        user_id = user.id
+
+    try:
+        worker = ReconciliationWorker(account_id, user_id, broker, order_manager, position_manager)
+        await worker.run_once()
+        # A second pass over the exact same, still-unresolved outage.
+        report = await worker.run_once()
+        assert report.in_sync is False
+
+        async with async_session_factory() as db:
+            notifications = (await db.execute(select(Notification).where(Notification.user_id == user_id))).scalars().all()
+            audits = (await db.execute(select(AuditLog).where(AuditLog.user_id == user_id))).scalars().all()
+        assert len(notifications) == 1
+        assert len(audits) == 1
+    finally:
+        await resume_account(account_id)
+        async with async_session_factory() as db:
+            await db.execute(delete(AuditLog).where(AuditLog.user_id == user_id))
+            await db.execute(delete(Notification).where(Notification.user_id == user_id))
+            await db.execute(delete(User).where(User.id == user_id))
+            await db.commit()
+
+
 async def test_reconciliation_halts_account_when_broker_is_unreachable(require_infra):
     # Regression test: `run_once` called `self.broker.get_orders()` with no
     # try/except. A real adapter raises rather than returning stale data

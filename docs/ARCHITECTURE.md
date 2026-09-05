@@ -1911,6 +1911,49 @@ both fail against the pre-fix code (the first with a `UniqueViolationError`
 propagating out of `process_tick`, the second directly) and pass once the
 fix is restored.
 
+## `ReconciliationWorker` re-fired its audit+notification alert on every pass an outage/mismatch stayed unresolved (§74-75)
+
+`ReconciliationWorker.run_once` has two failure branches — the broker
+being unreachable entirely (`except (BrokerError, httpx.HTTPError,
+NotImplementedError)`) and a local/broker state mismatch (`if not
+report.in_sync`). Both unconditionally called `halt_account(...)`,
+`record_audit(...)`, and `create_notification(...)` every single time they
+were reached, with no check for whether the account was *already* halted
+for this same, still-unresolved incident.
+
+That matters because `live_reconciliation.run()` calls
+`reconcile_all_connected_accounts()` — which drives this worker — every 60
+seconds in an infinite loop for as long as an account stays connected, and
+by this module's own documented design, resuming is a **deliberate manual
+admin action**, never automatic ("a mismatch means something needs a human
+look"). So a broker outage or a state mismatch that isn't noticed and
+resolved within a minute caused this worker to write a brand-new
+`AuditLog` row and a brand-new `Notification` row (`BROKER_DISCONNECTED`
+or `RECONCILIATION_REQUIRED`) once every single pass, indefinitely, for
+the entire duration of the incident. This is the exact same defect *shape*
+as `ScannerWorker`'s `Signal`-row spam fixed earlier in this document, just
+in a different worker and subsystem — a sustained, real outage (exactly
+the scenario blueprint §74 "Broker Failure Handling" exists to make
+visible) flooded `GET /notifications` and the audit trail fastest, right
+when a clean, singular, actionable alert mattered most.
+
+Fixed by checking `account_halt_reason(self.account_id)` before writing
+the audit row and notification in both branches: `halt_account` itself is
+still called on every pass (cheap, idempotent, keeps the halt reason
+fresh), but the `AuditLog`/`Notification` write only fires when the
+account wasn't already halted — i.e. this is a newly-detected incident,
+not a repeat of one still awaiting an admin's `resume_account` call. Once
+resumed, `account_halt_reason` returns `None` again, so the next
+occurrence still alerts exactly as before.
+
+New `tests/workers/test_reconciliation_worker.py::test_reconciliation_does_not_repeat_the_mismatch_alert_on_every_pass`
+and `::test_reconciliation_does_not_repeat_the_broker_unreachable_alert_on_every_pass`
+each call `run_once()` twice in a row over the same unresolved
+condition (no `resume_account` in between) and assert exactly one
+`AuditLog` row and one `Notification` row exist afterward, not two.
+Verified both fail against the pre-fix code and pass once the fix is
+restored.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

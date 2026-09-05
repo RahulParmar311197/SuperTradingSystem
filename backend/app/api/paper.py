@@ -1,35 +1,59 @@
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.orders import _get_instrument_by_symbol
 from app.auth.dependencies import get_current_user
+from app.core.audit import record_audit
+from app.database.models.notifications import NotificationType
+from app.database.models.strategy import Direction
 from app.database.models.strategy import Strategy as StrategyRow
+from app.database.models.trading import ExecutionMode
+from app.database.models.trading import Trade as TradeRow
 from app.database.models.users import User
 from app.database.session import get_db
+from app.notifications.service import create_notification
 from app.paper.engine import PaperTradingEngine
 from app.smc.types import Candle
 from app.strategy.dsl import StrategyDefinition
 
 router = APIRouter(prefix="/paper", tags=["paper"])
 
+
+@dataclass
+class _PaperSession:
+    """Wraps the in-memory engine with the identity `app.trading.persistence`
+    needs to journal a `Trade` row on close — the engine itself only knows
+    a plain `symbol` string, not a real `instruments` row, strategy, or
+    version."""
+
+    engine: PaperTradingEngine
+    instrument_id: uuid.UUID
+    strategy_id: uuid.UUID
+    strategy_version: int
+    opened_at: datetime | None = None
+    open_snapshot: dict | None = None
+
+
 # In-memory session registry — see the note in app/api/replay.py.
-_SESSIONS: dict[uuid.UUID, PaperTradingEngine] = {}
+_SESSIONS: dict[uuid.UUID, _PaperSession] = {}
 
 
-def _get_owned_session(session_id: uuid.UUID, user: User) -> PaperTradingEngine:
+def _get_owned_session(session_id: uuid.UUID, user: User) -> _PaperSession:
     """`PaperTradingEngine.account_id` is set to the creating user's id at
     `create_paper_session` and never changes — no other user's calls
     should ever be able to look this session up, feed candles into it, or
     even confirm it exists. A caller who isn't the owner gets the same
     404 as a session that doesn't exist, never a 403 that would leak
     which one is true."""
-    engine = _SESSIONS.get(session_id)
-    if engine is None or engine.account_id != str(user.id):
+    session = _SESSIONS.get(session_id)
+    if session is None or session.engine.account_id != str(user.id):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Paper trading session not found")
-    return engine
+    return session
 
 
 class CreatePaperSessionRequest(BaseModel):
@@ -76,18 +100,21 @@ async def create_paper_session(
     if strategy_row is None or strategy_row.user_id != user.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Strategy not found")
     strategy = StrategyDefinition.model_validate(strategy_row.definition)
+    instrument = await _get_instrument_by_symbol(db, payload.symbol)
 
     session_id = uuid.uuid4()
     engine = PaperTradingEngine(
         strategy, symbol=payload.symbol, account_id=str(user.id), starting_balance=payload.starting_balance
     )
-    _SESSIONS[session_id] = engine
+    _SESSIONS[session_id] = _PaperSession(
+        engine=engine, instrument_id=instrument.id, strategy_id=strategy_row.id, strategy_version=strategy_row.version
+    )
     return await _state_response(session_id, engine)
 
 
 @router.get("/{session_id}", response_model=PaperStateResponse)
 async def get_paper_session(session_id: uuid.UUID, user: User = Depends(get_current_user)) -> PaperStateResponse:
-    return await _state_response(session_id, _get_owned_session(session_id, user))
+    return await _state_response(session_id, _get_owned_session(session_id, user).engine)
 
 
 class FeedCandleRequest(BaseModel):
@@ -101,10 +128,80 @@ class FeedCandleRequest(BaseModel):
 
 @router.post("/{session_id}/candle", response_model=PaperStateResponse)
 async def feed_candle(
-    session_id: uuid.UUID, payload: FeedCandleRequest, user: User = Depends(get_current_user)
+    session_id: uuid.UUID, payload: FeedCandleRequest, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
 ) -> PaperStateResponse:
-    engine = _get_owned_session(session_id, user)
-    await engine.on_candle(Candle(**payload.model_dump()))
+    """Blueprint §49/§61: a manual paper trading session is a rehearsal of
+    a real account, not a toy — closing a position here has to leave the
+    same kind of trail a live or autonomous trade does. Before this, only
+    `AutoTradeSupervisor` (driving this exact same `PaperTradingEngine`)
+    ever wrote a `Trade` journal row or a notification on close; a manual
+    session's entire history vanished the moment it was deleted or the
+    process restarted, with nothing queryable anywhere.
+    """
+    session = _get_owned_session(session_id, user)
+    engine = session.engine
+    candle = Candle(**payload.model_dump())
+
+    position_before = engine.position_manager.get(engine.account_id, engine.symbol)
+    if position_before is not None and position_before.is_open:
+        session.open_snapshot = {
+            "direction": Direction.LONG if position_before.is_long else Direction.SHORT,
+            "quantity": abs(position_before.quantity),
+            "entry_price": position_before.average_price,
+            "stop": position_before.stop,
+            "target": position_before.target,
+        }
+
+    outcome = await engine.on_candle(candle)
+
+    if outcome.order_created:
+        session.opened_at = candle.timestamp
+        await record_audit(
+            db,
+            actor="user",
+            action="paper.order_placed",
+            user_id=user.id,
+            details={"symbol": engine.symbol, "direction": outcome.signal.direction if outcome.signal else None},
+        )
+
+    if outcome.closed_position_pnl is not None and session.open_snapshot is not None:
+        snapshot = session.open_snapshot
+        opened_at = session.opened_at or candle.timestamp
+        risk_per_unit = abs(snapshot["entry_price"] - snapshot["stop"]) if snapshot["stop"] else None
+        r_multiple = (outcome.closed_position_pnl / snapshot["quantity"]) / risk_per_unit if risk_per_unit else None
+
+        db.add(
+            TradeRow(
+                user_id=user.id,
+                instrument_id=session.instrument_id,
+                strategy_id=session.strategy_id,
+                strategy_version=session.strategy_version,
+                execution_mode=ExecutionMode.PAPER,
+                direction=snapshot["direction"],
+                entry_price=snapshot["entry_price"],
+                exit_price=candle.close,
+                quantity=snapshot["quantity"],
+                stop=snapshot["stop"],
+                target=snapshot["target"],
+                pnl=outcome.closed_position_pnl,
+                r_multiple=r_multiple,
+                opened_at=opened_at,
+                closed_at=candle.timestamp,
+                journal={"source": "manual_paper", "symbol": engine.symbol},
+            )
+        )
+        await db.commit()
+        await create_notification(
+            db,
+            user_id=user.id,
+            notification_type=NotificationType.POSITION_CLOSED,
+            title=f"{engine.symbol} paper trade closed",
+            body=f"Realized P&L: {outcome.closed_position_pnl:.2f}",
+            data={"symbol": engine.symbol, "pnl": outcome.closed_position_pnl},
+        )
+        session.open_snapshot = None
+        session.opened_at = None
+
     return await _state_response(session_id, engine)
 
 
@@ -112,6 +209,9 @@ async def feed_candle(
 async def close_paper_session(session_id: uuid.UUID, user: User = Depends(get_current_user)) -> None:
     """Ends a paper trading session, freeing its in-memory engine.
     `_SESSIONS` has no automatic eviction — every created session stays in
-    process memory until this is called or the process restarts."""
+    process memory until this is called or the process restarts. Closed
+    trades are already journaled (see `feed_candle`) by the time this
+    runs; only the live working copy and any still-open position's
+    unrealized state are discarded."""
     _get_owned_session(session_id, user)
     del _SESSIONS[session_id]

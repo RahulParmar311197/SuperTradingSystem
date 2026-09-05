@@ -5,6 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.security import (
+    DUMMY_PASSWORD_HASH,
     InvalidTokenError,
     TokenType,
     create_access_token,
@@ -58,7 +59,12 @@ async def login(
     db: AsyncSession, email: str, password: str, device_info: str | None = None
 ) -> tuple[str, str]:
     user = await get_user_by_email(db, email)
-    if user is None or not verify_password(password, user.password_hash):
+    # Always pay bcrypt's cost, even for an email with no account -- see
+    # DUMMY_PASSWORD_HASH's docstring in app/auth/security.py. Whether
+    # `user` exists must never be observable from response latency.
+    password_hash = user.password_hash if user is not None else DUMMY_PASSWORD_HASH
+    password_valid = verify_password(password, password_hash)
+    if user is None or not password_valid:
         await record_audit(db, actor="user", action="login.failed", details={"email": email})
         raise AuthError("Invalid email or password")
     tokens = await _issue_tokens(db, user, device_info=device_info)

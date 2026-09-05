@@ -698,6 +698,52 @@ Three `NotificationType` values remain unwired: `SETUP_DETECTED`,
 (scanner-side pattern detection, the market-data freshness halt path, and
 an auto-trading kill-switch respectively), left open for future rounds.
 
+## A timing side channel in login let an attacker enumerate accounts
+
+`app/auth/service.py`'s `login()` used to read:
+
+```python
+user = await get_user_by_email(db, email)
+if user is None or not verify_password(password, user.password_hash):
+    ...
+    raise AuthError("Invalid email or password")
+```
+
+Python's `or` short-circuits, so a login attempt for an email with no
+matching account returned after only a Postgres `SELECT` — fast — while an
+attempt for a real, registered email always paid the cost of
+`bcrypt.checkpw` inside `verify_password` (`app/auth/security.py`),
+deliberately slow (tens of milliseconds, by design — that's what makes
+bcrypt resistant to offline brute-forcing). That asymmetry is a textbook
+timing side channel: an unauthenticated caller can distinguish "this email
+is registered" from "this email is not registered" purely from response
+latency, with no dependency on guessing the password at all. `POST
+/auth/login`'s rate limit (`app/api/auth.py`, 10/minute per key) slows this
+down but doesn't close it — it bounds the query rate, not what a single
+response's timing leaks, and an attacker can spread a target list across
+many keys or simply wait. `POST /auth/register` (`AuthError("An account
+with this email already exists")`) is a separate, already-visible
+enumeration channel by design — a 409 conflict is an explicit, documented
+response, not a side channel — and is out of scope here; this fix is about
+login's timing leak specifically.
+
+Fixed by always calling `verify_password` exactly once, on a real bcrypt
+hash either way: the user's own hash when the account exists, or a
+precomputed dummy hash (`DUMMY_PASSWORD_HASH` in `app/auth/security.py`,
+computed once at import time via `hash_password(...)` on an arbitrary
+string with no matching account) when it doesn't. Both branches now do the
+same amount of work regardless of which is true, so response latency no
+longer reveals whether the submitted email is registered.
+`tests/api/test_auth_login.py::test_login_with_unknown_email_still_pays_bcrypt_cost`
+proves it by spying on `verify_password` (rather than asserting on wall-clock
+timing, which would be flaky under CI load) — it asserts the function is
+still called exactly once, against `DUMMY_PASSWORD_HASH`, for a login
+attempt against an email with no account. Reverting the fix reproduces the
+short-circuit (spy never called) immediately (verified by hand before
+committing). Two more tests in the same file cover the ordinary
+correct/incorrect-password paths to confirm behavior is otherwise
+unchanged.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

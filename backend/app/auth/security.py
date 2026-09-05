@@ -40,6 +40,17 @@ def verify_password(password: str, password_hash: str) -> bool:
     return bcrypt.checkpw(encoded, password_hash.encode("utf-8"))
 
 
+# A real bcrypt hash with no matching password, computed once at import
+# time. `login()` checks against this instead of skipping `verify_password`
+# entirely when no account matches the submitted email — bcrypt is
+# deliberately slow (~50-100ms), so returning early only for a nonexistent
+# account would let an unauthenticated caller distinguish "registered" from
+# "not registered" purely from response latency, independent of the
+# password guess itself. Comparing against a real hash either way keeps
+# both branches paying the same cost.
+DUMMY_PASSWORD_HASH = hash_password("not-a-real-password-timing-parity-only")
+
+
 def _create_token(
     subject: str, token_type: TokenType, expires_delta: timedelta, session_id: str | None = None
 ) -> str:

@@ -5,11 +5,12 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import delete, select
 
+from app.core.encryption import encrypt_credentials
 from app.database.models.instruments import Instrument, MarketType, OptionType
 from app.database.models.options import OptionChainSnapshot, OptionContract, OptionSnapshot
 from app.database.models.risk import AuditLog, RiskEvent
 from app.database.models.trading import ExecutionMode, Order, OrderEvent, Position, Trade
-from app.database.models.users import User, UserSession
+from app.database.models.users import BrokerAccount, BrokerAccountStatus, BrokerName, User, UserSession
 from app.database.session import async_session_factory
 from app.main import app
 
@@ -239,5 +240,66 @@ async def test_execute_rejects_when_premium_deviates_from_real_quote(require_inf
                 await db.execute(delete(OptionSnapshot).where(OptionSnapshot.option_contract_id == contract_id))
                 await db.execute(delete(OptionContract).where(OptionContract.id == contract_id))
                 await db.execute(delete(OptionChainSnapshot).where(OptionChainSnapshot.id == chain_id))
+                await db.commit()
+            await _cleanup(user_id, [long_leg.id, short_leg.id])
+
+
+async def test_execute_records_which_broker_account_executed_it(require_infra):
+    # Regression test: `Order.broker_account_id` exists to trace a placed
+    # order back to whichever connected BrokerAccount executed it (see
+    # tests/api/test_orders.py::test_place_order_records_which_broker_account_executed_it,
+    # which fixed this for POST /orders). execute_options_strategy places
+    # real orders through that same broker/risk/persistence pipeline (its
+    # own docstring says so) but never threaded broker_account_id into its
+    # persist_order call, so every options leg ever executed -- including
+    # through a real connected account -- was persisted with
+    # broker_account_id always NULL. Uses an ACTIVE PAPER account
+    # (resolves to MockBroker, same as the no-account default) so this
+    # doesn't need real Upstox/Dhan credentials.
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+        long_leg, short_leg = await _make_two_leg_instruments(f"OPTBA{uuid.uuid4().hex[:5].upper()}")
+
+        async with async_session_factory() as db:
+            account = BrokerAccount(
+                user_id=user_id,
+                broker=BrokerName.PAPER,
+                encrypted_credentials=encrypt_credentials({}),
+                status=BrokerAccountStatus.ACTIVE,
+            )
+            db.add(account)
+            await db.commit()
+            await db.refresh(account)
+            account_id = account.id
+
+        try:
+            r = client.post(
+                "/options/execute",
+                json={
+                    "strategy_name": "bull_call_spread",
+                    "legs": [
+                        {"symbol": long_leg.symbol, "direction": "LONG", "quantity": 1, "premium": 120.0},
+                        {"symbol": short_leg.symbol, "direction": "SHORT", "quantity": 1, "premium": 50.0},
+                    ],
+                },
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+
+            async with async_session_factory() as db:
+                orders = (await db.execute(select(Order).where(Order.user_id == user_id))).scalars().all()
+                assert len(orders) == 2
+                assert all(o.broker_account_id == account_id for o in orders)
+        finally:
+            async with async_session_factory() as db:
+                # Orders reference broker_accounts (Order.broker_account_id),
+                # so they must go first -- and OrderEvent rows must go
+                # before their Order, same as _cleanup below does.
+                order_ids = (await db.execute(select(Order.id).where(Order.user_id == user_id))).scalars().all()
+                for order_id in order_ids:
+                    await db.execute(delete(OrderEvent).where(OrderEvent.order_id == order_id))
+                await db.execute(delete(Order).where(Order.user_id == user_id))
+                await db.execute(delete(BrokerAccount).where(BrokerAccount.id == account_id))
                 await db.commit()
             await _cleanup(user_id, [long_leg.id, short_leg.id])

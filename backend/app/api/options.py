@@ -316,7 +316,9 @@ async def execute_options_strategy(
             await stack.execution_engine.submit(order.id)
 
         final_order = stack.order_manager.get(order.id)
-        await persist_order(db, final_order, user.id, instrument.id, execution_mode=execution_mode)
+        await persist_order(
+            db, final_order, user.id, instrument.id, execution_mode=execution_mode, broker_account_id=stack.broker_account_id
+        )
 
         position_after = stack.position_manager.get(str(user.id), leg.symbol)
         if position_after is not None:

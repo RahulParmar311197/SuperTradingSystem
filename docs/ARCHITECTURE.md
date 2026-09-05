@@ -1370,6 +1370,38 @@ Reverting the constant back to `30` reproduces the original bug
 immediately — this test fails with `assert 30 > 60.0` — confirmed by hand
 before restoring the fix.
 
+## The `Order.broker_account_id` fix never reached its sibling endpoint (§50, §53)
+
+The bug documented above in "`Order.broker_account_id` was declared but
+never populated" was fixed by threading `stack.broker_account_id`
+through `app/api/orders.py`'s two `persist_order` call sites
+(`place_order`, `cancel_order`). `app/api/options.py`'s
+`execute_options_strategy` was never touched by that fix — and its own
+docstring says it places real orders "through the same broker/risk/
+persistence pipeline `POST /orders` uses." It builds the exact same
+`_UserTradingStack` via `_stack_for(user, db)`, which already carries
+`stack.broker_account_id`, but its `persist_order(...)` call
+(`app/api/options.py`) never passed it along:
+```python
+final_order = stack.order_manager.get(order.id)
+await persist_order(db, final_order, user.id, instrument.id, execution_mode=execution_mode)
+```
+Every options leg ever executed through this endpoint — including
+through a real, connected Upstox/Dhan account — was persisted with
+`Order.broker_account_id` permanently `NULL`, the identical gap the
+earlier fix closed for `POST /orders`, just left open in this sibling
+endpoint that shares the same stack and the same persistence call.
+
+Fixed by adding `broker_account_id=stack.broker_account_id` to this call,
+mirroring `place_order`'s pattern exactly. New
+`tests/api/test_options_execute.py::test_execute_records_which_broker_account_executed_it`
+mirrors `test_orders.py`'s existing test for the same fix: connects an
+ACTIVE `PAPER` `BrokerAccount` (resolves to `MockBroker`, so no real
+broker credentials are needed), executes a two-leg strategy, and asserts
+both persisted `Order` rows' `broker_account_id` match it. Reverting the
+one-line fix reproduces the original bug immediately — confirmed by hand
+before restoring it.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

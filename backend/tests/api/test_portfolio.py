@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import delete, select
 
 from app.database.models.instruments import Instrument, MarketType
+from app.database.models.notifications import Notification
 from app.database.models.risk import AuditLog, RiskEvent
 from app.database.models.trading import ExecutionMode, Order, OrderEvent, Position, Trade
 from app.database.models.users import User, UserSession
@@ -23,6 +24,7 @@ async def _cleanup(user_id: uuid.UUID, instrument_id: uuid.UUID) -> None:
         await db.execute(delete(Trade).where(Trade.user_id == user_id))
         await db.execute(delete(Position).where(Position.user_id == user_id))
         await db.execute(delete(RiskEvent).where(RiskEvent.user_id == user_id))
+        await db.execute(delete(Notification).where(Notification.user_id == user_id))
         await db.execute(delete(AuditLog).where(AuditLog.user_id == user_id))
         await db.execute(delete(UserSession).where(UserSession.user_id == user_id))
         await db.execute(delete(User).where(User.id == user_id))

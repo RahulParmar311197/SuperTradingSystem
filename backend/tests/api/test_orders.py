@@ -148,6 +148,58 @@ async def test_place_and_close_order_persists_to_database(require_infra):
             await _cleanup(user_id, instrument_id)
 
 
+async def test_live_order_notifies_on_trade_executed_and_position_closed(require_infra):
+    # Regression test: `place_order` only ever called `create_notification`
+    # on risk rejection -- a real fill that opens or closes a live
+    # position never notified at all, unlike app/api/paper.py and
+    # app/workers/auto_trade_worker.py, which both already fire
+    # TRADE_EXECUTED/POSITION_CLOSED for the identical event. Blueprint
+    # §63/§104 list these as required notification events with no
+    # live/paper carve-out -- if anything the live path (real broker
+    # money) is the one where this matters most.
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        async with async_session_factory() as db:
+            instrument = Instrument(
+                symbol=f"ORDNOTIF{uuid.uuid4().hex[:6].upper()}", exchange="NSE", market=MarketType.EQUITY, instrument_type="EQ"
+            )
+            db.add(instrument)
+            await db.commit()
+            await db.refresh(instrument)
+            instrument_id = instrument.id
+
+        try:
+            r = client.post(
+                "/orders",
+                json={"symbol": instrument.symbol, "direction": "LONG", "entry": 100.0, "stop": 95.0},
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+
+            async with async_session_factory() as db:
+                notifications = (await db.execute(select(Notification).where(Notification.user_id == user_id))).scalars().all()
+            assert len(notifications) == 1
+            assert notifications[0].type == NotificationType.TRADE_EXECUTED
+
+            r = client.post(
+                "/orders",
+                json={"symbol": instrument.symbol, "direction": "SHORT", "entry": 110.0, "stop": 115.0},
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+
+            async with async_session_factory() as db:
+                notifications = (await db.execute(select(Notification).where(Notification.user_id == user_id))).scalars().all()
+            assert len(notifications) == 2
+            assert {n.type for n in notifications} == {NotificationType.TRADE_EXECUTED, NotificationType.POSITION_CLOSED}
+            closed = next(n for n in notifications if n.type == NotificationType.POSITION_CLOSED)
+            assert "1000" in closed.body
+        finally:
+            await _cleanup(user_id, instrument_id)
+
+
 async def test_live_order_records_stop_on_the_resulting_position(require_infra):
     # Regression test: `payload.stop` is required input already used to
     # size the order (calculate_position_size) and feed the risk engine,

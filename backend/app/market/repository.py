@@ -6,6 +6,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models.market import Candle as CandleRow
@@ -37,17 +38,36 @@ async def get_candles(
 
 
 async def upsert_candles(db: AsyncSession, instrument_id: uuid.UUID, timeframe: str, candles: list[Candle]) -> None:
-    for candle in candles:
-        db.add(
-            CandleRow(
-                instrument_id=instrument_id,
-                timeframe=timeframe,
-                timestamp=candle.timestamp,
-                open=candle.open,
-                high=candle.high,
-                low=candle.low,
-                close=candle.close,
-                volume=candle.volume,
-            )
-        )
+    """Despite the name, this used to be a plain `INSERT` -- any caller
+    that ever re-persists a `(instrument_id, timeframe, timestamp)` combo
+    already written (a worker restart replaying a backfill, an
+    out-of-order tick, a derived-timeframe recompute racing a previous
+    one) hit `uq_candle_key` and raised `UniqueViolationError`, which
+    `app/workers/main.py`'s generic `except Exception` around this whole
+    pipeline silently swallowed -- dropping the write, the tick's
+    in-memory bookkeeping, and any signal of the failure all at once. A
+    real `INSERT ... ON CONFLICT DO UPDATE` makes a re-write of the same
+    bucket a safe, idempotent overwrite instead of a crash."""
+    if not candles:
+        return
+    stmt = insert(CandleRow).values(
+        [
+            {
+                "instrument_id": instrument_id,
+                "timeframe": timeframe,
+                "timestamp": candle.timestamp,
+                "open": candle.open,
+                "high": candle.high,
+                "low": candle.low,
+                "close": candle.close,
+                "volume": candle.volume,
+            }
+            for candle in candles
+        ]
+    )
+    stmt = stmt.on_conflict_do_update(
+        constraint="uq_candle_key",
+        set_={"open": stmt.excluded.open, "high": stmt.excluded.high, "low": stmt.excluded.low, "close": stmt.excluded.close, "volume": stmt.excluded.volume},
+    )
+    await db.execute(stmt)
     await db.commit()

@@ -11,7 +11,7 @@ from app.database.models.risk import AuditLog
 from app.database.models.users import User, UserSession
 from app.database.session import async_session_factory
 from app.main import app
-from app.market.repository import upsert_candles
+from app.market.repository import get_candles, upsert_candles
 from app.smc.types import Candle
 
 pytestmark = pytest.mark.asyncio
@@ -67,3 +67,46 @@ async def test_get_candles_returns_data_without_crashing(require_infra):
             assert set(body[0].keys()) == {"timestamp", "open", "high", "low", "close", "volume"}
         finally:
             await _cleanup(user_id, instrument_id)
+
+
+async def test_upsert_candles_is_idempotent_on_conflict(require_infra):
+    # Regression test: despite the name, `upsert_candles` used to be a
+    # plain `INSERT` with no conflict handling. Any caller that
+    # re-persists the same `(instrument_id, timeframe, timestamp)` combo
+    # -- a worker restart replaying a backfill, an out-of-order tick in
+    # app/workers/candle_worker.py mishandled as a rollover, a
+    # derived-timeframe recompute racing a previous one -- hit
+    # `uq_candle_key` and raised `UniqueViolationError`, which the
+    # generic `except Exception` around the whole market-data pipeline
+    # (app/workers/main.py) silently swallowed: the write, and the
+    # worker's in-memory bookkeeping for that tick, both vanished with no
+    # record anywhere. A real `INSERT ... ON CONFLICT DO UPDATE` makes a
+    # re-write of the same bucket a safe overwrite instead of a crash.
+    async with async_session_factory() as db:
+        instrument = Instrument(symbol=f"UPS{uuid.uuid4().hex[:6].upper()}", exchange="NSE", market=MarketType.EQUITY, instrument_type="EQ")
+        db.add(instrument)
+        await db.commit()
+        instrument_id = instrument.id
+
+    ts = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
+    try:
+        async with async_session_factory() as db:
+            await upsert_candles(db, instrument_id, "1m", [Candle(ts, 100, 101, 99, 100, 10)])
+
+        # Re-persisting the exact same bucket with different OHLC (as a
+        # legitimate correction/replay would) must not raise, and must
+        # overwrite rather than duplicate.
+        async with async_session_factory() as db:
+            await upsert_candles(db, instrument_id, "1m", [Candle(ts, 100, 150, 99, 140, 25)])
+
+        async with async_session_factory() as db:
+            persisted = await get_candles(db, instrument_id, "1m")
+        assert len(persisted) == 1
+        assert persisted[0].high == 150
+        assert persisted[0].close == 140
+        assert persisted[0].volume == 25
+    finally:
+        async with async_session_factory() as db:
+            await db.execute(delete(CandleRow).where(CandleRow.instrument_id == instrument_id))
+            await db.execute(delete(Instrument).where(Instrument.id == instrument_id))
+            await db.commit()

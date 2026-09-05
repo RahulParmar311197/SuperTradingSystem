@@ -577,3 +577,49 @@ async def test_repeated_broker_rejections_trip_the_circuit_breaker(require_infra
                 assert any(n.type == NotificationType.ORDER_REJECTED for n in notifications)
         finally:
             await _cleanup(user_id, instrument_id)
+
+
+async def test_abnormal_price_jump_blocks_a_new_order(require_infra):
+    # Regression test: RiskEngine.evaluate's `no_abnormal_price_jump` check
+    # (app/risk/engine.py, blueprint §57 "unexpected price jump") reads
+    # `proposal.recent_price_jump_pct`, but nothing ever computed it -- it
+    # was always the TradeRiskProposal default of 0.0, so this check could
+    # never fail no matter how violently a symbol's price moved between
+    # ticks.
+    from app.core.redis import set_latest_price
+
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        async with async_session_factory() as db:
+            instrument = Instrument(
+                symbol=f"ORDJMP{uuid.uuid4().hex[:6].upper()}", exchange="NSE", market=MarketType.EQUITY, instrument_type="EQ"
+            )
+            db.add(instrument)
+            await db.commit()
+            await db.refresh(instrument)
+            instrument_id = instrument.id
+
+        try:
+            # Two ticks 10% apart -- well past the default 5% limit. Also
+            # keeps market_data_age_seconds fresh (near 0), so that check
+            # doesn't confound this one.
+            await set_latest_price(instrument.symbol, 100.0)
+            await set_latest_price(instrument.symbol, 110.0)
+
+            r = client.post(
+                "/orders",
+                json={"symbol": instrument.symbol, "direction": "LONG", "entry": 110.0, "stop": 105.0},
+                headers=headers,
+            )
+            assert r.status_code == 403, r.text
+            assert "no_abnormal_price_jump" in r.text
+
+            async with async_session_factory() as db:
+                notifications = (
+                    await db.execute(select(Notification).where(Notification.user_id == user_id))
+                ).scalars().all()
+                assert any(n.type == NotificationType.ORDER_REJECTED for n in notifications)
+        finally:
+            await _cleanup(user_id, instrument_id)

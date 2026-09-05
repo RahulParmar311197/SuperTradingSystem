@@ -145,3 +145,29 @@ async def test_paper_engine_enforces_repeated_rejections_limit():
             saw_rejection = True
 
     assert saw_rejection is True
+
+
+@pytest.mark.asyncio
+async def test_paper_engine_enforces_abnormal_price_jump_limit():
+    # Regression test: RiskEngine.evaluate's `no_abnormal_price_jump` check
+    # (app/risk/engine.py, blueprint §57 "unexpected price jump") reads
+    # `proposal.recent_price_jump_pct`, but PaperTradingEngine never
+    # computed it -- always the TradeRiskProposal default of 0.0 -- so it
+    # could never fail regardless of how violently the price moved between
+    # candles. The SETUP fixture's own entry-candle jump (candle 6's close
+    # 107 -> candle 7's close 109 -- the candle the strategy actually
+    # matches and places an order on -- ~1.87%) is real, unmodified
+    # fixture data -- lowering the limit below it is enough to prove the
+    # wiring works without needing to synthesize an artificial price
+    # spike.
+    candles = make_candles(SETUP)
+    engine = PaperTradingEngine(_strategy(), symbol="TESTSYM", starting_balance=100_000)
+    engine.risk_engine.limits.max_price_jump_pct = 1.0
+
+    saw_rejection = False
+    for candle in candles:
+        outcome = await engine.on_candle(candle)
+        if outcome.risk_failed_check == "no_abnormal_price_jump":
+            saw_rejection = True
+
+    assert saw_rejection is True

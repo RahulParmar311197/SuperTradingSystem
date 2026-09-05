@@ -156,6 +156,16 @@ class PaperTradingEngine:
             market_data_age_seconds=0.0,
             broker_healthy=await self.broker.is_healthy(),
             repeated_rejections=self.repeated_rejections,
+            # `len(self.candles) < 3` already returned above, so
+            # `self.candles[-2]` is always safe here. No Redis primitive
+            # needed like app/api/orders.py's live path -- this engine
+            # already has its own candle history to diff the current tick
+            # against.
+            recent_price_jump_pct=(
+                abs(self.candles[-1].close - self.candles[-2].close) / self.candles[-2].close * 100
+                if self.candles[-2].close
+                else 0.0
+            ),
         )
         decision = self.risk_engine.evaluate(proposal)
         if not decision.approved:

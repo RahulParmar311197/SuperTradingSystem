@@ -148,6 +148,74 @@ async def test_place_and_close_order_persists_to_database(require_infra):
             await _cleanup(user_id, instrument_id)
 
 
+async def test_live_order_records_stop_on_the_resulting_position(require_infra):
+    # Regression test: `payload.stop` is required input already used to
+    # size the order (calculate_position_size) and feed the risk engine,
+    # but nothing ever attached it to the resulting position -- unlike
+    # PaperTradingEngine, which already records a stop for every
+    # paper/auto-trade entry. Every live position's stop was permanently
+    # None, so the positions.stop column was dead-on-arrival and nothing
+    # could ever know what a position's protective level was supposed to
+    # be.
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        async with async_session_factory() as db:
+            instrument = Instrument(
+                symbol=f"ORDSTP{uuid.uuid4().hex[:6].upper()}", exchange="NSE", market=MarketType.EQUITY, instrument_type="EQ"
+            )
+            db.add(instrument)
+            await db.commit()
+            await db.refresh(instrument)
+            instrument_id = instrument.id
+
+        try:
+            # Opening a position records its stop.
+            r = client.post(
+                "/orders",
+                json={"symbol": instrument.symbol, "direction": "LONG", "entry": 100.0, "stop": 95.0},
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+
+            async with async_session_factory() as db:
+                position_row = (await db.execute(select(Position).where(Position.user_id == user_id))).scalar_one()
+                assert float(position_row.stop) == pytest.approx(95.0)
+
+            # Adding to the same-direction position updates the stop to
+            # whatever this new order declares.
+            r = client.post(
+                "/orders",
+                json={"symbol": instrument.symbol, "direction": "LONG", "entry": 101.0, "stop": 94.0},
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+
+            async with async_session_factory() as db:
+                position_row = (await db.execute(select(Position).where(Position.user_id == user_id))).scalar_one()
+                assert float(position_row.stop) == pytest.approx(94.0)
+
+            # A reducing fill in the opposite direction must never
+            # overwrite the stop with its own (irrelevant) value -- a
+            # large stop distance keeps this order's sized quantity small
+            # relative to the existing open position, so it only reduces,
+            # not closes or flips it.
+            r = client.post(
+                "/orders",
+                json={"symbol": instrument.symbol, "direction": "SHORT", "entry": 110.0, "stop": 10.0},
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+
+            async with async_session_factory() as db:
+                position_row = (await db.execute(select(Position).where(Position.user_id == user_id))).scalar_one()
+                assert position_row.is_open is True
+                assert float(position_row.stop) == pytest.approx(94.0)
+        finally:
+            await _cleanup(user_id, instrument_id)
+
+
 async def test_place_order_records_which_broker_account_executed_it(require_infra):
     # Regression test: `Order.broker_account_id` is a real FK column that
     # existed purely to trace a placed order back to whichever connected

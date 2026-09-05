@@ -26,6 +26,7 @@ from app.options.greeks import OptionType, black_scholes_greeks, black_scholes_p
 from app.options.liquidity_filter import evaluate_liquidity
 from app.options.payoff import OptionLeg, compute_payoff_summary
 from app.options.strategies import BIAS_STRATEGIES, build_strategy
+from app.risk.kill_switch import load_kill_switch_state
 from app.risk.options_risk import OptionsRiskProposal, evaluate_options_risk
 from app.trading.persistence import persist_order, persist_position, record_trade
 
@@ -285,7 +286,11 @@ async def execute_options_strategy(
         liquidity_acceptable=liquidity_acceptable,
         premium_deviation_pct=premium_deviation_pct,
     )
-    decision = evaluate_options_risk(risk_proposal, limits=stack.risk_engine.limits)
+    # Blueprint §58: fetched fresh on every call so a kill triggered via the
+    # admin endpoint from this or any other process takes effect on the
+    # very next order -- see app.risk.kill_switch.load_kill_switch_state.
+    kill_switch = await load_kill_switch_state(str(user.id), None)
+    decision = evaluate_options_risk(risk_proposal, limits=stack.risk_engine.limits, kill_switch=kill_switch)
     db.add(
         RiskEvent(
             user_id=user.id,

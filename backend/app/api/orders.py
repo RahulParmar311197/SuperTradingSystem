@@ -22,6 +22,7 @@ from app.database.models.users import TradingPermission, User
 from app.database.session import get_db
 from app.notifications.service import create_notification
 from app.risk.engine import RiskEngine, TradeRiskProposal, calculate_position_size
+from app.risk.kill_switch import load_kill_switch_state
 from app.risk.limits import RiskLimits
 from app.risk.portfolio import compute_correlated_exposure
 from app.trading.broker_resolver import resolve_broker
@@ -268,6 +269,11 @@ async def place_order(
         recent_price_jump_pct=await get_price_jump_pct(payload.symbol) or 0.0,
         entry_deviation_pct=entry_deviation_pct,
     )
+    # Blueprint §58: refreshed on every call, not cached on the stack at
+    # construction time, so a kill triggered via the admin endpoint from
+    # this or any other process takes effect on the very next order --
+    # see app.risk.kill_switch.load_kill_switch_state.
+    stack.risk_engine.kill_switch = await load_kill_switch_state(str(user.id), None)
     decision = stack.risk_engine.evaluate(proposal)
     db.add(
         RiskEvent(

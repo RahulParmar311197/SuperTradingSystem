@@ -190,6 +190,68 @@ async def list_halted_accounts() -> dict[str, str]:
     return halted
 
 
+# --- Kill switch (blueprint §58) ------------------------------------------
+#
+# Same cross-process problem as the account halts above: `KillSwitchState`
+# (app.risk.kill_switch) is a plain in-memory dataclass, so a kill
+# triggered from one process (an admin API call) was invisible to the
+# RiskEngine instances living inside every other process's -- and even the
+# same process's other -- per-user trading stacks. These keys are the
+# shared surface; app.risk.kill_switch.load_kill_switch_state reads them
+# back into a KillSwitchState for RiskEngine/evaluate_options_risk to
+# consult, the same way `account_halt_reason` above is read by orders.py.
+
+_KILL_GLOBAL_KEY = "kill:global"
+_KILL_ACCOUNT_PREFIX = "kill:account:"
+_KILL_STRATEGY_PREFIX = "kill:strategy:"
+
+
+async def set_global_kill() -> None:
+    await get_redis().set(_KILL_GLOBAL_KEY, "1")
+
+
+async def clear_global_kill() -> None:
+    await get_redis().delete(_KILL_GLOBAL_KEY)
+
+
+async def is_global_killed() -> bool:
+    return await get_redis().get(_KILL_GLOBAL_KEY) is not None
+
+
+async def set_account_kill(account_id: str) -> None:
+    await get_redis().set(f"{_KILL_ACCOUNT_PREFIX}{account_id}", "1")
+
+
+async def clear_account_kill(account_id: str) -> None:
+    await get_redis().delete(f"{_KILL_ACCOUNT_PREFIX}{account_id}")
+
+
+async def is_account_killed(account_id: str) -> bool:
+    return await get_redis().get(f"{_KILL_ACCOUNT_PREFIX}{account_id}") is not None
+
+
+async def set_strategy_kill(strategy_id: str) -> None:
+    await get_redis().set(f"{_KILL_STRATEGY_PREFIX}{strategy_id}", "1")
+
+
+async def clear_strategy_kill(strategy_id: str) -> None:
+    await get_redis().delete(f"{_KILL_STRATEGY_PREFIX}{strategy_id}")
+
+
+async def is_strategy_killed(strategy_id: str) -> bool:
+    return await get_redis().get(f"{_KILL_STRATEGY_PREFIX}{strategy_id}") is not None
+
+
+async def list_killed_accounts() -> list[str]:
+    client = get_redis()
+    return [key[len(_KILL_ACCOUNT_PREFIX) :] async for key in client.scan_iter(match=f"{_KILL_ACCOUNT_PREFIX}*")]
+
+
+async def list_killed_strategies() -> list[str]:
+    client = get_redis()
+    return [key[len(_KILL_STRATEGY_PREFIX) :] async for key in client.scan_iter(match=f"{_KILL_STRATEGY_PREFIX}*")]
+
+
 # --- Worker heartbeats (blueprint §117 "Workers 🟢") ----------------------
 #
 # The worker process (see app/workers/main.py) is separate from the API

@@ -4,7 +4,17 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import delete
 
-from app.core.redis import account_halt_reason, halt_account, resume_account
+from app.core.redis import (
+    account_halt_reason,
+    clear_account_kill,
+    clear_global_kill,
+    clear_strategy_kill,
+    halt_account,
+    is_account_killed,
+    is_global_killed,
+    is_strategy_killed,
+    resume_account,
+)
 from app.database.models.risk import AuditLog
 from app.database.models.users import User, UserRole, UserSession
 from app.database.session import async_session_factory
@@ -48,11 +58,15 @@ async def test_admin_endpoints_reject_non_admin_users(require_infra):
                 "/admin/system-health",
                 "/admin/halted-accounts",
                 "/admin/ai-decisions",
+                "/admin/kill-switch",
             ):
                 r = client.get(path, headers=headers)
                 assert r.status_code == 403, f"{path}: {r.text}"
 
             r = client.post("/admin/accounts/some-account/resume", json={"confirm": True}, headers=headers)
+            assert r.status_code == 403, r.text
+
+            r = client.post("/admin/kill-switch/global", json={"confirm": True}, headers=headers)
             assert r.status_code == 403, r.text
         finally:
             await _cleanup(user_id)
@@ -131,4 +145,70 @@ async def test_admin_can_view_and_resume_a_halted_account(require_infra):
             assert r.status_code == 404, r.text
         finally:
             await resume_account(halted_account_id)
+            await _cleanup(admin_id)
+
+
+async def test_admin_can_view_and_trigger_the_three_level_kill_switch(require_infra):
+    # Regression test: blueprint §58's three-level kill switch
+    # (app/risk/kill_switch.py) had no admin-reachable way to ever be
+    # triggered -- `KillSwitchState` was a plain in-memory dataclass that
+    # nothing outside a unit test ever called kill_global/kill_account/
+    # kill_strategy on, so `RiskEngine.evaluate`'s "kill_switch" check was
+    # permanently a no-op. These are the endpoints that make it real,
+    # backed by Redis so a kill here is visible to every RiskEngine in
+    # every process (see app.risk.kill_switch.load_kill_switch_state).
+    with TestClient(app) as client:
+        admin_token, admin_id = await _register(client, "admin")
+
+        async with async_session_factory() as db:
+            admin_user = await db.get(User, admin_id)
+            admin_user.role = UserRole.ADMIN
+            await db.commit()
+
+        headers = {"Authorization": f"Bearer {admin_token}"}
+        account_id = f"killtest-{uuid.uuid4().hex[:8]}"
+        strategy_id = f"strat-{uuid.uuid4().hex[:8]}"
+        try:
+            r = client.get("/admin/kill-switch", headers=headers)
+            assert r.status_code == 200, r.text
+            assert r.json()["global_kill"] is False
+
+            # Requires confirm=true, on every level.
+            r = client.post("/admin/kill-switch/global", json={"confirm": False}, headers=headers)
+            assert r.status_code == 400, r.text
+            assert await is_global_killed() is False
+
+            r = client.post("/admin/kill-switch/global", json={"confirm": True}, headers=headers)
+            assert r.status_code == 200, r.text
+            assert r.json()["global_kill"] is True
+            assert await is_global_killed() is True
+
+            r = client.delete("/admin/kill-switch/global", headers=headers)
+            assert r.status_code == 200, r.text
+            assert r.json()["global_kill"] is False
+            assert await is_global_killed() is False
+
+            r = client.post(f"/admin/kill-switch/account/{account_id}", json={"confirm": True}, headers=headers)
+            assert r.status_code == 200, r.text
+            assert account_id in r.json()["killed_accounts"]
+            assert await is_account_killed(account_id) is True
+
+            r = client.delete(f"/admin/kill-switch/account/{account_id}", headers=headers)
+            assert r.status_code == 200, r.text
+            assert account_id not in r.json()["killed_accounts"]
+            assert await is_account_killed(account_id) is False
+
+            r = client.post(f"/admin/kill-switch/strategy/{strategy_id}", json={"confirm": True}, headers=headers)
+            assert r.status_code == 200, r.text
+            assert strategy_id in r.json()["killed_strategies"]
+            assert await is_strategy_killed(strategy_id) is True
+
+            r = client.delete(f"/admin/kill-switch/strategy/{strategy_id}", headers=headers)
+            assert r.status_code == 200, r.text
+            assert strategy_id not in r.json()["killed_strategies"]
+            assert await is_strategy_killed(strategy_id) is False
+        finally:
+            await clear_global_kill()
+            await clear_account_kill(account_id)
+            await clear_strategy_kill(strategy_id)
             await _cleanup(admin_id)

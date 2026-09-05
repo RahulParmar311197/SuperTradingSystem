@@ -239,6 +239,47 @@ async def test_execute_rejects_when_projected_loss_exceeds_exposure_limit(requir
             await _cleanup(user_id, [long_leg.id, short_leg.id])
 
 
+async def test_execute_respects_account_kill_switch(require_infra):
+    # Regression test: `evaluate_options_risk` (app/risk/options_risk.py)
+    # already had a `kill_switch` parameter and checked it first, but
+    # `POST /options/execute` never passed one -- it always got a fresh,
+    # permanently-empty default (see app/risk/kill_switch.py), so this
+    # path's kill-switch check was as dead as POST /orders's used to be.
+    # Now refreshed from Redis on every call (see
+    # app.risk.kill_switch.load_kill_switch_state), the same shared keys
+    # `POST /admin/kill-switch/account/{id}` writes.
+    from app.core.redis import clear_account_kill, set_account_kill
+
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+        long_leg, short_leg = await _make_two_leg_instruments(f"KILL{uuid.uuid4().hex[:5].upper()}")
+
+        try:
+            await set_account_kill(str(user_id))
+
+            r = client.post(
+                "/options/execute",
+                json={
+                    "strategy_name": "bull_call_spread",
+                    "legs": [
+                        {"symbol": long_leg.symbol, "direction": "LONG", "quantity": 1, "premium": 5.0},
+                        {"symbol": short_leg.symbol, "direction": "SHORT", "quantity": 1, "premium": 2.0},
+                    ],
+                },
+                headers=headers,
+            )
+            assert r.status_code == 403, r.text
+            assert "trading is stopped" in r.text
+
+            async with async_session_factory() as db:
+                orders = (await db.execute(select(Order).where(Order.user_id == user_id))).scalars().all()
+                assert orders == []  # nothing should have been placed
+        finally:
+            await clear_account_kill(str(user_id))
+            await _cleanup(user_id, [long_leg.id, short_leg.id])
+
+
 async def test_execute_risk_rejection_writes_audit_row_and_notifies(require_infra):
     # Regression test: unlike POST /orders (app/api/orders.py's
     # place_order), which always writes a RiskEvent audit row and fires an

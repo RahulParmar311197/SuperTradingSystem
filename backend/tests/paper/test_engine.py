@@ -56,22 +56,30 @@ async def test_paper_engine_opens_and_closes_trade_through_full_stack():
 
 
 @pytest.mark.asyncio
-async def test_paper_engine_respects_risk_kill_switch():
-    from app.risk.kill_switch import KillSwitchState
+async def test_paper_engine_respects_risk_kill_switch(require_infra):
+    # Regression test: `on_candle` now refreshes `risk_engine.kill_switch`
+    # from Redis on every candle (see app.risk.kill_switch.load_kill_switch_state)
+    # so a kill triggered from any process takes effect immediately -- a
+    # `KillSwitchState` set directly on the engine, as this test used to do,
+    # would now just be overwritten by the next candle's refresh. Going
+    # through the same Redis keys the admin endpoint writes is what
+    # actually exercises that wiring.
+    from app.core.redis import clear_global_kill, set_global_kill
 
     candles = make_candles(SETUP)
     engine = PaperTradingEngine(_strategy(), symbol="TESTSYM")
-    engine.risk_engine.kill_switch = KillSwitchState()
-    engine.risk_engine.kill_switch.kill_global()
+    await set_global_kill()
+    try:
+        saw_rejection = False
+        for candle in candles:
+            outcome = await engine.on_candle(candle)
+            if outcome.risk_rejected_reason is not None:
+                saw_rejection = True
 
-    saw_rejection = False
-    for candle in candles:
-        outcome = await engine.on_candle(candle)
-        if outcome.risk_rejected_reason is not None:
-            saw_rejection = True
-
-    assert saw_rejection is True
-    assert engine.trades_today == 0
+        assert saw_rejection is True
+        assert engine.trades_today == 0
+    finally:
+        await clear_global_kill()
 
 
 @pytest.mark.asyncio

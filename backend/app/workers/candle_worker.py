@@ -64,6 +64,23 @@ class CandleWorker:
         forming = self._forming.get(tick.symbol)
         closed: Candle | None = None
 
+        if forming is not None and bucket_ts < forming.timestamp:
+            # A stale/out-of-order tick -- its bucket is older than the
+            # candle currently forming, not just a different one. Ordinary
+            # live feeds redeliver a few already-seen ticks after a
+            # reconnect, and this bucket has already closed and been
+            # persisted. Accepting it would corrupt the *current* forming
+            # candle with a stale price (via the `!=` branch below
+            # wrongly treating it as a rollover) and reopen an
+            # already-persisted bucket, which then collides with that row
+            # once it closes again. Drop it instead -- the closed history
+            # for that bucket is already correct.
+            logger.warning(
+                "Dropping out-of-order tick for %s: bucket %s is older than the forming candle's %s",
+                tick.symbol, bucket_ts, forming.timestamp,
+            )
+            return None
+
         if forming is not None and forming.timestamp != bucket_ts:
             closed = forming.to_candle()
             await self._on_candle_closed(tick.symbol, closed)

@@ -1849,6 +1849,68 @@ history and asserts exactly one `Signal` row exists both times (the same
 row, by id). Verified it fails against the pre-fix code (a second row
 appears after the second pass) and passes once the fix is restored.
 
+## An out-of-order tick could silently corrupt candle history, and `upsert_candles` wasn't actually an upsert (§16, §66)
+
+`CandleWorker.process_tick` (`app/workers/candle_worker.py`) decides
+whether an incoming tick belongs to the candle currently forming or
+starts a new one with a single check: `forming.timestamp != bucket_ts`.
+That's correct for the ordinary case (a tick lands in a later bucket, so
+the current candle closes and a new one opens) but wrong for a tick whose
+bucket is *older* than the one currently forming — a completely ordinary
+occurrence on a real live feed: a WebSocket reconnect routinely redelivers
+a handful of already-seen ticks, and network jitter can deliver ticks out
+of order. `!=` treats that stale tick exactly like a legitimate rollover:
+it prematurely closes the *current*, correct, still-accumulating candle
+with whatever partial data it had so far, and opens a bogus new "forming"
+candle back at the old, already-closed bucket. When the next real tick
+arrives, that bogus candle closes again and collides with the row already
+persisted for that bucket.
+
+That collision surfaced a second, independent bug: `app/market/repository.py`'s
+`upsert_candles` — despite its name, and despite being the *only* place in
+the codebase that ever writes a `candles` row (both the base-timeframe
+path and every derived-timeframe recompute route through it) — was a bare
+`INSERT` with no conflict handling at all. Any re-write of an
+`(instrument_id, timeframe, timestamp)` combination that already existed
+(the stale-tick scenario above, but also a worker restart replaying a
+backfill, or a derived-timeframe recompute racing a previous one) raised
+`asyncpg`'s `UniqueViolationError` against `uq_candle_key`. That exception
+propagated out of `process_tick` into `app/workers/main.py`'s generic
+`except Exception: logger.exception(...)` around the whole market-data
+pipeline — silently logged and swallowed, with the triggering tick dropped
+from `CandleWorker._forming` entirely (the exception fires before that
+dict is updated), so the worker's in-memory bookkeeping for that symbol
+was lost along with the write. Net effect: a single stale/duplicate tick
+after an ordinary feed reconnect could truncate one real candle to a
+single tick and silently drop a persistence write, with zero record
+anywhere that it happened — and every downstream consumer (SMC/ICT
+analysis, the scanner, backtests, charts) reads that corrupted/gapped
+history from then on.
+
+Fixed both halves:
+- `process_tick` now only rolls over to a new forming candle when
+  `bucket_ts` is strictly *newer* than the one currently forming. A tick
+  whose bucket is older is dropped (with a warning log) rather than
+  corrupting the current candle or reopening an already-closed one — the
+  closed history for that bucket is already correct.
+- `upsert_candles` is now a genuine `INSERT ... ON CONFLICT (instrument_id,
+  timeframe, timestamp) DO UPDATE` (matching `uq_candle_key`), so any
+  re-write of the same bucket — from any source, not just this one
+  pathway — is a safe, idempotent overwrite instead of a crash.
+
+New tests:
+`tests/workers/test_candle_worker.py::test_process_tick_drops_a_stale_out_of_order_tick`
+feeds a stale tick mid-way through forming a later candle and asserts it's
+dropped (`process_tick` returns `None`), the current candle's OHLC is
+untouched, and exactly the two genuine candles end up persisted — no
+crash, no phantom third row.
+`tests/api/test_markets_candles.py::test_upsert_candles_is_idempotent_on_conflict`
+calls `upsert_candles` twice for the identical bucket with different OHLC
+values and asserts the second call overwrites rather than raising. Verified
+both fail against the pre-fix code (the first with a `UniqueViolationError`
+propagating out of `process_tick`, the second directly) and pass once the
+fix is restored.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

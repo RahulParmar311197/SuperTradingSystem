@@ -39,6 +39,8 @@ from app.database.models.strategy import Strategy as StrategyRow
 from app.database.models.trading import ExecutionMode
 from app.database.models.trading import Trade as TradeRow
 from app.database.models.notifications import NotificationType
+from app.database.models.risk import RiskDecision as RiskEventDecision
+from app.database.models.risk import RiskEvent
 from app.database.models.users import TradingPermission, User
 from app.database.session import async_session_factory
 from app.market.repository import get_candles
@@ -162,6 +164,22 @@ class AutoTradeSupervisor:
             }
 
         outcome = await engine.on_candle(latest)
+
+        if outcome.risk_checks is not None:
+            # Same audit gap and fix as app/api/paper.py's feed_candle -- this
+            # supervisor drives the identical PaperTradingEngine/RiskEngine
+            # unattended, 24/7, with no synchronous caller to see a rejection;
+            # without this, `GET /admin/risk-events` never saw a single
+            # autonomous-trading decision, approved or rejected.
+            db.add(
+                RiskEvent(
+                    user_id=user.id,
+                    decision=RiskEventDecision.REJECT if outcome.risk_rejected_reason is not None else RiskEventDecision.APPROVE,
+                    reason=outcome.risk_rejected_reason,
+                    checks=outcome.risk_checks,
+                )
+            )
+            await db.commit()
 
         if outcome.order_created:
             self._opened_at[key] = latest.timestamp

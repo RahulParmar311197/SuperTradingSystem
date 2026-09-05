@@ -159,12 +159,13 @@ async def test_supervisor_opens_and_journals_a_trade_end_to_end(db_instrument):
         assert trades[0].strategy_id == strategy_id
         assert float(trades[0].pnl) == pytest.approx(closed_pnl, rel=1e-6)
         assert trades[0].journal.get("symbol") == db_instrument.symbol
-        assert len(notifications) == 1
+        # One TRADE_EXECUTED for the open, one closing notification.
+        assert len(notifications) == 2
+        assert {n.type for n in notifications} == {NotificationType.TRADE_EXECUTED, NotificationType.TP_HIT}
         # Regression: this dataset runs hard to target (see the comment on
-        # SETUP), so this must be TP_HIT specifically, not the generic
+        # SETUP), so the close specifically must be TP_HIT, not the generic
         # POSITION_CLOSED every close used to fire regardless of which side
         # of the bracket actually closed it.
-        assert notifications[0].type == NotificationType.TP_HIT
     finally:
         await _cleanup(user_id)
 
@@ -228,8 +229,8 @@ async def test_supervisor_notifies_sl_hit_on_stop_loss_exit(db_instrument):
 
         assert len(trades) == 1
         assert float(trades[0].pnl) < 0.0
-        assert len(notifications) == 1
-        assert notifications[0].type == NotificationType.SL_HIT
+        assert len(notifications) == 2
+        assert {n.type for n in notifications} == {NotificationType.TRADE_EXECUTED, NotificationType.SL_HIT}
     finally:
         await _cleanup(user_id)
 

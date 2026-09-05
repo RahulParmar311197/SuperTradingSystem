@@ -208,13 +208,18 @@ async def test_paper_trading_persists_trade_and_notification_on_close(require_in
                 assert trade.strategy_id == strategy_id
                 assert float(trade.pnl) != 0.0
 
-                notification = (await db.execute(select(Notification).where(Notification.user_id == user_id))).scalar_one()
-                assert "paper trade closed" in notification.title
+                notifications = (
+                    await db.execute(select(Notification).where(Notification.user_id == user_id))
+                ).scalars().all()
+                # One TRADE_EXECUTED for the open, one closing notification.
+                assert len(notifications) == 2
+                assert {n.type for n in notifications} == {NotificationType.TRADE_EXECUTED, NotificationType.TP_HIT}
+                closed = next(n for n in notifications if n.type == NotificationType.TP_HIT)
+                assert "paper trade closed" in closed.title
                 # Regression: this dataset runs hard to target (see the
                 # comment on _SETUP), so this must be TP_HIT specifically,
                 # not the generic POSITION_CLOSED every close used to fire
                 # regardless of which side of the bracket actually closed it.
-                assert notification.type == NotificationType.TP_HIT
         finally:
             await _cleanup([user_id], [strategy_id], instrument.id)
 
@@ -268,8 +273,11 @@ async def test_paper_trading_notifies_sl_hit_on_stop_loss_exit(require_infra):
                 trade = (await db.execute(select(Trade).where(Trade.user_id == user_id))).scalar_one()
                 assert float(trade.pnl) < 0.0
 
-                notification = (await db.execute(select(Notification).where(Notification.user_id == user_id))).scalar_one()
-                assert notification.type == NotificationType.SL_HIT
+                notifications = (
+                    await db.execute(select(Notification).where(Notification.user_id == user_id))
+                ).scalars().all()
+                assert len(notifications) == 2
+                assert {n.type for n in notifications} == {NotificationType.TRADE_EXECUTED, NotificationType.SL_HIT}
         finally:
             await _cleanup([user_id], [strategy_id], instrument.id)
 

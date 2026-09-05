@@ -156,12 +156,27 @@ async def feed_candle(
 
     if outcome.order_created:
         session.opened_at = candle.timestamp
+        direction = outcome.signal.direction if outcome.signal else None
         await record_audit(
             db,
             actor="user",
             action="paper.order_placed",
             user_id=user.id,
-            details={"symbol": engine.symbol, "direction": outcome.signal.direction if outcome.signal else None},
+            details={"symbol": engine.symbol, "direction": direction},
+        )
+
+        # Blueprint §63 mandates a "Trade executed" notification -- the
+        # sibling risk_rejected_reason/closed_position_pnl branches below
+        # both notify, but this one, the actual open of a position, never
+        # did: NotificationType.TRADE_EXECUTED was defined but nothing in
+        # the codebase ever passed it to create_notification.
+        await create_notification(
+            db,
+            user_id=user.id,
+            notification_type=NotificationType.TRADE_EXECUTED,
+            title=f"{engine.symbol} paper trade executed",
+            body=f"Opened {direction or 'a'} position in {engine.symbol}",
+            data={"symbol": engine.symbol, "direction": direction},
         )
 
     if outcome.risk_rejected_reason is not None:

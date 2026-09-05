@@ -165,12 +165,28 @@ class AutoTradeSupervisor:
 
         if outcome.order_created:
             self._opened_at[key] = latest.timestamp
+            direction = outcome.signal.direction if outcome.signal else None
             await record_audit(
                 db,
                 actor="system",
                 action="autotrade.order_placed",
                 user_id=user.id,
-                details={"strategy": strategy_row.name, "symbol": instrument.symbol, "direction": outcome.signal.direction if outcome.signal else None},
+                details={"strategy": strategy_row.name, "symbol": instrument.symbol, "direction": direction},
+            )
+            # Blueprint §63 mandates a "Trade executed" notification -- the
+            # sibling risk_rejected_reason/closed_position_pnl branches
+            # below both notify, but this one, the actual open of a
+            # position, never did. This path has no synchronous HTTP
+            # response for anyone to see the way manual POST /orders does,
+            # so without this an opened autonomous trade was as invisible
+            # as a rejected one used to be.
+            await create_notification(
+                db,
+                user_id=user.id,
+                notification_type=NotificationType.TRADE_EXECUTED,
+                title=f"{instrument.symbol} auto-trade executed",
+                body=f"Opened {direction or 'a'} position in {instrument.symbol}",
+                data={"strategy": strategy_row.name, "symbol": instrument.symbol, "direction": direction},
             )
 
         if outcome.risk_rejected_reason is not None:

@@ -195,12 +195,20 @@ async def list_halted_accounts() -> dict[str, str]:
 # The worker process (see app/workers/main.py) is separate from the API
 # process serving GET /health, so "is the scanner loop actually iterating"
 # has to be answered through shared state, same as the trading halt above.
-# A short TTL key that each worker's loop refreshes on every pass means a
-# stuck or crashed loop goes stale within one interval — no separate
-# liveness check to maintain.
-
+# A TTL key that each worker's loop refreshes on every pass means a stuck
+# or crashed loop goes stale within one interval — no separate liveness
+# check to maintain. That only holds if the TTL comfortably exceeds every
+# worker's actual refresh cadence, though: scanner_worker.py,
+# auto_trade_worker.py, and live_reconciliation.py all call `heartbeat()`
+# once per 60-second loop (`interval_seconds=60.0`, hardcoded at every
+# call site — not env-configurable, so a single constant here is safe).
+# The TTL must be comfortably longer than that, with margin for one slow
+# pass — not shorter, which would make `worker_is_alive()` flap
+# False/True every cycle for a perfectly healthy worker (this was the bug:
+# 30s < 60s meant the key expired for roughly the back half of every
+# cycle).
 _HEARTBEAT_PREFIX = "heartbeat:worker:"
-_HEARTBEAT_TTL_SECONDS = 30
+_HEARTBEAT_TTL_SECONDS = 90
 
 
 async def heartbeat(worker_name: str) -> None:

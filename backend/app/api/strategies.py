@@ -2,14 +2,15 @@ import uuid
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.dependencies import get_current_user
+from app.core.audit import record_audit
 from app.database.models.strategy import Strategy as StrategyRow
 from app.database.models.strategy import StrategyVersion as StrategyVersionRow
-from app.database.models.users import User
+from app.database.models.users import TradingPermission, User
 from app.database.session import get_db
 from app.strategy.dsl import StrategyDefinition
 
@@ -94,6 +95,61 @@ async def update_strategy(
     await _snapshot_version(db, row)
     await db.commit()
     await db.refresh(row)
+    return row
+
+
+class UpdateStrategyStatusRequest(BaseModel):
+    is_active: bool | None = None
+    eligible_for_auto_trading: bool | None = None
+    confirm: bool = Field(
+        default=False,
+        description="Must be true when setting eligible_for_auto_trading=True -- promoting a strategy to "
+        "autonomous trading requires explicit confirmation, the same as POST /auto-trading/enable.",
+    )
+
+
+@router.patch("/{strategy_id}/status", response_model=StrategyResponse)
+async def update_strategy_status(
+    strategy_id: uuid.UUID,
+    payload: UpdateStrategyStatusRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> StrategyRow:
+    """Blueprint §77: a strategy graduates to `eligible_for_auto_trading`
+    only after Backtest -> Out-of-sample -> Replay -> Paper trading -> Risk
+    review -- deliberately a separate, explicit step from `update_strategy`
+    (editing the DSL) so promoting a strategy to autonomous trading is
+    never a side effect of an unrelated edit. Before this endpoint existed,
+    nothing in the API ever wrote `eligible_for_auto_trading`, so
+    `AutoTradeSupervisor`'s `WHERE eligible_for_auto_trading IS TRUE`
+    filter was unsatisfiable for every real user -- autonomous trading
+    could never place a single order regardless of the account-level
+    `POST /auto-trading/enable` switch.
+    """
+    row = await db.get(StrategyRow, strategy_id)
+    if row is None or row.user_id != user.id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Strategy not found")
+
+    if payload.eligible_for_auto_trading is True and row.eligible_for_auto_trading is not True:
+        if TradingPermission.AUTO_TRADE.value not in user.trading_permissions:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Missing required trading permission: AUTO_TRADE")
+        if not payload.confirm:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Set confirm=true to mark a strategy eligible for auto-trading")
+
+    if payload.is_active is not None:
+        row.is_active = payload.is_active
+    if payload.eligible_for_auto_trading is not None:
+        row.eligible_for_auto_trading = payload.eligible_for_auto_trading
+
+    await db.commit()
+    await db.refresh(row)
+    await record_audit(
+        db,
+        actor="user",
+        action="strategy.status_updated",
+        user_id=user.id,
+        details={"strategy_id": str(row.id), "is_active": row.is_active, "eligible_for_auto_trading": row.eligible_for_auto_trading},
+    )
     return row
 
 

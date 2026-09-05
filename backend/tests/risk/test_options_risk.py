@@ -57,6 +57,26 @@ def test_rejects_when_broker_unhealthy():
     assert result.decision == RiskDecision.REJECT
 
 
+def test_premium_deviation_defaults_to_a_no_op():
+    # premium_deviation_pct defaults to 0.0 -- a clean strategy must still
+    # approve even though max_premium_deviation_pct exists.
+    result = evaluate_options_risk(_base_proposal())
+    assert any(c.name == "premium_matches_market" and c.passed for c in result.checks)
+
+
+def test_rejects_when_premium_deviates_from_the_real_market_quote():
+    # Regression test: a client-supplied leg `premium` is otherwise
+    # trusted input that sizes this strategy's own payoff/risk math
+    # (compute_payoff_summary), unchecked against anything real -- the
+    # same shape of gap already fixed for POST /orders's `entry` field
+    # (RiskEngine's entry_matches_market), reopened here since that fix
+    # never touched options execution.
+    proposal = _base_proposal(premium_deviation_pct=10.0)  # default limit is 5.0%
+    result = evaluate_options_risk(proposal)
+    assert result.decision == RiskDecision.REJECT
+    assert any(c.name == "premium_matches_market" and not c.passed for c in result.checks)
+
+
 def test_unbounded_risk_strategy_uses_capital_requirement_not_zero():
     """A naked long call has unbounded upside but a *bounded, non-zero*
     max_loss (the premium paid) — this asserts the risk gate reads a real

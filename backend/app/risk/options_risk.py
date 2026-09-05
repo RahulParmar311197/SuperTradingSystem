@@ -29,6 +29,13 @@ class OptionsRiskProposal:
     broker_healthy: bool
     market_data_age_seconds: float = 0.0
     liquidity_acceptable: bool = True
+    # Worst (max) percent gap, across every leg with a real OptionSnapshot
+    # quote available, between that leg's client-claimed `premium` and the
+    # snapshot's own bid/ask mid -- 0.0 when no leg has snapshot data yet.
+    # See RiskLimits.max_premium_deviation_pct for why this exists: premium
+    # is otherwise trusted input that sizes this strategy's own payoff/risk
+    # math (compute_payoff_summary), unchecked against anything real.
+    premium_deviation_pct: float = 0.0
 
 
 def evaluate_options_risk(
@@ -61,6 +68,13 @@ def evaluate_options_risk(
         )
     )
     checks.append(RiskCheck("liquidity_acceptable", proposal.liquidity_acceptable))
+    checks.append(
+        RiskCheck(
+            "premium_matches_market",
+            proposal.premium_deviation_pct <= limits.max_premium_deviation_pct,
+            f"Premium deviates {proposal.premium_deviation_pct:.2f}% from the real quote vs limit {limits.max_premium_deviation_pct}%",
+        )
+    )
     checks.append(
         RiskCheck(
             "market_data_fresh",

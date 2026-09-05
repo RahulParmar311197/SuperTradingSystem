@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import delete, select
 
 from app.database.models.instruments import Instrument, MarketType, OptionType
+from app.database.models.options import OptionChainSnapshot, OptionContract, OptionSnapshot
 from app.database.models.risk import AuditLog, RiskEvent
 from app.database.models.trading import ExecutionMode, Order, OrderEvent, Position, Trade
 from app.database.models.users import User, UserSession
@@ -171,4 +172,72 @@ async def test_execute_rejects_when_projected_loss_exceeds_exposure_limit(requir
                 orders = (await db.execute(select(Order).where(Order.user_id == user_id))).scalars().all()
                 assert orders == []  # nothing should have been placed
         finally:
+            await _cleanup(user_id, [long_leg.id, short_leg.id])
+
+
+async def test_execute_rejects_when_premium_deviates_from_real_quote(require_infra):
+    # Regression test: `leg.premium` is otherwise trusted input that sizes
+    # this strategy's own payoff/risk math (compute_payoff_summary),
+    # unchecked against anything real -- the same shape of gap already
+    # fixed for POST /orders's `entry` field (RiskEngine's
+    # entry_matches_market), reopened here since that fix never touched
+    # options execution. A real OptionSnapshot's bid/ask was already
+    # fetched for the liquidity check and then discarded without ever
+    # being compared to the claimed premium.
+    from datetime import datetime, timezone
+
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+        long_leg, short_leg = await _make_two_leg_instruments(f"PDEV{uuid.uuid4().hex[:5].upper()}")
+
+        async with async_session_factory() as db:
+            chain = OptionChainSnapshot(
+                underlying="NIFTY", expiry=long_leg.expiry, spot_price=25000.0, fetched_at=datetime.now(timezone.utc)
+            )
+            db.add(chain)
+            await db.flush()
+            contract = OptionContract(instrument_id=long_leg.id, chain_id=chain.id, strike=25000.0, option_type="CALL")
+            db.add(contract)
+            await db.flush()
+            db.add(
+                OptionSnapshot(
+                    option_contract_id=contract.id,
+                    bid=100.0,
+                    ask=102.0,
+                    ltp=101.0,
+                    volume=1000,
+                    open_interest=1000,
+                    snapshot_at=datetime.now(timezone.utc),
+                )
+            )
+            await db.commit()
+            contract_id = contract.id
+            chain_id = chain.id
+
+        try:
+            # Real quote mid is 101.0 -- claiming premium=200.0 is a ~98%
+            # deviation, well past the default 5% limit.
+            r = client.post(
+                "/options/execute",
+                json={
+                    "strategy_name": "long_call",
+                    "legs": [
+                        {"symbol": long_leg.symbol, "direction": "LONG", "quantity": 1, "premium": 200.0},
+                    ],
+                },
+                headers=headers,
+            )
+            assert r.status_code == 403, r.text
+            assert "Premium deviates" in r.text
+
+            async with async_session_factory() as db:
+                orders = (await db.execute(select(Order).where(Order.user_id == user_id))).scalars().all()
+                assert orders == []  # nothing should have been placed
+        finally:
+            async with async_session_factory() as db:
+                await db.execute(delete(OptionSnapshot).where(OptionSnapshot.option_contract_id == contract_id))
+                await db.execute(delete(OptionContract).where(OptionContract.id == contract_id))
+                await db.execute(delete(OptionChainSnapshot).where(OptionChainSnapshot.id == chain_id))
+                await db.commit()
             await _cleanup(user_id, [long_leg.id, short_leg.id])

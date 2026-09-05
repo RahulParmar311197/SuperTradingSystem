@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import delete, select
 
 from app.database.models.instruments import Instrument, MarketType
-from app.database.models.notifications import Notification
+from app.database.models.notifications import Notification, NotificationType
 from app.database.models.risk import AuditLog
 from app.database.models.strategy import Strategy as StrategyRow
 from app.database.models.strategy import StrategyVersion as StrategyVersionRow
@@ -14,6 +14,8 @@ from app.database.models.trading import ExecutionMode, Trade
 from app.database.models.users import User, UserSession
 from app.database.session import async_session_factory
 from app.main import app
+from app.risk.engine import RiskEngine
+from app.risk.limits import RiskDecision, RiskDecisionResult
 
 pytestmark = pytest.mark.asyncio
 
@@ -208,5 +210,61 @@ async def test_paper_trading_persists_trade_and_notification_on_close(require_in
 
                 notification = (await db.execute(select(Notification).where(Notification.user_id == user_id))).scalar_one()
                 assert "paper trade closed" in notification.title
+        finally:
+            await _cleanup([user_id], [strategy_id], instrument.id)
+
+
+async def test_paper_trading_notifies_on_risk_rejected_entry(require_infra, monkeypatch):
+    # Regression test: `PaperTradingEngine.on_candle` returns
+    # `risk_rejected_reason` when a matched entry signal is blocked by the
+    # risk engine, but `feed_candle` used to discard it entirely -- no
+    # notification, no audit entry, not even a field on
+    # `PaperStateResponse`. A rejected entry vanished the instant
+    # `on_candle` returned, unlike a manual `/orders` rejection which at
+    # least gets a synchronous 403 with the reason.
+    monkeypatch.setattr(
+        RiskEngine, "evaluate", lambda self, proposal: RiskDecisionResult(RiskDecision.REJECT, [], "forced rejection for test")
+    )
+
+    with TestClient(app) as client:
+        token, user_id = await _register(client, "paperrejected")
+        headers = {"Authorization": f"Bearer {token}"}
+        instrument = await _make_instrument()
+        strategy_id = await _create_strategy(client, headers, instrument.symbol)
+
+        try:
+            r = client.post("/paper", json={"strategy_id": str(strategy_id), "symbol": instrument.symbol}, headers=headers)
+            assert r.status_code == 200, r.text
+            session_id = r.json()["session_id"]
+
+            start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
+            for i, (o, h, low, c) in enumerate(_SETUP):
+                ts = (start + timedelta(minutes=i)).isoformat()
+                r = client.post(
+                    f"/paper/{session_id}/candle",
+                    json={"timestamp": ts, "open": o, "high": h, "low": low, "close": c, "volume": 10},
+                    headers=headers,
+                )
+                assert r.status_code == 200, r.text
+
+            # The strategy would have matched and opened on this dataset
+            # (see the end-to-end test above) -- with evaluate() forced to
+            # always reject, it never actually opens.
+            r = client.get(f"/paper/{session_id}", headers=headers)
+            assert r.json()["open_position"] is None
+
+            async with async_session_factory() as db:
+                notifications = (
+                    await db.execute(select(Notification).where(Notification.user_id == user_id))
+                ).scalars().all()
+                assert len(notifications) >= 1
+                assert all(n.type == NotificationType.ORDER_REJECTED for n in notifications)
+                assert all("forced rejection for test" in n.body for n in notifications)
+
+                audits = (
+                    await db.execute(select(AuditLog).where(AuditLog.user_id == user_id, AuditLog.action == "paper.order_rejected"))
+                ).scalars().all()
+                assert len(audits) >= 1
+                assert all(a.details["reason"] == "forced rejection for test" for a in audits)
         finally:
             await _cleanup([user_id], [strategy_id], instrument.id)

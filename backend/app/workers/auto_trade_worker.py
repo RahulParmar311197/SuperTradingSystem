@@ -173,6 +173,29 @@ class AutoTradeSupervisor:
                 details={"strategy": strategy_row.name, "symbol": instrument.symbol, "direction": outcome.signal.direction if outcome.signal else None},
             )
 
+        if outcome.risk_rejected_reason is not None:
+            # Blueprint §63 mandates an "Order rejected" notification. This
+            # path has no synchronous HTTP response the way manual
+            # POST /orders does (that endpoint at least returns a 403 with
+            # the reason) -- without this, an autonomous entry the risk
+            # engine blocked left absolutely no record anywhere the user
+            # could ever see it happened.
+            await record_audit(
+                db,
+                actor="system",
+                action="autotrade.order_rejected",
+                user_id=user.id,
+                details={"strategy": strategy_row.name, "symbol": instrument.symbol, "reason": outcome.risk_rejected_reason},
+            )
+            await create_notification(
+                db,
+                user_id=user.id,
+                notification_type=NotificationType.ORDER_REJECTED,
+                title=f"{instrument.symbol} auto-trade rejected",
+                body=outcome.risk_rejected_reason,
+                data={"strategy": strategy_row.name, "symbol": instrument.symbol, "reason": outcome.risk_rejected_reason},
+            )
+
         if outcome.closed_position_pnl is not None and snapshot is not None:
             opened_at = self._opened_at.pop(key, latest.timestamp)
             risk_per_unit = abs(snapshot["entry_price"] - snapshot["stop"]) if snapshot["stop"] else None

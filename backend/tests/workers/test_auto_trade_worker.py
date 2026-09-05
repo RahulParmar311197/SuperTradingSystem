@@ -5,13 +5,15 @@ import pytest
 from sqlalchemy import delete, select
 
 from app.auth.security import hash_password
-from app.database.models.notifications import Notification
+from app.database.models.notifications import Notification, NotificationType
 from app.database.models.risk import AuditLog
 from app.database.models.strategy import Strategy as StrategyRow
 from app.database.models.trading import Trade as TradeRow
 from app.database.models.users import TradingPermission, User
 from app.database.session import async_session_factory
 from app.market.repository import upsert_candles
+from app.risk.engine import RiskEngine
+from app.risk.limits import RiskDecision, RiskDecisionResult
 from app.smc.types import Candle
 from app.workers.auto_trade_worker import AutoTradeSupervisor
 
@@ -245,5 +247,68 @@ async def test_supervisor_picks_up_strategy_edited_after_engine_cached(db_instru
             trades = (await db.execute(select(TradeRow).where(TradeRow.user_id == user_id))).scalars().all()
         assert len(trades) == 1
         assert trades[0].strategy_version == 2
+    finally:
+        await _cleanup(user_id)
+
+
+async def test_supervisor_notifies_on_risk_rejected_entry(db_instrument, monkeypatch):
+    # Regression test: `PaperTradingEngine.on_candle` returns
+    # `risk_rejected_reason` when a matched entry signal is blocked by the
+    # risk engine, but `_process` used to discard it entirely -- unlike a
+    # manual `/orders` rejection, which at least gets a synchronous 403
+    # with the reason, an autonomous entry the risk engine blocked left
+    # zero record anywhere the user could ever see it happened.
+    monkeypatch.setattr(
+        RiskEngine, "evaluate", lambda self, proposal: RiskDecisionResult(RiskDecision.REJECT, [], "forced rejection for test")
+    )
+
+    start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
+    candles = [Candle(start + timedelta(minutes=i), o, h, l, c, 100) for i, (o, h, l, c) in enumerate(SETUP)]
+
+    async with async_session_factory() as db:
+        user = User(
+            id=uuid.uuid4(),
+            email=f"autotrade-rejected-{uuid.uuid4().hex[:8]}@example.com",
+            password_hash=hash_password("irrelevant123"),
+            name="Auto Trade Rejected",
+            trading_permissions=[TradingPermission.AUTO_TRADE.value],
+            auto_trading_enabled=True,
+            auto_trading_risk_per_trade_pct=1.0,
+        )
+        db.add(user)
+        await db.flush()
+        strategy = StrategyRow(
+            user_id=user.id,
+            name="Bullish FVG retest",
+            definition={**STRATEGY_DEFINITION, "market": db_instrument.symbol},
+            is_active=True,
+            eligible_for_auto_trading=True,
+        )
+        db.add(strategy)
+        await db.commit()
+        user_id = user.id
+
+    try:
+        supervisor = AutoTradeSupervisor(timeframe="15m")
+        for i in range(len(candles)):
+            async with async_session_factory() as db:
+                await upsert_candles(db, db_instrument.id, "15m", [candles[i]])
+            await supervisor.run_once()
+
+        async with async_session_factory() as db:
+            notifications = (
+                await db.execute(select(Notification).where(Notification.user_id == user_id))
+            ).scalars().all()
+            assert len(notifications) >= 1
+            assert all(n.type == NotificationType.ORDER_REJECTED for n in notifications)
+
+            audits = (
+                await db.execute(select(AuditLog).where(AuditLog.user_id == user_id, AuditLog.action == "autotrade.order_rejected"))
+            ).scalars().all()
+            assert len(audits) >= 1
+            assert all(a.details["reason"] == "forced rejection for test" for a in audits)
+
+            trades = (await db.execute(select(TradeRow).where(TradeRow.user_id == user_id))).scalars().all()
+            assert trades == []  # forced rejection means it never actually opened
     finally:
         await _cleanup(user_id)

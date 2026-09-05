@@ -13,7 +13,7 @@ from app.database.models.users import TradingPermission, User
 from app.database.session import async_session_factory
 from app.market.repository import upsert_candles
 from app.risk.engine import RiskEngine
-from app.risk.limits import RiskDecision, RiskDecisionResult
+from app.risk.limits import RiskCheck, RiskDecision, RiskDecisionResult
 from app.smc.types import Candle
 from app.workers.auto_trade_worker import AutoTradeSupervisor
 
@@ -381,5 +381,67 @@ async def test_supervisor_notifies_on_risk_rejected_entry(db_instrument, monkeyp
 
             trades = (await db.execute(select(TradeRow).where(TradeRow.user_id == user_id))).scalars().all()
             assert trades == []  # forced rejection means it never actually opened
+    finally:
+        await _cleanup(user_id)
+
+
+async def test_supervisor_notifies_daily_loss_limit_distinctly(db_instrument, monkeypatch):
+    # Regression test: `RiskEngine.evaluate` already names the specific
+    # check that failed (a structured `RiskCheck("daily_loss_limit", ...)`
+    # among others), but `PaperTradingEngine.on_candle` used to collapse
+    # every rejection into the same free-text `risk_rejected_reason`, so
+    # `_process` had no way to tell a daily-loss-limit rejection apart from
+    # any other kind of veto -- every one fired the same generic
+    # NotificationType.ORDER_REJECTED, even though blueprint §63 lists
+    # "Daily loss limit" as its own distinct notification event.
+    monkeypatch.setattr(
+        RiskEngine,
+        "evaluate",
+        lambda self, proposal: RiskDecisionResult(
+            RiskDecision.REJECT,
+            [RiskCheck("daily_loss_limit", False, "Daily loss 3.00% vs limit 2.0%")],
+            "Daily loss 3.00% vs limit 2.0%",
+        ),
+    )
+
+    start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
+    candles = [Candle(start + timedelta(minutes=i), o, h, l, c, 100) for i, (o, h, l, c) in enumerate(SETUP)]
+
+    async with async_session_factory() as db:
+        user = User(
+            id=uuid.uuid4(),
+            email=f"autotrade-dailyloss-{uuid.uuid4().hex[:8]}@example.com",
+            password_hash=hash_password("irrelevant123"),
+            name="Auto Trade Daily Loss",
+            trading_permissions=[TradingPermission.AUTO_TRADE.value],
+            auto_trading_enabled=True,
+            auto_trading_risk_per_trade_pct=1.0,
+        )
+        db.add(user)
+        await db.flush()
+        strategy = StrategyRow(
+            user_id=user.id,
+            name="Bullish FVG retest",
+            definition={**STRATEGY_DEFINITION, "market": db_instrument.symbol},
+            is_active=True,
+            eligible_for_auto_trading=True,
+        )
+        db.add(strategy)
+        await db.commit()
+        user_id = user.id
+
+    try:
+        supervisor = AutoTradeSupervisor(timeframe="15m")
+        for i in range(len(candles)):
+            async with async_session_factory() as db:
+                await upsert_candles(db, db_instrument.id, "15m", [candles[i]])
+            await supervisor.run_once()
+
+        async with async_session_factory() as db:
+            notifications = (
+                await db.execute(select(Notification).where(Notification.user_id == user_id))
+            ).scalars().all()
+            assert len(notifications) >= 1
+            assert all(n.type == NotificationType.DAILY_LOSS_LIMIT for n in notifications)
     finally:
         await _cleanup(user_id)

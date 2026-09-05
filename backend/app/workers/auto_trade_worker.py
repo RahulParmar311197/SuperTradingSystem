@@ -203,10 +203,19 @@ class AutoTradeSupervisor:
                 user_id=user.id,
                 details={"strategy": strategy_row.name, "symbol": instrument.symbol, "reason": outcome.risk_rejected_reason},
             )
+            # Blueprint §63 lists "Daily loss limit" as its own
+            # notification event, distinct from a generic order rejection
+            # -- see the identical comment in app/api/paper.py's
+            # feed_candle.
+            rejection_notification_type = (
+                NotificationType.DAILY_LOSS_LIMIT
+                if outcome.risk_failed_check == "daily_loss_limit"
+                else NotificationType.ORDER_REJECTED
+            )
             await create_notification(
                 db,
                 user_id=user.id,
-                notification_type=NotificationType.ORDER_REJECTED,
+                notification_type=rejection_notification_type,
                 title=f"{instrument.symbol} auto-trade rejected",
                 body=outcome.risk_rejected_reason,
                 data={"strategy": strategy_row.name, "symbol": instrument.symbol, "reason": outcome.risk_rejected_reason},

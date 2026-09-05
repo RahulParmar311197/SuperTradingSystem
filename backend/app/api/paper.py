@@ -193,10 +193,21 @@ async def feed_candle(
             user_id=user.id,
             details={"symbol": engine.symbol, "reason": outcome.risk_rejected_reason},
         )
+        # Blueprint §63 lists "Daily loss limit" as its own notification
+        # event, distinct from a generic order rejection -- `RiskEngine`
+        # already names the specific check that failed
+        # (`risk_failed_check`); only fall back to the generic type for
+        # every other kind of veto (max positions, correlated exposure,
+        # stale data, ...).
+        rejection_notification_type = (
+            NotificationType.DAILY_LOSS_LIMIT
+            if outcome.risk_failed_check == "daily_loss_limit"
+            else NotificationType.ORDER_REJECTED
+        )
         await create_notification(
             db,
             user_id=user.id,
-            notification_type=NotificationType.ORDER_REJECTED,
+            notification_type=rejection_notification_type,
             title=f"{engine.symbol} paper trade rejected",
             body=outcome.risk_rejected_reason,
             data={"symbol": engine.symbol, "reason": outcome.risk_rejected_reason},

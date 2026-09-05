@@ -31,6 +31,16 @@ class PaperTradeOutcome:
     signal: StrategyEvaluationResult | None
     order_created: bool = False
     risk_rejected_reason: str | None = None
+    # Which `RiskCheck.name` actually failed (e.g. "daily_loss_limit",
+    # "max_open_positions") -- `risk_rejected_reason` above is only the
+    # first failed check's free-text `detail`/`name` collapsed into one
+    # string by `RiskDecisionResult.reason`, not something a caller can
+    # safely pattern-match on. This is the same identity `RiskEngine`
+    # already computed (`RiskDecisionResult.failed_checks[0].name`); kept
+    # here as a stable string so callers can fire
+    # NotificationType.DAILY_LOSS_LIMIT (blueprint §63) instead of a
+    # generic ORDER_REJECTED when that specific check is why.
+    risk_failed_check: str | None = None
     closed_position_pnl: float | None = None
     # Which side of the bracket actually closed the position -- `None` iff
     # `closed_position_pnl` is also `None` (nothing closed this candle).
@@ -115,7 +125,8 @@ class PaperTradingEngine:
         )
         decision = self.risk_engine.evaluate(proposal)
         if not decision.approved:
-            return PaperTradeOutcome(signal=result, risk_rejected_reason=decision.reason)
+            failed_check = decision.failed_checks[0].name if decision.failed_checks else None
+            return PaperTradeOutcome(signal=result, risk_rejected_reason=decision.reason, risk_failed_check=failed_check)
 
         quantity = calculate_position_size(
             account.balance, self.strategy.risk.risk_percent, result.entry, result.stop, self.risk_engine.limits.max_position_size

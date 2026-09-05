@@ -744,6 +744,59 @@ committing). Two more tests in the same file cover the ordinary
 correct/incorrect-password paths to confirm behavior is otherwise
 unchanged.
 
+## `ENVIRONMENT` was declared but read nowhere — production could boot with a public encryption key
+
+`Settings.credentials_encryption_key` (`app/core/config.py`) has always
+defaulted to a real, working Fernet key — not an obviously-invalid
+placeholder the way `jwt_secret`'s default (`"change-me-in-production"`)
+is. This key encrypts every connected broker account's OAuth credentials
+before they're persisted (`app/api/brokers.py` → `BrokerAccount.encrypted_credentials`,
+decrypted in `app/trading/broker_resolver.py`). Because it's committed to
+source, it's public by construction — anyone who has ever cloned this
+repository, or found it on GitHub, already has it.
+
+Nothing enforced that a real deployment actually overrode it before
+serving traffic. `docs/PRODUCTION_READINESS.md` already told operators to
+"generate real values, don't ship the repo's dev defaults" — good advice,
+but advice only, with no code checking it was followed. Worse: `Settings`
+had an `environment` field (`"development"` by default) that looked like
+exactly the right place to gate a "you're in production, so this must be
+configured" check — except a repo-wide grep confirmed `settings.environment`
+was never read anywhere in the entire codebase. It was pure decoration:
+declared, defaulted, and otherwise completely inert. A misconfigured
+production deployment — someone who copied `.env.example`, forgot to fill
+in `CREDENTIALS_ENCRYPTION_KEY`, or simply never knew that field's default
+was a real key rather than an invalid placeholder — would boot silently
+and serve traffic indefinitely with a publicly-known secret protecting
+every user's broker credentials.
+
+Fixed with a `pydantic` `model_validator(mode="after")` on `Settings`
+(`_refuse_default_secrets_in_production`) that raises a clear `ValueError`
+at construction time — meaning at process startup, since `get_settings()`
+constructs `Settings()` eagerly — whenever `environment == "production"`
+and either `jwt_secret` or `credentials_encryption_key` is blank or still
+equals its repository default. Blank is checked as its own case, not just
+equality with the default: `.env.example` ships
+`CREDENTIALS_ENCRYPTION_KEY=` empty by design (to force an operator to
+notice it), and pydantic-settings treats an empty value in `.env` as an
+explicit override to `""`, not "fall through to the class default" — so
+an operator who copies the file and simply forgets to fill it in would
+sail right past a check that only compared against the committed default
+string. This is the first time `environment` does anything at all in this
+codebase; `.env.example` and `docs/PRODUCTION_READINESS.md` were both
+updated to actually instruct setting `ENVIRONMENT=production`, since
+nothing previously told an operator that field mattered.
+
+`tests/test_core_config.py` proves all of this: development settings
+(the class defaults, or whatever a local `.env` overrides, `environment`
+left at its own default) never raise, since the entire point is that local
+dev and the test suite work with zero configuration; `environment=
+"production"` with either secret at its default, or blank, raises with a
+message naming the specific variable to set; `environment="production"`
+with real values for both starts normally. Reverting the validator
+reproduces the silent-boot behavior immediately (verified by hand before
+committing).
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

@@ -81,12 +81,21 @@ Every secret the app reads comes from environment variables (see
 `.env.example`) — none are hardcoded, and `.gitignore` excludes `.env`.
 For real deployment:
 
+- **Set `ENVIRONMENT=production`.** It's `development` by default, which
+  is what lets local dev and the test suite run with zero configuration.
+  Setting it to `production` makes the app refuse to start
+  (`app/core/config.py`'s `Settings._refuse_default_secrets_in_production`)
+  if `JWT_SECRET` or `CREDENTIALS_ENCRYPTION_KEY` is still blank or a
+  repo default — this is the enforcement mechanism for the next bullet,
+  not just documentation of intent.
 - **Generate real values**, don't ship the repo's dev defaults:
   - `JWT_SECRET`: any high-entropy random string.
   - `CREDENTIALS_ENCRYPTION_KEY`: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`.
     This key encrypts broker credentials at rest (`broker_accounts.encrypted_credentials`)
     — losing it means losing access to every connected broker account;
-    rotating it means re-encrypting or re-connecting every account.
+    rotating it means re-encrypting or re-connecting every account. Its
+    repo default is a real, working key, committed to source — treat it
+    as already public, never as a fallback for a forgotten override.
 - **Don't put secrets in `docker-compose.yml`'s `environment:` block** in
   production — use `env_file` (as it already does for app-level config)
   backed by your platform's secret store (e.g. Docker secrets, a cloud

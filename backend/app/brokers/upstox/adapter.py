@@ -194,6 +194,22 @@ class UpstoxBroker(Broker):
         except httpx.HTTPStatusError as exc:
             reason = _extract_error_message(exc.response)
             return OrderResult(broker_order_id="", status=OrderStatus.REJECTED, rejection_reason=reason)
+        except BrokerError as exc:
+            # Upstox returns HTTP 200 with a {"status": "error", ...} body
+            # for ordinary validation failures (insufficient margin, market
+            # closed, bad instrument, ...) -- `_unwrap` above turns that
+            # into a raised BrokerError. Callers (ExecutionEngine.submit,
+            # then POST /orders and /options/execute) have no try/except
+            # around place_order, and by the time this call happens the
+            # order is already registered under its idempotency key
+            # (OrderManager.create_order), so letting this propagate would
+            # 500 the request AND permanently wedge the order at SUBMITTED:
+            # any retry with the same order params returns `created=False`
+            # and never calls submit() again. A broker-level rejection,
+            # whether surfaced as a 4xx/5xx or as a 200-with-error-envelope,
+            # must always come back as a normal REJECTED OrderResult so it
+            # flows through the existing rejection handling instead.
+            return OrderResult(broker_order_id="", status=OrderStatus.REJECTED, rejection_reason=str(exc))
 
     async def modify_order(self, broker_order_id: str, **changes) -> OrderResult:
         body = {"order_id": broker_order_id, **changes}

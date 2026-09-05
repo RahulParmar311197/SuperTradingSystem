@@ -386,7 +386,18 @@ async def place_order(
                 instrument_id=instrument.id,
                 direction=Direction.LONG if position_before["is_long"] else Direction.SHORT,
                 entry_price=position_before["average_price"],
-                exit_price=payload.entry,
+                # The real broker fill price, not the client-supplied
+                # `payload.entry` -- `pnl` above is computed from this same
+                # value (via PositionManager.apply_fill -> ExecutionEngine.
+                # submit's `result.average_fill_price`), so persisting
+                # `payload.entry` here made the trades journal row
+                # internally inconsistent (exit_price didn't match the pnl/
+                # entry_price actually realized) for any real broker, where
+                # the fill price is independent of what the client typed as
+                # `entry`. Invisible with MockBroker because
+                # `stack.broker.set_quote(payload.symbol, ltp=payload.entry)`
+                # above pins the simulated fill to that same value.
+                exit_price=final_order.average_fill_price,
                 quantity=abs(position_before["quantity"]),
                 pnl=realized_delta,
                 stop=position_before["stop"],

@@ -787,3 +787,77 @@ async def test_entry_far_from_the_real_broker_quote_is_rejected(require_infra):
             assert "Entry deviates" in r.text
         finally:
             await _cleanup(user_id, instrument_id)
+
+
+async def test_closing_trade_records_the_real_fill_price_not_the_claimed_entry(require_infra):
+    # Regression test: the `trades` journal row's `exit_price` was set to
+    # `payload.entry` -- the client-supplied field -- even though `pnl` on
+    # the very same row is computed from `PositionManager.apply_fill`'s
+    # `price` parameter, which is `final_order.average_fill_price`, the
+    # broker's actual fill. For a real broker those two values are
+    # independent (that's the whole premise of `entry_matches_market`
+    # above -- a real broker's quote doesn't move just because a client
+    # typed a different `entry`), so any real fill produced an internally
+    # inconsistent, permanently-persisted trades row: pnl/entry_price
+    # reflected the true fill, exit_price didn't. Invisible with
+    # `MockBroker` because its quote is always seeded from `payload.entry`
+    # by design -- uses `_FakeRealBroker` (fixed, client-independent quote)
+    # for the same reason `test_entry_far_from_the_real_broker_quote_is_
+    # rejected` above needs it.
+    from app.api import orders as orders_module
+
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        async with async_session_factory() as db:
+            instrument = Instrument(
+                symbol=f"ORDFILL{uuid.uuid4().hex[:6].upper()}", exchange="NSE", market=MarketType.EQUITY, instrument_type="EQ"
+            )
+            db.add(instrument)
+            await db.commit()
+            await db.refresh(instrument)
+            instrument_id = instrument.id
+
+        try:
+            # Opens a LONG position against the default MockBroker.
+            r = client.post(
+                "/orders",
+                json={"symbol": instrument.symbol, "direction": "LONG", "entry": 100.0, "stop": 95.0},
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+
+            # Swap in a real-broker stand-in whose quote (and therefore
+            # fill price) is fixed at 101.0 -- the real market moved since
+            # the position opened at 100.0, independent of whatever this
+            # next order's client claims as `entry`. `ExecutionEngine`
+            # captures its own `broker` reference at construction (see
+            # `_UserTradingStack.__init__`), so it has to be swapped too --
+            # otherwise the order would still actually execute against the
+            # stale MockBroker even though `stack.broker.get_quote` (used
+            # for the entry_matches_market check) sees the new one.
+            stack = orders_module._STACKS[user_id]
+            stack.broker = _FakeRealBroker(quote_price=101.0)
+            stack.execution_engine.broker = stack.broker
+
+            # A reducing SHORT fill: entry=101.5 is within the 1% deviation
+            # tolerance of the real quote (101.0), so it passes
+            # entry_matches_market -- but the actual fill still happens at
+            # 101.0, not 101.5. A large stop distance keeps the sized
+            # quantity small relative to the open position, so this only
+            # reduces it (guaranteeing a record_trade call) without fully
+            # closing or flipping it.
+            r = client.post(
+                "/orders",
+                json={"symbol": instrument.symbol, "direction": "SHORT", "entry": 101.5, "stop": 10.0},
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+
+            async with async_session_factory() as db:
+                trade = (await db.execute(select(Trade).where(Trade.user_id == user_id))).scalar_one()
+                assert float(trade.exit_price) == pytest.approx(101.0)
+                assert float(trade.exit_price) != pytest.approx(101.5)
+        finally:
+            await _cleanup(user_id, instrument_id)

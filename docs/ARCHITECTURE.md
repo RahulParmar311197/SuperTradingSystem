@@ -1504,6 +1504,62 @@ Verified each fails against the pre-fix code (an assertion on
 `len(risk_events) >= 1` with zero rows returned) and passes again once the
 fix is restored.
 
+## A closing trade's `exit_price` recorded the client's claimed price, not the broker's real fill (§61)
+
+`POST /orders` and `POST /options/execute` both write a `trades` journal
+row (`app/trading/persistence.py`'s `record_trade`, blueprint §61) whenever
+a fill closes or reduces an existing position. On that row, `pnl` is
+computed correctly — `position_after.realized_pnl - realized_pnl_before`,
+where `PositionManager.apply_fill` derived the realized P&L from its
+`price` argument, which is `final_order.average_fill_price`: the broker's
+own reported fill (`ExecutionEngine.submit` sets
+`order.average_fill_price = result.average_fill_price` straight from
+`Broker.place_order`'s response). But `exit_price` on that same row was
+set to `payload.entry` in `app/api/orders.py` and `leg.premium` in
+`app/api/options.py` — the raw, client-supplied request field, never
+`final_order.average_fill_price`, which sits right there on the same
+`final_order` object `persist_order` already uses two lines earlier.
+
+For any real broker (`UpstoxBroker`/`DhanBroker`), the actual MARKET-order
+fill price is independent of whatever the client typed as `entry`/
+`premium` — that is the entire premise behind the already-fixed
+`entry_matches_market`/`premium_matches_market` checks earlier in this
+document, whose ≤1%/≤5% deviation tolerance only bounds risk *sizing*, not
+what gets permanently written to the trade journal as historical fact. So
+even a fully legitimate, within-tolerance live order produced a `trades`
+row where `exit_price` didn't match the price actually implied by its own
+`pnl`/`entry_price` — an internally inconsistent, permanently-persisted
+financial record, exactly the kind of discrepancy an audit or a SEBI
+compliance review would flag.
+
+This was invisible in every existing test because `MockBroker` fills a
+MARKET order at exactly the quote both endpoints explicitly seed from the
+client's own value right before submitting
+(`stack.broker.set_quote(payload.symbol, ltp=payload.entry)` in
+`orders.py`; the `leg.premium` equivalent in `options.py`), with the
+default `slippage_pct=0.0` — so `average_fill_price` happened to equal
+`payload.entry`/`leg.premium` by construction, for every prior test.
+`app/api/paper.py`'s `feed_candle` already does this correctly
+(`exit_price=candle.close`, the real simulated price), showing the
+codebase already knew the right pattern — `orders.py`/`options.py` simply
+didn't follow it for this one field.
+
+Fixed by changing both `record_trade` calls to
+`exit_price=final_order.average_fill_price` instead of the client-supplied
+field. New tests:
+`tests/api/test_orders.py::test_closing_trade_records_the_real_fill_price_not_the_claimed_entry`
+and
+`tests/api/test_options_execute.py::test_closing_leg_records_the_real_fill_price_not_the_claimed_premium`
+— both reproduce a real broker whose fill price diverges from the client's
+claim (`orders.py`'s test reuses `_FakeRealBroker`, a fixed-quote broker
+double, syncing `stack.execution_engine.broker` too since `ExecutionEngine`
+captures its own reference at construction; `options.py`'s test instead
+mutates the existing `MockBroker.slippage_pct` in place, since that
+broker's own fill logic is what needs to diverge from the quote it was
+just seeded with) and assert the persisted `exit_price` matches the real
+fill, not the claim. Verified both fail against the pre-fix code (asserting
+the buggy client-supplied value) and pass once restored.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

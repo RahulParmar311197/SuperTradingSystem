@@ -52,12 +52,22 @@ async def ping() -> bool:
 # --- Latest price cache -----------------------------------------------
 
 _PRICE_TS_PREFIX = "price_ts:"
+_PRICE_PREV_PREFIX = "price_prev:"
 
 
 async def set_latest_price(symbol: str, price: float) -> None:
     now = datetime.now(timezone.utc).timestamp()
     client = get_redis()
+    # Stash whatever was latest a moment ago as "previous" before
+    # overwriting it, so `get_price_jump_pct` has a tick to diff the new
+    # one against (blueprint §57 "unexpected price jump"). A plain read
+    # before the pipeline, not part of its transaction: `market_data_worker`
+    # is the only writer, one tick at a time on one loop, so there's no
+    # concurrent writer this could race with.
+    previous = await get_latest_price(symbol)
     async with client.pipeline(transaction=True) as pipe:
+        if previous is not None:
+            pipe.set(f"{_PRICE_PREV_PREFIX}{symbol}", previous, ex=_PRICE_TTL_SECONDS)
         pipe.set(f"{_LATEST_PRICE_PREFIX}{symbol}", price, ex=_PRICE_TTL_SECONDS)
         pipe.set(f"{_PRICE_TS_PREFIX}{symbol}", now, ex=_PRICE_TTL_SECONDS)
         await pipe.execute()
@@ -76,6 +86,23 @@ async def get_price_age_seconds(symbol: str) -> float | None:
     if value is None:
         return None
     return max(datetime.now(timezone.utc).timestamp() - float(value), 0.0)
+
+
+async def get_price_jump_pct(symbol: str) -> float | None:
+    """Percent change between the current latest price and the tick
+    immediately before it, or None if there's no previous tick to compare
+    against yet (same "nothing to trust" convention as
+    `get_price_age_seconds` — a brand-new symbol or one whose keys expired
+    isn't a price jump, it's just no data)."""
+    client = get_redis()
+    latest = await get_latest_price(symbol)
+    previous_raw = await client.get(f"{_PRICE_PREV_PREFIX}{symbol}")
+    if latest is None or previous_raw is None:
+        return None
+    previous = float(previous_raw)
+    if previous == 0:
+        return None
+    return abs(latest - previous) / previous * 100
 
 
 # --- Pub/sub fanout (backs the WebSocket channels in app.api.websockets) --

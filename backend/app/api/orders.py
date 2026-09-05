@@ -11,7 +11,7 @@ from app.auth.dependencies import get_current_user, require_permission
 from app.brokers.mock import MockBroker
 from app.core.audit import record_audit
 from app.core.metrics import ORDER_COUNT, RISK_REJECTION_COUNT
-from app.core.redis import account_halt_reason, channel_name, get_price_age_seconds, publish
+from app.core.redis import account_halt_reason, channel_name, get_price_age_seconds, get_price_jump_pct, publish
 from app.database.models.instruments import Instrument
 from app.database.models.notifications import NotificationType
 from app.database.models.risk import RiskDecision as RiskEventDecision
@@ -251,6 +251,10 @@ async def place_order(
         broker_healthy=await stack.broker.is_healthy(),
         correlated_exposure=correlated_exposure,
         repeated_rejections=stack.repeated_rejections,
+        # Same "nothing to compare against yet" convention as
+        # market_data_age_seconds above -- no prior tick means no jump to
+        # flag, not an infinite one.
+        recent_price_jump_pct=await get_price_jump_pct(payload.symbol) or 0.0,
     )
     decision = stack.risk_engine.evaluate(proposal)
     db.add(

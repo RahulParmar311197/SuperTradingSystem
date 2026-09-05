@@ -1072,16 +1072,74 @@ argument) or the write-side update reproduces the original bug
 immediately in the corresponding tests — confirmed by hand, both ways,
 before restoring the fix.
 
-**Known follow-up, deliberately not fixed here:** `no_abnormal_price_jump`
-has the identical shape of bug — `TradeRiskProposal.recent_price_jump_pct`
-also defaults to `0.0` and is never set by either call site, so it can
-never fail either. Unlike `repeated_rejections`, though, there is no
-existing rolling-price infrastructure to compute it from: `app/core/redis.py`
-tracks only the latest price and its age, not a previous tick to diff
-against. Fixing this properly needs a small addition (e.g. storing the
-previous tick alongside the latest one) rather than just wiring up data
-that already exists elsewhere, so it's left as a follow-up rather than
-folded into this fix.
+This PR left one sibling gap open — `no_abnormal_price_jump` had the
+identical shape of bug (see the next section) — since it needed new
+rolling-price infrastructure that didn't exist yet, rather than just
+wiring up data available elsewhere. It's fixed below.
+
+## The "unexpected price jump" circuit breaker never actually tripped (§57)
+
+The last of blueprint §57's five system-level circuit breakers to still
+be dead code, after the two above: `RiskEngine.evaluate` (`app/risk/engine.py`)
+already implements `no_abnormal_price_jump` as a real check —
+```python
+checks.append(
+    RiskCheck("no_abnormal_price_jump", proposal.recent_price_jump_pct <= limits.max_price_jump_pct)
+)
+```
+against a real threshold (`RiskLimits.max_price_jump_pct = 5.0`), but
+`TradeRiskProposal.recent_price_jump_pct` defaults to `0.0`, and neither
+`app/api/orders.py`'s `place_order` nor `app/paper/engine.py`'s
+`on_candle` ever set it. `0.0 <= 5.0` is always true, so an account could
+never be blocked from opening a new position during a real flash-crash or
+price spike — exactly the scenario this check exists for.
+
+Unlike `repeated_rejections`, this one genuinely had no data to wire up:
+`app/core/redis.py`'s price cache (`set_latest_price`/`get_latest_price`/
+`get_price_age_seconds`) only ever stored the current tick — there was no
+previous tick anywhere to diff against, live or paper.
+
+Fixed with the smallest infrastructure addition that closes the gap:
+- `set_latest_price` now stashes whatever was latest a moment ago under a
+  new `price_prev:{symbol}` key (same TTL as the existing keys, so it
+  expires and needs no separate cleanup) *before* overwriting it with the
+  new tick. `app/workers/market_data_worker.py`'s `process_tick` is the
+  only writer, one tick at a time on one sequential loop, so a plain read
+  before the write pipeline can't race with a concurrent writer for the
+  same symbol.
+- A new `get_price_jump_pct(symbol)` reads both keys and returns
+  `abs(latest - previous) / previous * 100`, or `None` when there's
+  nothing to compare against yet — the same "no data yet, not an infinite
+  jump" convention `get_price_age_seconds` already established.
+- `app/api/orders.py`'s `place_order` wires this in exactly like
+  `market_data_age_seconds` two lines above it:
+  `recent_price_jump_pct=await get_price_jump_pct(payload.symbol) or 0.0`.
+- `PaperTradingEngine` needed no Redis at all: it already keeps its own
+  `self.candles` history, so `recent_price_jump_pct` there is just the
+  percent move between `self.candles[-1]` (the current candle, already
+  appended by the time the proposal is built) and `self.candles[-2]` —
+  always safe to index, since `on_candle` already returns early when
+  fewer than 3 candles exist.
+
+`tests/test_core_redis.py` adds two tests for the new Redis primitive:
+`None` with only one tick ever set, and the correct percentage — computed
+against the *immediately preceding* tick, not the first one ever seen —
+across a sequence of three. `tests/api/test_orders.py::test_abnormal_price_jump_blocks_a_new_order`
+drives two real ticks 10% apart through `set_latest_price` and confirms
+`POST /orders` genuinely rejects the next order with
+`no_abnormal_price_jump`. `tests/paper/test_engine.py::test_paper_engine_enforces_abnormal_price_jump_limit`
+uses the SETUP fixture's own real, unmodified entry-candle price move
+(~1.87%, the candle the fixture's strategy actually matches and places an
+order on) and simply lowers `max_price_jump_pct` below it, rather than
+synthesizing an artificial spike. Reverting either call site's wiring
+reproduces the original bug immediately in all three tests — confirmed by
+hand, before restoring the fix.
+
+This closes out every known instance of the "risk-check input never
+actually set" pattern found across daily/weekly P&L, repeated rejections,
+and now price jumps — all three of §56-57's account/system-level checks
+that had a real implementation and a real threshold, but no live data
+feeding them.
 
 ## Multi-leg options execution (§37-40)
 

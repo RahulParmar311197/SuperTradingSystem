@@ -2,9 +2,12 @@
 
 import uuid
 
+import pytest
+
 from app.core.redis import (
     account_halt_reason,
     get_price_age_seconds,
+    get_price_jump_pct,
     halt_account,
     heartbeat,
     list_halted_accounts,
@@ -25,6 +28,31 @@ async def test_price_age_is_near_zero_right_after_a_set(require_infra):
     age = await get_price_age_seconds(symbol)
     assert age is not None
     assert 0 <= age < 2
+
+
+async def test_price_jump_is_none_with_no_previous_tick(require_infra):
+    # Regression test: RiskEngine.evaluate's `no_abnormal_price_jump` check
+    # (blueprint §57 "unexpected price jump") reads
+    # TradeRiskProposal.recent_price_jump_pct, but nothing ever computed a
+    # real value for it -- this is the primitive that makes that possible.
+    # A single tick has nothing to diff against yet.
+    symbol = f"JUMPNONE{uuid.uuid4().hex[:8]}"
+    await set_latest_price(symbol, 100.0)
+    assert await get_price_jump_pct(symbol) is None
+
+
+async def test_price_jump_pct_reflects_the_move_since_the_previous_tick(require_infra):
+    symbol = f"JUMP{uuid.uuid4().hex[:8]}"
+    await set_latest_price(symbol, 100.0)
+    await set_latest_price(symbol, 105.0)
+    jump = await get_price_jump_pct(symbol)
+    assert jump is not None
+    assert jump == pytest.approx(5.0)
+
+    # A third tick diffs against the *second* tick, not the first.
+    await set_latest_price(symbol, 106.0)
+    jump = await get_price_jump_pct(symbol)
+    assert jump == pytest.approx(1 / 105 * 100)
 
 
 async def test_halt_and_resume_account(require_infra):

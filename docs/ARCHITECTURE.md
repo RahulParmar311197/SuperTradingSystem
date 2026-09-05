@@ -654,6 +654,50 @@ a different subsystem (scanner-side pattern detection, the market-data
 freshness halt path, and an auto-trading kill-switch respectively),
 deliberately left open for future rounds rather than folded into this fix.
 
+## Live order rejections were the one path that never notified (§63)
+
+Three code paths reject a proposed trade against the risk engine's
+verdict: manual paper trading (`app/api/paper.py`'s `feed_candle`),
+autonomous trading (`app/workers/auto_trade_worker.py`'s `_process`), and
+manual live/mock trading (`app/api/orders.py`'s `place_order`). The first
+two were fixed in earlier rounds to dispatch `NotificationType.ORDER_REJECTED`
+or `DAILY_LOSS_LIMIT` (depending on which `RiskCheck` failed) whenever
+`RiskEngine.evaluate` rejects. `place_order` — the one path that places a
+live order against a real connected broker (or `MockBroker` when none is
+connected) — never got the same treatment. It wrote a `RiskEvent` audit
+row and raised an `HTTP 403` back to the caller, and that was it:
+`app/api/orders.py` didn't even import `create_notification` or
+`NotificationType`.
+
+Concretely, this meant the highest-stakes rejection path in the whole
+system — a user's live order blocked by their daily loss limit, exposure
+cap, correlated-exposure limit, or stale market data — left no
+`Notification` row anywhere. The synchronous `403` response told whichever
+HTTP client made that specific call, and nothing else: `GET /notifications`
+would never show it, a second device or browser tab would never learn
+about it, and no admin view could see it happened. The inconsistency with
+the two already-fixed sibling paths made this an obvious gap once found:
+same trigger, same `RiskDecisionResult`, same missing notification.
+
+Fixed by mirroring the exact dispatch already used in `app/api/paper.py`
+and `app/workers/auto_trade_worker.py` — `NotificationType.DAILY_LOSS_LIMIT`
+when `decision.failed_checks[0].name == "daily_loss_limit"`, else
+`ORDER_REJECTED` — added to `place_order`'s existing `if not
+decision.approved:` branch, right before the `HTTPException` is raised
+(the audit trail was already covered by the `RiskEvent` row written just
+above it; this only adds the missing user-facing notification).
+`tests/api/test_orders.py` adds two tests mirroring the equivalent
+paper/auto-trade regression tests — one monkeypatching `RiskEngine.evaluate`
+to a generic rejection (asserting `ORDER_REJECTED`), one to a rejection
+whose `checks` list contains a failed `daily_loss_limit` check (asserting
+`DAILY_LOSS_LIMIT` specifically). Reverting the fix reproduces the missing
+notification immediately (verified by hand before committing).
+
+Three `NotificationType` values remain unwired: `SETUP_DETECTED`,
+`MARKET_DATA_STALE`, and `AUTO_TRADING_DISABLED` — different subsystems
+(scanner-side pattern detection, the market-data freshness halt path, and
+an auto-trading kill-switch respectively), left open for future rounds.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

@@ -7,11 +7,14 @@ from fastapi.testclient import TestClient
 from sqlalchemy import delete, select
 
 from app.database.models.instruments import Instrument, MarketType, OptionType
+from app.database.models.notifications import Notification, NotificationType
 from app.database.models.risk import AuditLog, RiskEvent
 from app.database.models.trading import ExecutionMode, Order, OrderEvent, Position, Trade
 from app.database.models.users import User, UserSession
 from app.database.session import async_session_factory
 from app.main import app
+from app.risk.engine import RiskEngine
+from app.risk.limits import RiskCheck, RiskDecision, RiskDecisionResult
 
 pytestmark = pytest.mark.asyncio
 
@@ -25,6 +28,7 @@ async def _cleanup(user_id: uuid.UUID, instrument_id: uuid.UUID) -> None:
         await db.execute(delete(Trade).where(Trade.user_id == user_id))
         await db.execute(delete(Position).where(Position.user_id == user_id))
         await db.execute(delete(RiskEvent).where(RiskEvent.user_id == user_id))
+        await db.execute(delete(Notification).where(Notification.user_id == user_id))
         await db.execute(delete(AuditLog).where(AuditLog.user_id == user_id))
         await db.execute(delete(UserSession).where(UserSession.user_id == user_id))
         await db.execute(delete(User).where(User.id == user_id))
@@ -260,3 +264,94 @@ async def test_place_order_unknown_symbol_returns_404(require_infra):
             await db.execute(delete(UserSession).where(UserSession.user_id == user_id))
             await db.execute(delete(User).where(User.id == user_id))
             await db.commit()
+
+
+async def test_place_order_rejected_by_risk_engine_notifies(require_infra, monkeypatch):
+    # Regression test: unlike app/api/paper.py's feed_candle and
+    # app/workers/auto_trade_worker.py's _process, this handler -- the one
+    # order-placement path that handles real broker money -- used to only
+    # write a RiskEvent audit row and raise a 403 on a risk rejection.
+    # create_notification/NotificationType weren't even imported. No
+    # Notification row was ever persisted, so nothing else (another
+    # device, GET /notifications, an admin view) ever learned a live
+    # order was blocked.
+    monkeypatch.setattr(
+        RiskEngine, "evaluate", lambda self, proposal: RiskDecisionResult(RiskDecision.REJECT, [], "forced rejection for test")
+    )
+
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        async with async_session_factory() as db:
+            instrument = Instrument(
+                symbol=f"ORDREJ{uuid.uuid4().hex[:6].upper()}", exchange="NSE", market=MarketType.EQUITY, instrument_type="EQ"
+            )
+            db.add(instrument)
+            await db.commit()
+            await db.refresh(instrument)
+            instrument_id = instrument.id
+
+        try:
+            r = client.post(
+                "/orders",
+                json={"symbol": instrument.symbol, "direction": "LONG", "entry": 100.0, "stop": 95.0},
+                headers=headers,
+            )
+            assert r.status_code == 403, r.text
+
+            async with async_session_factory() as db:
+                notifications = (
+                    await db.execute(select(Notification).where(Notification.user_id == user_id))
+                ).scalars().all()
+                assert len(notifications) == 1
+                assert notifications[0].type == NotificationType.ORDER_REJECTED
+                assert "forced rejection for test" in notifications[0].body
+        finally:
+            await _cleanup(user_id, instrument_id)
+
+
+async def test_place_order_rejected_for_daily_loss_limit_notifies_distinctly(require_infra, monkeypatch):
+    # Same gap as above, specifically for the daily-loss-limit case: the
+    # paper/auto-trade paths already distinguish DAILY_LOSS_LIMIT from a
+    # generic ORDER_REJECTED (see app/api/paper.py, app/workers/auto_trade_worker.py) --
+    # the live-order path should behave the same way.
+    monkeypatch.setattr(
+        RiskEngine,
+        "evaluate",
+        lambda self, proposal: RiskDecisionResult(
+            RiskDecision.REJECT,
+            [RiskCheck("daily_loss_limit", False, "Daily loss 3.00% vs limit 2.0%")],
+            "Daily loss 3.00% vs limit 2.0%",
+        ),
+    )
+
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        async with async_session_factory() as db:
+            instrument = Instrument(
+                symbol=f"ORDDL{uuid.uuid4().hex[:6].upper()}", exchange="NSE", market=MarketType.EQUITY, instrument_type="EQ"
+            )
+            db.add(instrument)
+            await db.commit()
+            await db.refresh(instrument)
+            instrument_id = instrument.id
+
+        try:
+            r = client.post(
+                "/orders",
+                json={"symbol": instrument.symbol, "direction": "LONG", "entry": 100.0, "stop": 95.0},
+                headers=headers,
+            )
+            assert r.status_code == 403, r.text
+
+            async with async_session_factory() as db:
+                notifications = (
+                    await db.execute(select(Notification).where(Notification.user_id == user_id))
+                ).scalars().all()
+                assert len(notifications) == 1
+                assert notifications[0].type == NotificationType.DAILY_LOSS_LIMIT
+        finally:
+            await _cleanup(user_id, instrument_id)

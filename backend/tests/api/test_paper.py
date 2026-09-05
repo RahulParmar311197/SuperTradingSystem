@@ -361,6 +361,64 @@ async def test_paper_trading_notifies_sl_hit_on_stop_loss_exit(require_infra):
             await _cleanup([user_id], [strategy_id], instrument.id)
 
 
+async def test_paper_trading_records_the_real_stop_price_not_the_candles_close(require_infra):
+    # Regression test: `feed_candle` journaled a closing `Trade` row with
+    # `exit_price=candle.close` -- but `_maybe_exit` fills the closing
+    # order at the stop/target level that actually triggered it, not at
+    # the candle's close, and `pnl` on that same row is derived from that
+    # real fill (via PositionManager.apply_fill). A stop-loss can trigger
+    # intraday (candle.low crosses the stop) and the candle can still
+    # close well above it -- this dataset's last candle does exactly that
+    # (low=90 crosses the stop, close=92) -- so `exit_price` was
+    # persisted as a value the position was never actually closed at,
+    # internally inconsistent with its own `pnl`. Same bug and fix as
+    # tests/api/test_orders.py::test_closing_trade_records_the_real_fill_price_not_the_claimed_entry,
+    # in this engine's stop/target-exit path instead of a live order fill.
+    stop_loss_setup = [
+        (100, 100, 99, 100),
+        (100, 102, 100, 101),
+        (101, 103, 100, 102),
+        (102, 102, 97, 98),
+        (98, 99, 96, 97),
+        (97, 100, 96, 99),
+        (99, 108, 99, 107),
+        (107, 110, 106, 109),
+        (109, 109, 103, 104),  # retraces into the FVG -> entry
+        (104, 105, 90, 92),  # reverses hard through the stop
+    ]
+
+    with TestClient(app) as client:
+        token, user_id = await _register(client, "paperexitprice")
+        headers = {"Authorization": f"Bearer {token}"}
+        instrument = await _make_instrument()
+        strategy_id = await _create_strategy(client, headers, instrument.symbol)
+
+        try:
+            r = client.post("/paper", json={"strategy_id": str(strategy_id), "symbol": instrument.symbol}, headers=headers)
+            assert r.status_code == 200, r.text
+            session_id = r.json()["session_id"]
+
+            start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
+            for i, (o, h, low, c) in enumerate(stop_loss_setup):
+                ts = (start + timedelta(minutes=i)).isoformat()
+                r = client.post(
+                    f"/paper/{session_id}/candle",
+                    json={"timestamp": ts, "open": o, "high": h, "low": low, "close": c, "volume": 10},
+                    headers=headers,
+                )
+                assert r.status_code == 200, r.text
+
+            async with async_session_factory() as db:
+                trade = (await db.execute(select(Trade).where(Trade.user_id == user_id))).scalar_one()
+                # The stop level is what actually filled -- never the
+                # closing candle's close (92.0), which the position was
+                # never filled at.
+                assert float(trade.exit_price) == pytest.approx(float(trade.stop))
+                assert float(trade.exit_price) != pytest.approx(92.0)
+        finally:
+            await _cleanup([user_id], [strategy_id], instrument.id)
+
+
 async def test_paper_trading_notifies_on_risk_rejected_entry(require_infra, monkeypatch):
     # Regression test: `PaperTradingEngine.on_candle` returns
     # `risk_rejected_reason` when a matched entry signal is blocked by the

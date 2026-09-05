@@ -254,7 +254,7 @@ class AutoTradeSupervisor:
                     execution_mode=ExecutionMode.PAPER,
                     direction=snapshot["direction"],
                     entry_price=snapshot["entry_price"],
-                    exit_price=latest.close,
+                    exit_price=outcome.exit_price,
                     quantity=snapshot["quantity"],
                     stop=snapshot["stop"],
                     target=snapshot["target"],

@@ -62,6 +62,14 @@ class PaperTradeOutcome:
     # away, so callers can fire NotificationType.SL_HIT/TP_HIT (blueprint
     # §63) instead of a generic POSITION_CLOSED for every exit.
     exit_reason: Literal["stop_loss", "take_profit"] | None = None
+    # The real fill price behind `closed_position_pnl` -- `None` iff
+    # `closed_position_pnl` is also `None`. `_maybe_exit` fills the closing
+    # order at the stop/target level that triggered it, not at the
+    # candle's `close` -- a stop-loss can trigger intraday and still close
+    # green on the candle's close, so `candle.close`/`latest.close` (what
+    # callers used before this field existed) was never the price that
+    # actually produced `closed_position_pnl`.
+    exit_price: float | None = None
 
 
 class PaperTradingEngine:
@@ -134,8 +142,8 @@ class PaperTradingEngine:
 
         position = self.position_manager.get(self.account_id, self.symbol)
         if position is not None and position.is_open:
-            closed_pnl, exit_reason = await self._maybe_exit(position, candle)
-            return PaperTradeOutcome(signal=None, closed_position_pnl=closed_pnl, exit_reason=exit_reason)
+            closed_pnl, exit_reason, exit_price = await self._maybe_exit(position, candle)
+            return PaperTradeOutcome(signal=None, closed_position_pnl=closed_pnl, exit_reason=exit_reason, exit_price=exit_price)
 
         if len(self.candles) < 3:
             return PaperTradeOutcome(signal=None)
@@ -212,30 +220,32 @@ class PaperTradingEngine:
 
         return PaperTradeOutcome(signal=result, order_created=created, risk_checks=risk_checks)
 
-    async def _maybe_exit(self, position, candle: Candle) -> tuple[float | None, Literal["stop_loss", "take_profit"] | None]:
+    async def _maybe_exit(
+        self, position, candle: Candle
+    ) -> tuple[float | None, Literal["stop_loss", "take_profit"] | None, float | None]:
         is_long = position.is_long
-        exit_price = None
+        trigger_price = None
         exit_reason: Literal["stop_loss", "take_profit"] | None = None
         if is_long:
             if position.stop is not None and candle.low <= position.stop:
-                exit_price = position.stop
+                trigger_price = position.stop
                 exit_reason = "stop_loss"
             elif position.target is not None and candle.high >= position.target:
-                exit_price = position.target
+                trigger_price = position.target
                 exit_reason = "take_profit"
         else:
             if position.stop is not None and candle.high >= position.stop:
-                exit_price = position.stop
+                trigger_price = position.stop
                 exit_reason = "stop_loss"
             elif position.target is not None and candle.low <= position.target:
-                exit_price = position.target
+                trigger_price = position.target
                 exit_reason = "take_profit"
 
-        if exit_price is None:
-            return None, None
+        if trigger_price is None:
+            return None, None, None
 
         realized_before = position.realized_pnl
-        self.broker.set_quote(self.symbol, ltp=exit_price)
+        self.broker.set_quote(self.symbol, ltp=trigger_price)
         closing_direction = Direction.SHORT if is_long else Direction.LONG
         idempotency_key = f"{self.account_id}:{self.symbol}:close:{candle.timestamp.isoformat()}"
         order, created = self.order_manager.create_order(
@@ -249,4 +259,11 @@ class PaperTradingEngine:
         pnl = position.realized_pnl - realized_before
         self.daily_pnl += pnl
         self.weekly_pnl += pnl
-        return pnl, exit_reason
+        # The order's own recorded fill, not `trigger_price` -- same
+        # reasoning as app/api/orders.py's record_trade fix: `pnl` above
+        # was already derived from this fill via PositionManager.apply_fill,
+        # so this is the value that actually matches it, not a
+        # pre-execution local that happens to equal it only while this
+        # engine's MockBroker has zero slippage.
+        final_order = self.order_manager.get(order.id)
+        return pnl, exit_reason, final_order.average_fill_price

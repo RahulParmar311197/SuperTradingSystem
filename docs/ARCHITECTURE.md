@@ -1700,6 +1700,57 @@ the first) is also dead afterward, that every session row for the user is
 `revoked`, and that matching `AuditLog` rows exist. Verified the test
 fails against the pre-fix code and passes once the fix is restored.
 
+## Paper/auto-trade `Trade.exit_price` also recorded the wrong price — on the SL/TP-exit path this time (§61)
+
+**Correction to the section above:** its claim that `app/api/paper.py`'s
+`feed_candle` "already does this correctly (`exit_price=candle.close`, the
+real simulated price)" was wrong for the one path that matters most —
+a stop-loss or take-profit exit — and this round found it.
+`PaperTradingEngine._maybe_exit` (`app/paper/engine.py`) closes a position
+when a candle's `high`/`low` crosses `position.stop`/`position.target`,
+fills the closing order at *that trigger level* (`self.broker.set_quote(
+self.symbol, ltp=trigger_price)`, then submits through the same
+`ExecutionEngine`/`PositionManager.apply_fill` pipeline `POST /orders`
+uses) — **not** at the candle's close. A stop-loss can trigger intraday
+(`candle.low <= position.stop`) while the candle still closes well above
+it; both `app/api/paper.py`'s `feed_candle` and
+`app/workers/auto_trade_worker.py`'s `_process` nonetheless journaled the
+closing `Trade` row with `exit_price=candle.close`/`latest.close` — a
+value the position was never actually filled at — while `pnl` on that same
+row was correctly derived from the real stop/target fill. The exact same
+"internally inconsistent trade-journal row" defect as the section above,
+just reached via the bracket-exit path instead of a live order fill, and
+missed by that round because its own regression test
+(`test_paper_trading_notifies_sl_hit_on_stop_loss_exit`) only ever
+asserted `pnl < 0.0`, never checked `exit_price` against anything, and
+`grep`ping the whole suite confirmed no test anywhere did.
+
+Concretely: this project's own `stop_loss_setup` test dataset (already
+used by three existing tests) reverses hard through a long's stop on its
+final candle, `(open=104, high=105, low=90, close=92)` — the stop-loss
+triggers on `low=90`, but `exit_price` was persisted as `92` (the close),
+a value close enough to the entry that the row *understates* the real
+loss; a milder reversal that still stops out but closes back above entry
+would have made a genuine loss read as a gain in the trade journal.
+
+Fixed by having `_maybe_exit` return the closing order's own
+`average_fill_price` (read off `self.order_manager.get(order.id)` after
+`execution_engine.submit`, the same object `orders.py`/`options.py` read
+`final_order.average_fill_price` from) rather than reusing the
+pre-execution `trigger_price` local or the candle's close. Threaded
+through a new `PaperTradeOutcome.exit_price` field, consumed by both
+`app/api/paper.py` and `app/workers/auto_trade_worker.py` in place of
+`candle.close`/`latest.close`.
+
+New tests:
+`tests/api/test_paper.py::test_paper_trading_records_the_real_stop_price_not_the_candles_close`
+and
+`tests/workers/test_auto_trade_worker.py::test_supervisor_records_the_real_stop_price_not_the_candles_close`,
+both reusing the existing `stop_loss_setup` dataset and asserting
+`trade.exit_price == trade.stop` (never the candle's `92.0` close).
+Verified both fail against the pre-fix code and pass once the fix is
+restored.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

@@ -164,6 +164,29 @@ async def feed_candle(
             details={"symbol": engine.symbol, "direction": outcome.signal.direction if outcome.signal else None},
         )
 
+    if outcome.risk_rejected_reason is not None:
+        # Blueprint §63 mandates an "Order rejected" notification. Before
+        # this, a matched entry signal the risk engine blocked (daily loss
+        # limit, max positions, correlated exposure, ...) left literally no
+        # trace anywhere in a paper session: not a notification, not an
+        # audit entry, not even a field on `PaperStateResponse` -- the
+        # rejection vanished the instant `on_candle` returned.
+        await record_audit(
+            db,
+            actor="user",
+            action="paper.order_rejected",
+            user_id=user.id,
+            details={"symbol": engine.symbol, "reason": outcome.risk_rejected_reason},
+        )
+        await create_notification(
+            db,
+            user_id=user.id,
+            notification_type=NotificationType.ORDER_REJECTED,
+            title=f"{engine.symbol} paper trade rejected",
+            body=outcome.risk_rejected_reason,
+            data={"symbol": engine.symbol, "reason": outcome.risk_rejected_reason},
+        )
+
     if outcome.closed_position_pnl is not None and session.open_snapshot is not None:
         snapshot = session.open_snapshot
         opened_at = session.opened_at or candle.timestamp

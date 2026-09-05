@@ -475,6 +475,56 @@ account being halted, a `BROKER_DISCONNECTED` notification, and the audit
 entry — reverting the fix reproduces the unhandled-exception failure
 immediately (verified by hand before committing).
 
+## A risk-rejected paper/auto-trade entry left no record anywhere (§63)
+
+`PaperTradingEngine.on_candle` (`app/paper/engine.py`) returns a
+`PaperTradeOutcome` whose `risk_rejected_reason` field is set whenever a
+matched entry signal gets vetoed by `RiskEngine.evaluate` — daily loss
+limit, max open positions, correlated exposure, any of the checks in
+`app/risk/engine.py`. Both of this engine's two callers computed that
+value and then simply never read it: `app/api/paper.py`'s `feed_candle`
+discarded it (`PaperStateResponse` doesn't even have a field for it), and
+`app/workers/auto_trade_worker.py`'s `_process` discarded it too. A
+rejected entry vanished the instant `on_candle` returned — not a
+notification, not an audit-log entry, nothing queryable anywhere. This is
+the same "a value is computed but nothing ever consumes it" shape as the
+two previously-fixed dead-value bugs (`eligible_for_auto_trading`,
+`BROKER_DISCONNECTED`), and blueprint §63 explicitly lists "Order
+rejected" as a mandatory notification event.
+
+The autonomous path made this worse than the manual one: `POST /orders`'s
+own risk rejection at least returns a synchronous `403` with
+`decision.reason` in the body, so a manual live-trading user always sees
+why their order didn't go through. `AutoTradeSupervisor` has no HTTP
+response for anyone to read — it runs on a timer, unattended — so a
+rejected autonomous entry left literally zero trace the account's owner
+could ever discover, unless they happened to notice a signal that should
+have opened a position simply never did.
+
+Fixed by mirroring each call site's existing `order_created` branch: when
+`risk_rejected_reason` is set, `record_audit` (`paper.order_rejected` /
+`autotrade.order_rejected`) and `create_notification` with
+`NotificationType.ORDER_REJECTED`, body set to the rejection reason
+itself. `tests/api/test_paper.py::test_paper_trading_notifies_on_risk_rejected_entry`
+and `tests/workers/test_auto_trade_worker.py::test_supervisor_notifies_on_risk_rejected_entry`
+both monkeypatch `RiskEngine.evaluate` to force a deterministic rejection
+on a dataset already proven (in sibling tests) to otherwise open and close
+a position, then assert the notification and audit entry land with the
+forced reason. Reverting either fix reproduces the original silent
+swallowing immediately (verified by hand before committing).
+
+A repo-wide check of every `NotificationType` enum value confirms 3 of 11
+are still never triggered anywhere — `SETUP_DETECTED`, `TRADE_EXECUTED`,
+`SL_HIT`/`TP_HIT` (closing a position emits `POSITION_CLOSED` instead, not
+separately, which arguably already covers the same event), `DAILY_LOSS_LIMIT`,
+`MARKET_DATA_STALE`, and `AUTO_TRADING_DISABLED` remain unwired. Each is a
+real, separately-scoped gap in its own right (a scanner-side setup
+detection, an order-fill completion event, the market-data-freshness halt
+path, and an auto-trading kill-switch notification are four different
+subsystems) — left for a future round rather than folded into this one, to
+keep this fix's diff and its tests focused on the single concrete case
+already reproduced above.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

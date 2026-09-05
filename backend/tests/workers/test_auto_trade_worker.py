@@ -287,6 +287,71 @@ async def test_supervisor_notifies_sl_hit_on_stop_loss_exit(db_instrument):
         await _cleanup(user_id)
 
 
+async def test_supervisor_records_the_real_stop_price_not_the_candles_close(db_instrument):
+    # Regression test: `_process` journaled a closing `Trade` row with
+    # `exit_price=latest.close` -- but `_maybe_exit` fills the closing
+    # order at the stop/target level that actually triggered it, not at
+    # the candle's close, and `pnl` on that same row is derived from that
+    # real fill. This dataset's last candle triggers the stop intraday
+    # (low=90) but closes at 92, well above it -- so `exit_price` was
+    # persisted as a value the position was never actually closed at.
+    # Same bug as tests/api/test_paper.py's identical fix -- this
+    # supervisor drives the exact same `PaperTradingEngine`.
+    stop_loss_setup = [
+        (100, 100, 99, 100),
+        (100, 102, 100, 101),
+        (101, 103, 100, 102),
+        (102, 102, 97, 98),
+        (98, 99, 96, 97),
+        (97, 100, 96, 99),
+        (99, 108, 99, 107),
+        (107, 110, 106, 109),
+        (109, 109, 103, 104),  # retraces into the FVG -> entry
+        (104, 105, 90, 92),  # reverses hard through the stop
+    ]
+    start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
+    candles = [Candle(start + timedelta(minutes=i), o, h, l, c, 100) for i, (o, h, l, c) in enumerate(stop_loss_setup)]
+
+    async with async_session_factory() as db:
+        user = User(
+            id=uuid.uuid4(),
+            email=f"autotrade-exitprice-{uuid.uuid4().hex[:8]}@example.com",
+            password_hash=hash_password("irrelevant123"),
+            name="Auto Trade Exit Price",
+            trading_permissions=[TradingPermission.AUTO_TRADE.value],
+            auto_trading_enabled=True,
+            auto_trading_risk_per_trade_pct=1.0,
+        )
+        db.add(user)
+        await db.flush()
+        strategy = StrategyRow(
+            user_id=user.id,
+            name="Bullish FVG retest",
+            definition={**STRATEGY_DEFINITION, "market": db_instrument.symbol},
+            is_active=True,
+            eligible_for_auto_trading=True,
+        )
+        db.add(strategy)
+        await db.commit()
+        user_id = user.id
+
+    try:
+        supervisor = AutoTradeSupervisor(timeframe="15m")
+        for i in range(len(candles)):
+            async with async_session_factory() as db:
+                await upsert_candles(db, db_instrument.id, "15m", [candles[i]])
+            await supervisor.run_once()
+
+        async with async_session_factory() as db:
+            trades = (await db.execute(select(TradeRow).where(TradeRow.user_id == user_id))).scalars().all()
+
+        assert len(trades) == 1
+        assert float(trades[0].exit_price) == pytest.approx(float(trades[0].stop))
+        assert float(trades[0].exit_price) != pytest.approx(92.0)
+    finally:
+        await _cleanup(user_id)
+
+
 async def test_supervisor_picks_up_strategy_edited_after_engine_cached(db_instrument):
     # Regression test: `_process` cached one `PaperTradingEngine` per
     # (user, strategy, instrument) and only ever used the freshly re-parsed

@@ -2082,6 +2082,91 @@ returns a normal `REJECTED` `OrderResult` rather than raising. Verified to
 fail (with an unhandled `BrokerError`) against the pre-fix code and pass
 once the fix is restored.
 
+## The three-level kill switch (blueprint §58) was permanently a no-op
+
+`RiskEngine.evaluate` and `evaluate_options_risk` (`app/risk/engine.py`,
+`app/risk/options_risk.py`) have always checked a `kill_switch` first,
+before any other risk check — an operator's ability to stop a
+misbehaving strategy, freeze one account, or halt everything is meant to
+be the single highest-priority veto in the whole risk pipeline (blueprint
+§58). What existed, though, was `KillSwitchState`
+(`app/risk/kill_switch.py`): a plain in-memory `@dataclass` with
+`kill_global()`/`kill_account(id)`/`kill_strategy(id)` mutator methods
+that **nothing outside a unit test ever called**. Every real call site
+(`RiskEngine.__init__`, `evaluate_options_risk`) did
+`kill_switch = kill_switch or KillSwitchState()` — always taking the
+`or` branch, since nothing ever passed one in — producing a brand-new,
+permanently-empty instance. There was no admin endpoint, no user
+endpoint, no worker, nothing anywhere in the API that ever mutated a
+`KillSwitchState` a live `RiskEngine` actually consulted. The
+`"kill_switch"` `RiskCheck` passed unconditionally, in every environment,
+regardless of operator intent — and even if some code path had called
+`kill_global()` on some object, it couldn't have reached anything: each
+per-user `_UserTradingStack` (`app/api/orders.py`) builds its own
+`RiskEngine` with its own fresh `KillSwitchState`, and `PaperTradingEngine`
+does the same, so a kill on one in-memory instance is invisible to every
+other stack in the same process, let alone another process. This is the
+identical cross-process gap an earlier round already fixed for
+reconciliation-triggered account halts — in fact `app/core/redis.py`'s
+halt section carries a comment calling out `KillSwitchState` by name as
+"can't carry this signal between processes" — but that fix was never
+extended to the kill switch itself.
+
+Fixed by giving the kill switch the same Redis-backed treatment as
+account halts. `app/core/redis.py` gained `set_global_kill`/
+`clear_global_kill`/`is_global_killed`, the equivalent trio for
+`*_account_kill(account_id)` and `*_strategy_kill(strategy_id)`, and
+`list_killed_accounts`/`list_killed_strategies` for visibility — all
+simple `SET`/`DELETE`/`GET`/`SCAN` operations under `kill:global`,
+`kill:account:<id>`, `kill:strategy:<id>` keys. `app/risk/kill_switch.py`
+gained `load_kill_switch_state(account_id, strategy_id)`, an async
+function that reads those keys back into a `KillSwitchState` — reusing
+`KillSwitchState.is_blocked`'s existing logic unchanged rather than
+rewriting it, and keeping `RiskEngine`/`evaluate_options_risk` themselves
+synchronous and IO-free (their docstring is explicit: "AI ≠ Risk Manager
+... only looks at deterministic account/market state" — the same
+principle applies to this engine not owning IO itself). Every real
+trading path now calls `load_kill_switch_state` and assigns the result to
+`risk_engine.kill_switch` immediately before evaluating, mirroring how
+`POST /orders` already re-checks `account_halt_reason` on every call
+rather than once at stack construction: `app/api/orders.py`'s
+`place_order`, `app/api/options.py`'s `execute_options_strategy` (passed
+directly to `evaluate_options_risk`'s `kill_switch` parameter, since it's
+a free function rather than a method), and `app/paper/engine.py`'s
+`on_candle` — which `app/workers/auto_trade_worker.py`'s
+`AutoTradeSupervisor` already reuses, so this one change covers both the
+manual paper-trading API and the autonomous trading loop.
+
+New admin endpoints in `app/api/admin.py` make the switch operable at
+all: `GET /admin/kill-switch` (current global/account/strategy state),
+`POST`/`DELETE /admin/kill-switch/global`, `.../account/{account_id}`,
+and `.../strategy/{strategy_id}` — mirroring the existing
+`GET /admin/halted-accounts`/`POST /admin/accounts/{id}/resume` pattern,
+including the same `confirm: true` requirement on every trigger and an
+audit-log row (`admin.kill_switch_*_triggered`/`*_cleared`) on every
+mutation.
+
+New `tests/api/test_admin.py::test_admin_can_view_and_trigger_the_three_level_kill_switch`
+exercises the full admin CRUD surface at all three levels. New
+`tests/api/test_orders.py::test_account_kill_switch_blocks_a_new_order`
+and `tests/api/test_options_execute.py::test_execute_respects_account_kill_switch`
+each set a real Redis kill key via `set_account_kill` (not a manually
+constructed `KillSwitchState`, which would prove nothing about whether
+the real path reads Redis at all) and confirm the corresponding live
+endpoint now rejects with a 403 and an `ORDER_REJECTED` notification, then
+that clearing the key lets the account trade again. The existing
+`tests/paper/test_engine.py::test_paper_engine_respects_risk_kill_switch`
+previously set `engine.risk_engine.kill_switch` directly and asserted
+`RiskEngine.evaluate` respected it — true, but no longer representative,
+since `on_candle` now overwrites `kill_switch` from Redis on every candle
+regardless of what was set beforehand; it was rewritten to go through
+`set_global_kill`/`clear_global_kill` instead, so it actually exercises
+the wiring rather than just the already-correct pure `is_blocked` logic.
+All four were verified to fail against the pre-fix code (three with a
+collection-time `ImportError` for the not-yet-existing Redis functions,
+the fourth — the rewritten paper-engine test — the same way) and pass
+once the fix is restored.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

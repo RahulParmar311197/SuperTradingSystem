@@ -746,6 +746,64 @@ async def test_abnormal_price_jump_blocks_a_new_order(require_infra):
             await _cleanup(user_id, instrument_id)
 
 
+async def test_account_kill_switch_blocks_a_new_order(require_infra):
+    # Regression test: `KillSwitchState` (app/risk/kill_switch.py, blueprint
+    # §58) was a plain in-memory dataclass that nothing anywhere ever
+    # mutated -- there was no admin endpoint, and even if one existed, a
+    # kill set on one process's object couldn't reach the RiskEngine living
+    # inside another process's (or this same process's other) per-user
+    # trading stack. `RiskEngine.evaluate`'s "kill_switch" check therefore
+    # always passed, regardless of intent. Fixed by moving kill state into
+    # Redis (mirroring `halt_account`) and having `POST /orders` refresh
+    # `stack.risk_engine.kill_switch` from it on every call -- this test
+    # exercises exactly that path, going through the real Redis keys
+    # `POST /admin/kill-switch/account/{id}` writes, not a manually-set
+    # in-memory object.
+    from app.core.redis import clear_account_kill, set_account_kill
+
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        async with async_session_factory() as db:
+            instrument = Instrument(
+                symbol=f"ORDKILL{uuid.uuid4().hex[:6].upper()}", exchange="NSE", market=MarketType.EQUITY, instrument_type="EQ"
+            )
+            db.add(instrument)
+            await db.commit()
+            await db.refresh(instrument)
+            instrument_id = instrument.id
+
+        try:
+            await set_account_kill(str(user_id))
+
+            r = client.post(
+                "/orders",
+                json={"symbol": instrument.symbol, "direction": "LONG", "entry": 100.0, "stop": 95.0},
+                headers=headers,
+            )
+            assert r.status_code == 403, r.text
+            assert "trading is stopped" in r.text
+
+            async with async_session_factory() as db:
+                notifications = (
+                    await db.execute(select(Notification).where(Notification.user_id == user_id))
+                ).scalars().all()
+                assert any(n.type == NotificationType.ORDER_REJECTED for n in notifications)
+
+            # Clearing it lets the account trade again.
+            await clear_account_kill(str(user_id))
+            r = client.post(
+                "/orders",
+                json={"symbol": instrument.symbol, "direction": "LONG", "entry": 100.0, "stop": 95.0},
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+        finally:
+            await clear_account_kill(str(user_id))
+            await _cleanup(user_id, instrument_id)
+
+
 class _FakeRealBroker(Broker):
     """A minimal non-`MockBroker` double whose quote is fixed and
     independent of whatever `entry` a client submits -- unlike

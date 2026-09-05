@@ -37,3 +37,22 @@ class KillSwitchState:
         if strategy_id and strategy_id in self.killed_strategies:
             return f"Strategy {strategy_id} is stopped"
         return None
+
+
+async def load_kill_switch_state(account_id: str | None, strategy_id: str | None) -> KillSwitchState:
+    """Builds a `KillSwitchState` reflecting only the global flag and the
+    given account/strategy, backed by Redis (app.core.redis) so a kill
+    triggered by an admin API call in one process is visible to the
+    RiskEngine inside every trading stack in every process -- a plain
+    `KillSwitchState()` constructed locally, which is all `RiskEngine` ever
+    got before this existed, can't carry that signal between processes (see
+    the "Kill switch" section of app.core.redis for the shared keys). Call
+    this right before `RiskEngine.evaluate`/`evaluate_options_risk` so the
+    check reflects the current state rather than whatever was true when the
+    trading stack was constructed."""
+    from app.core.redis import is_account_killed, is_global_killed, is_strategy_killed
+
+    global_kill = await is_global_killed()
+    killed_accounts = {account_id} if account_id and await is_account_killed(account_id) else set()
+    killed_strategies = {strategy_id} if strategy_id and await is_strategy_killed(strategy_id) else set()
+    return KillSwitchState(global_kill=global_kill, killed_accounts=killed_accounts, killed_strategies=killed_strategies)

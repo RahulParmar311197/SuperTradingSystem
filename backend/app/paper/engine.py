@@ -16,6 +16,7 @@ from app.database.models.strategy import Direction
 from app.database.models.trading import OrderStatus, OrderType
 from app.ict.engine import ICTConfig, ICTEngine
 from app.risk.engine import RiskEngine, TradeRiskProposal, calculate_position_size
+from app.risk.kill_switch import load_kill_switch_state
 from app.risk.limits import RiskLimits
 from app.smc.engine import SMCConfig, SMCEngine
 from app.smc.types import Candle
@@ -187,6 +188,13 @@ class PaperTradingEngine:
                 else 0.0
             ),
         )
+        # Blueprint §58: refreshed on every candle, not cached at
+        # construction time, so a kill triggered via the admin endpoint
+        # (from this or any other process -- this engine and the
+        # AutoTradeSupervisor that drives it in app.workers.auto_trade_worker
+        # both reuse this method) takes effect on the very next evaluation.
+        # See app.risk.kill_switch.load_kill_switch_state.
+        self.risk_engine.kill_switch = await load_kill_switch_state(self.account_id, self.strategy.name)
         decision = self.risk_engine.evaluate(proposal)
         risk_checks = {c.name: c.passed for c in decision.checks}
         if not decision.approved:

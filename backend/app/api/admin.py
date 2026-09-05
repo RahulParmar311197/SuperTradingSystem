@@ -17,7 +17,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.dependencies import require_admin
 from app.core.audit import record_audit
-from app.core.redis import account_halt_reason, list_halted_accounts, resume_account
+from app.core.redis import (
+    account_halt_reason,
+    clear_account_kill,
+    clear_global_kill,
+    clear_strategy_kill,
+    is_global_killed,
+    list_halted_accounts,
+    list_killed_accounts,
+    list_killed_strategies,
+    resume_account,
+    set_account_kill,
+    set_global_kill,
+    set_strategy_kill,
+)
 from app.database.models.ai import AIDecision, AIDecisionType
 from app.database.models.risk import RiskDecision, RiskEvent
 from app.database.models.trading import Order, OrderStatus
@@ -241,3 +254,112 @@ async def trigger_portfolio_snapshot(user: User = Depends(require_admin), db: As
     count = await snapshot_all_stacks()
     await record_audit(db, actor="user", action="admin.portfolio_snapshot_triggered", user_id=user.id, details={"accounts_snapshotted": count})
     return PortfolioSnapshotTriggerResponse(accounts_snapshotted=count)
+
+
+class KillSwitchStateResponse(BaseModel):
+    global_kill: bool
+    killed_accounts: list[str]
+    killed_strategies: list[str]
+
+
+async def _kill_switch_state() -> KillSwitchStateResponse:
+    return KillSwitchStateResponse(
+        global_kill=await is_global_killed(),
+        killed_accounts=await list_killed_accounts(),
+        killed_strategies=await list_killed_strategies(),
+    )
+
+
+@router.get("/kill-switch", response_model=KillSwitchStateResponse)
+async def get_kill_switch(user: User = Depends(require_admin)) -> KillSwitchStateResponse:
+    """Blueprint §58 "Kill switch": three levels (global/account/strategy)
+    that `RiskEngine.evaluate`/`evaluate_options_risk` already check on
+    every proposal via `KillSwitchState.is_blocked` -- but `KillSwitchState`
+    was a plain in-memory dataclass that nothing anywhere ever called
+    `kill_global`/`kill_account`/`kill_strategy` on, so the check was
+    permanently a no-op in every environment regardless of operator intent.
+    Backed by Redis (app.core.redis) the same way account halts already
+    are, so a kill triggered here is visible to every RiskEngine in every
+    process on its very next evaluation (see
+    app.risk.kill_switch.load_kill_switch_state)."""
+    return await _kill_switch_state()
+
+
+class KillSwitchConfirmRequest(BaseModel):
+    confirm: bool = Field(description="Must be true — triggering or clearing a kill switch requires explicit confirmation")
+
+
+@router.post("/kill-switch/global", response_model=KillSwitchStateResponse)
+async def trigger_global_kill_switch(
+    payload: KillSwitchConfirmRequest, user: User = Depends(require_admin), db: AsyncSession = Depends(get_db)
+) -> KillSwitchStateResponse:
+    if not payload.confirm:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Set confirm=true to trigger the global kill switch")
+    await set_global_kill()
+    await record_audit(db, actor="user", action="admin.kill_switch_global_triggered", user_id=user.id, details={})
+    return await _kill_switch_state()
+
+
+@router.delete("/kill-switch/global", response_model=KillSwitchStateResponse)
+async def clear_global_kill_switch(user: User = Depends(require_admin), db: AsyncSession = Depends(get_db)) -> KillSwitchStateResponse:
+    await clear_global_kill()
+    await record_audit(db, actor="user", action="admin.kill_switch_global_cleared", user_id=user.id, details={})
+    return await _kill_switch_state()
+
+
+@router.post("/kill-switch/account/{account_id}", response_model=KillSwitchStateResponse)
+async def trigger_account_kill_switch(
+    account_id: str,
+    payload: KillSwitchConfirmRequest,
+    user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> KillSwitchStateResponse:
+    if not payload.confirm:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Set confirm=true to stop trading for this account")
+    await set_account_kill(account_id)
+    await record_audit(
+        db, actor="user", action="admin.kill_switch_account_triggered", user_id=user.id, details={"account_id": account_id}
+    )
+    return await _kill_switch_state()
+
+
+@router.delete("/kill-switch/account/{account_id}", response_model=KillSwitchStateResponse)
+async def clear_account_kill_switch(
+    account_id: str, user: User = Depends(require_admin), db: AsyncSession = Depends(get_db)
+) -> KillSwitchStateResponse:
+    await clear_account_kill(account_id)
+    await record_audit(
+        db, actor="user", action="admin.kill_switch_account_cleared", user_id=user.id, details={"account_id": account_id}
+    )
+    return await _kill_switch_state()
+
+
+@router.post("/kill-switch/strategy/{strategy_id}", response_model=KillSwitchStateResponse)
+async def trigger_strategy_kill_switch(
+    strategy_id: str,
+    payload: KillSwitchConfirmRequest,
+    user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> KillSwitchStateResponse:
+    if not payload.confirm:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Set confirm=true to stop this strategy")
+    await set_strategy_kill(strategy_id)
+    await record_audit(
+        db,
+        actor="user",
+        action="admin.kill_switch_strategy_triggered",
+        user_id=user.id,
+        details={"strategy_id": strategy_id},
+    )
+    return await _kill_switch_state()
+
+
+@router.delete("/kill-switch/strategy/{strategy_id}", response_model=KillSwitchStateResponse)
+async def clear_strategy_kill_switch(
+    strategy_id: str, user: User = Depends(require_admin), db: AsyncSession = Depends(get_db)
+) -> KillSwitchStateResponse:
+    await clear_strategy_kill(strategy_id)
+    await record_audit(
+        db, actor="user", action="admin.kill_switch_strategy_cleared", user_id=user.id, details={"strategy_id": strategy_id}
+    )
+    return await _kill_switch_state()

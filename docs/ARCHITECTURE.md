@@ -1448,6 +1448,62 @@ uses and asserts both a `RiskEvent` row (`decision == REJECT`) and a
 the fix reproduces the original bug immediately — this test fails with
 zero rows in both tables — confirmed by hand before restoring it.
 
+## Paper trading and autonomous trading never wrote a `RiskEvent` audit row (§63)
+
+`GET /admin/risk-events` (`app/api/admin.py`) is the only queryable audit
+trail of what `RiskEngine.evaluate()` actually decided — the raw
+`{check_name: passed}` map, not a free-text summary. `POST /orders`
+(`app/api/orders.py`) and `POST /options/execute` (`app/api/options.py`,
+the two fixes directly above this one) both write a `RiskEvent` row on
+*every* decision, approved or rejected, right after calling their risk
+engine. `app/paper/engine.py`'s `PaperTradingEngine.on_candle` — driven
+identically by a manual paper session (`app/api/paper.py`'s `feed_candle`)
+and by `AutoTradeSupervisor` (`app/workers/auto_trade_worker.py`, which
+runs unattended, 24/7, across every eligible user/strategy/instrument) —
+calls the exact same `RiskEngine.evaluate()`, but until this fix the
+resulting `RiskDecisionResult` never left the engine as anything more than
+two free-text strings (`risk_rejected_reason`, `risk_failed_check`) used
+only to pick a notification type. No `RiskEvent` row was ever written from
+either caller, for either outcome.
+
+This was the same "sibling path missed a fix" shape as the two `options.py`
+gaps above it, just one hop further out: `orders.py` and `options.py` are
+both synchronous HTTP endpoints with a response the caller sees immediately
+(a 403 with `decision.reason`, at minimum) even before either of those
+`RiskEvent` fixes existed. Paper trading and autonomous trading have no such
+synchronous observer — `AutoTradeSupervisor` in particular places or
+rejects trades on a background timer with nobody watching the return value.
+For a platform whose flagship feature is unattended autonomous trading,
+this was exactly the audit trail an admin or compliance reviewer would need
+to answer "why did the system approve or reject this trade at 3am", and it
+was silently absent for every paper session and every autonomous trade ever
+run — while the identical decision on a live order or an options strategy
+was fully audited.
+
+Fixed by widening `PaperTradeOutcome` (`app/paper/engine.py`) with a new
+`risk_checks: dict[str, bool] | None` field, set from
+`{c.name: c.passed for c in decision.checks}` on *both* branches of
+`on_candle` — the early return when `decision.approved` is `False`, and the
+final return after an order is created — so a caller can tell a real
+decision was made (`risk_checks is not None`) even when it approved
+everything with `PaperTradeOutcome` otherwise looking identical to the "no
+signal matched" case. `app/api/paper.py`'s `feed_candle` and
+`app/workers/auto_trade_worker.py`'s `_process` both now check
+`outcome.risk_checks is not None` immediately after calling
+`engine.on_candle(...)` and write a `RiskEvent(user_id, decision, reason,
+checks)` row — `REJECT` when `outcome.risk_rejected_reason` is set,
+`APPROVE` otherwise — mirroring `place_order`'s pattern exactly, before any
+of the existing notification/audit-log branches run.
+
+New tests: `tests/api/test_paper.py::test_paper_trading_writes_risk_event_audit_row_on_approval`
+and `::test_paper_trading_writes_risk_event_audit_row_on_rejection` (the
+latter reuses the existing `RiskEngine.evaluate` monkeypatch technique to
+force a rejection deterministically), plus
+`tests/workers/test_auto_trade_worker.py::test_supervisor_writes_risk_event_audit_row_for_the_opened_trade`.
+Verified each fails against the pre-fix code (an assertion on
+`len(risk_events) >= 1` with zero rows returned) and passes again once the
+fix is restored.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

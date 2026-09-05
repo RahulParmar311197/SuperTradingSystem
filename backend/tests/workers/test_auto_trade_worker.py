@@ -6,7 +6,8 @@ from sqlalchemy import delete, select
 
 from app.auth.security import hash_password
 from app.database.models.notifications import Notification, NotificationType
-from app.database.models.risk import AuditLog
+from app.database.models.risk import AuditLog, RiskEvent
+from app.database.models.risk import RiskDecision as RiskEventDecision
 from app.database.models.strategy import Strategy as StrategyRow
 from app.database.models.trading import Trade as TradeRow
 from app.database.models.users import TradingPermission, User
@@ -48,6 +49,7 @@ async def _cleanup(user_id: uuid.UUID) -> None:
         await db.execute(delete(TradeRow).where(TradeRow.user_id == user_id))
         await db.execute(delete(Notification).where(Notification.user_id == user_id))
         await db.execute(delete(AuditLog).where(AuditLog.user_id == user_id))
+        await db.execute(delete(RiskEvent).where(RiskEvent.user_id == user_id))
         await db.execute(delete(StrategyRow).where(StrategyRow.user_id == user_id))
         await db.execute(delete(User).where(User.id == user_id))
         await db.commit()
@@ -166,6 +168,56 @@ async def test_supervisor_opens_and_journals_a_trade_end_to_end(db_instrument):
         # SETUP), so the close specifically must be TP_HIT, not the generic
         # POSITION_CLOSED every close used to fire regardless of which side
         # of the bracket actually closed it.
+    finally:
+        await _cleanup(user_id)
+
+
+async def test_supervisor_writes_risk_event_audit_row_for_the_opened_trade(db_instrument):
+    # Regression test: `_process` drives the exact same `PaperTradingEngine`/
+    # `RiskEngine` as `POST /orders`/`POST /options/execute`, but never wrote
+    # a `RiskEvent` audit row for a single decision it made -- approved or
+    # rejected. This path runs unattended with no synchronous caller to see
+    # the decision at all, so `GET /admin/risk-events` was blind to every
+    # autonomous trade ever placed.
+    start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
+    candles = [Candle(start + timedelta(minutes=i), o, h, l, c, 100) for i, (o, h, l, c) in enumerate(SETUP)]
+
+    async with async_session_factory() as db:
+        user = User(
+            id=uuid.uuid4(),
+            email=f"autotrade-riskevent-{uuid.uuid4().hex[:8]}@example.com",
+            password_hash=hash_password("irrelevant123"),
+            name="Auto Trade Risk Event",
+            trading_permissions=[TradingPermission.AUTO_TRADE.value],
+            auto_trading_enabled=True,
+            auto_trading_risk_per_trade_pct=1.0,
+        )
+        db.add(user)
+        await db.flush()
+        strategy = StrategyRow(
+            user_id=user.id,
+            name="Bullish FVG retest",
+            definition={**STRATEGY_DEFINITION, "market": db_instrument.symbol},
+            is_active=True,
+            eligible_for_auto_trading=True,
+        )
+        db.add(strategy)
+        await db.commit()
+        user_id = user.id
+
+    try:
+        supervisor = AutoTradeSupervisor(timeframe="15m")
+        for i in range(len(candles)):
+            async with async_session_factory() as db:
+                await upsert_candles(db, db_instrument.id, "15m", [candles[i]])
+            await supervisor.run_once()
+
+        async with async_session_factory() as db:
+            risk_events = (await db.execute(select(RiskEvent).where(RiskEvent.user_id == user_id))).scalars().all()
+
+        assert len(risk_events) >= 1
+        assert all(e.decision == RiskEventDecision.APPROVE for e in risk_events)
+        assert all(e.checks for e in risk_events)
     finally:
         await _cleanup(user_id)
 

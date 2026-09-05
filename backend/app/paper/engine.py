@@ -42,6 +42,18 @@ class PaperTradeOutcome:
     # NotificationType.DAILY_LOSS_LIMIT (blueprint §63) instead of a
     # generic ORDER_REJECTED when that specific check is why.
     risk_failed_check: str | None = None
+    # The full per-check pass/fail map from the `RiskDecisionResult` that
+    # was actually evaluated this candle -- `None` iff no risk decision was
+    # made at all (no signal matched, or a position was already open).
+    # Set on *both* the approved and rejected paths so callers (app/api/paper.py,
+    # app/workers/auto_trade_worker.py) can write a `RiskEvent` audit row for
+    # every decision, mirroring what app/api/orders.py and app/api/options.py
+    # already do -- before this field existed, paper trading and autonomous
+    # trading evaluated the exact same `RiskEngine` but the decision (approve
+    # *or* reject) vanished the instant `on_candle` returned, leaving
+    # `GET /admin/risk-events` blind to every paper/auto-trade decision ever
+    # made.
+    risk_checks: dict[str, bool] | None = None
     closed_position_pnl: float | None = None
     # Which side of the bracket actually closed the position -- `None` iff
     # `closed_position_pnl` is also `None` (nothing closed this candle).
@@ -168,9 +180,12 @@ class PaperTradingEngine:
             ),
         )
         decision = self.risk_engine.evaluate(proposal)
+        risk_checks = {c.name: c.passed for c in decision.checks}
         if not decision.approved:
             failed_check = decision.failed_checks[0].name if decision.failed_checks else None
-            return PaperTradeOutcome(signal=result, risk_rejected_reason=decision.reason, risk_failed_check=failed_check)
+            return PaperTradeOutcome(
+                signal=result, risk_rejected_reason=decision.reason, risk_failed_check=failed_check, risk_checks=risk_checks
+            )
 
         quantity = calculate_position_size(
             account.balance, self.strategy.risk.risk_percent, result.entry, result.stop, self.risk_engine.limits.max_position_size
@@ -195,7 +210,7 @@ class PaperTradingEngine:
                 new_position.stop = result.stop
                 new_position.target = result.target
 
-        return PaperTradeOutcome(signal=result, order_created=created)
+        return PaperTradeOutcome(signal=result, order_created=created, risk_checks=risk_checks)
 
     async def _maybe_exit(self, position, candle: Candle) -> tuple[float | None, Literal["stop_loss", "take_profit"] | None]:
         is_long = position.is_long

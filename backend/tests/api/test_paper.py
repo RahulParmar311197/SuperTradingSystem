@@ -7,7 +7,8 @@ from sqlalchemy import delete, select
 
 from app.database.models.instruments import Instrument, MarketType
 from app.database.models.notifications import Notification, NotificationType
-from app.database.models.risk import AuditLog
+from app.database.models.risk import AuditLog, RiskEvent
+from app.database.models.risk import RiskDecision as RiskEventDecision
 from app.database.models.strategy import Strategy as StrategyRow
 from app.database.models.strategy import StrategyVersion as StrategyVersionRow
 from app.database.models.trading import ExecutionMode, Trade
@@ -80,6 +81,7 @@ async def _cleanup(user_ids: list[uuid.UUID], strategy_ids: list[uuid.UUID], ins
             await db.execute(delete(Trade).where(Trade.user_id == user_id))
             await db.execute(delete(Notification).where(Notification.user_id == user_id))
             await db.execute(delete(AuditLog).where(AuditLog.user_id == user_id))
+            await db.execute(delete(RiskEvent).where(RiskEvent.user_id == user_id))
             await db.execute(delete(UserSession).where(UserSession.user_id == user_id))
         for strategy_id in strategy_ids:
             await db.execute(delete(StrategyVersionRow).where(StrategyVersionRow.strategy_id == strategy_id))
@@ -220,6 +222,83 @@ async def test_paper_trading_persists_trade_and_notification_on_close(require_in
                 # comment on _SETUP), so this must be TP_HIT specifically,
                 # not the generic POSITION_CLOSED every close used to fire
                 # regardless of which side of the bracket actually closed it.
+        finally:
+            await _cleanup([user_id], [strategy_id], instrument.id)
+
+
+async def test_paper_trading_writes_risk_event_audit_row_on_approval(require_infra):
+    # Regression test: `PaperTradingEngine.on_candle` evaluates the exact
+    # same `RiskEngine` as `POST /orders`/`POST /options/execute`, but
+    # `feed_candle` used to discard the decision entirely -- no `RiskEvent`
+    # row was ever written for a paper-trading risk decision, approved or
+    # rejected, leaving `GET /admin/risk-events` blind to every one of them.
+    with TestClient(app) as client:
+        token, user_id = await _register(client, "paperriskapprove")
+        headers = {"Authorization": f"Bearer {token}"}
+        instrument = await _make_instrument()
+        strategy_id = await _create_strategy(client, headers, instrument.symbol)
+
+        try:
+            r = client.post("/paper", json={"strategy_id": str(strategy_id), "symbol": instrument.symbol}, headers=headers)
+            assert r.status_code == 200, r.text
+            session_id = r.json()["session_id"]
+
+            start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
+            for i, (o, h, low, c) in enumerate(_SETUP):
+                ts = (start + timedelta(minutes=i)).isoformat()
+                r = client.post(
+                    f"/paper/{session_id}/candle",
+                    json={"timestamp": ts, "open": o, "high": h, "low": low, "close": c, "volume": 10},
+                    headers=headers,
+                )
+                assert r.status_code == 200, r.text
+
+            # This dataset opens (see test_paper_trading_persists_trade_and_
+            # notification_on_close above), so the entry's risk decision was
+            # an approval.
+            async with async_session_factory() as db:
+                risk_events = (await db.execute(select(RiskEvent).where(RiskEvent.user_id == user_id))).scalars().all()
+                assert len(risk_events) >= 1
+                assert all(e.decision == RiskEventDecision.APPROVE for e in risk_events)
+                assert all(e.checks for e in risk_events)
+        finally:
+            await _cleanup([user_id], [strategy_id], instrument.id)
+
+
+async def test_paper_trading_writes_risk_event_audit_row_on_rejection(require_infra, monkeypatch):
+    monkeypatch.setattr(
+        RiskEngine, "evaluate", lambda self, proposal: RiskDecisionResult(RiskDecision.REJECT, [], "forced rejection for test")
+    )
+
+    with TestClient(app) as client:
+        token, user_id = await _register(client, "paperriskreject")
+        headers = {"Authorization": f"Bearer {token}"}
+        instrument = await _make_instrument()
+        strategy_id = await _create_strategy(client, headers, instrument.symbol)
+
+        try:
+            r = client.post("/paper", json={"strategy_id": str(strategy_id), "symbol": instrument.symbol}, headers=headers)
+            assert r.status_code == 200, r.text
+            session_id = r.json()["session_id"]
+
+            start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
+            for i, (o, h, low, c) in enumerate(_SETUP):
+                ts = (start + timedelta(minutes=i)).isoformat()
+                r = client.post(
+                    f"/paper/{session_id}/candle",
+                    json={"timestamp": ts, "open": o, "high": h, "low": low, "close": c, "volume": 10},
+                    headers=headers,
+                )
+                assert r.status_code == 200, r.text
+
+            r = client.get(f"/paper/{session_id}", headers=headers)
+            assert r.json()["open_position"] is None
+
+            async with async_session_factory() as db:
+                risk_events = (await db.execute(select(RiskEvent).where(RiskEvent.user_id == user_id))).scalars().all()
+                assert len(risk_events) >= 1
+                assert all(e.decision == RiskEventDecision.REJECT for e in risk_events)
+                assert all(e.reason == "forced rejection for test" for e in risk_events)
         finally:
             await _cleanup([user_id], [strategy_id], instrument.id)
 

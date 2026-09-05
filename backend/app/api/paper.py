@@ -10,6 +10,8 @@ from app.api.orders import _get_instrument_by_symbol
 from app.auth.dependencies import get_current_user
 from app.core.audit import record_audit
 from app.database.models.notifications import NotificationType
+from app.database.models.risk import RiskDecision as RiskEventDecision
+from app.database.models.risk import RiskEvent
 from app.database.models.strategy import Direction
 from app.database.models.strategy import Strategy as StrategyRow
 from app.database.models.trading import ExecutionMode
@@ -153,6 +155,22 @@ async def feed_candle(
         }
 
     outcome = await engine.on_candle(candle)
+
+    if outcome.risk_checks is not None:
+        # Blueprint's `risk_events` table (see AI_TRADING_PLATFORM_BLUEPRINT.md)
+        # is the only queryable audit trail of what the risk engine actually
+        # decided -- POST /orders and POST /options/execute both write this
+        # row unconditionally (approve or reject); paper trading evaluates the
+        # exact same RiskEngine but, before this, never wrote one at all.
+        db.add(
+            RiskEvent(
+                user_id=user.id,
+                decision=RiskEventDecision.REJECT if outcome.risk_rejected_reason is not None else RiskEventDecision.APPROVE,
+                reason=outcome.risk_rejected_reason,
+                checks=outcome.risk_checks,
+            )
+        )
+        await db.commit()
 
     if outcome.order_created:
         session.opened_at = candle.timestamp

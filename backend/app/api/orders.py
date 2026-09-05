@@ -1,5 +1,6 @@
 import asyncio
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
@@ -68,6 +69,32 @@ class _UserTradingStack:
         self.trades_today = 0
         self.daily_pnl = 0.0
         self.weekly_pnl = 0.0
+        # Set on first `_roll_risk_window` call, not here -- `None` means
+        # "no window established yet", so the first call never wrongly
+        # resets a stack that was just created.
+        self._risk_day = None
+        self._risk_week = None
+
+    def _roll_risk_window(self, now: datetime) -> None:
+        """Resets `trades_today`/`daily_pnl` at a UTC day boundary and
+        `weekly_pnl` at a UTC (ISO) week boundary. Without this, these
+        counters only ever reset when the API process restarts, making
+        RiskEngine.evaluate's `max_trades_per_day`/`daily_loss_limit`/
+        `weekly_loss_limit` checks lifetime-of-process limits rather than
+        the rolling daily/weekly limits they're meant to be -- see
+        docs/ARCHITECTURE.md. Mirrors
+        `PaperTradingEngine._roll_risk_window` (app/paper/engine.py),
+        which does the same thing keyed off candle time instead of wall
+        clock."""
+        today = now.date()
+        this_week = now.isocalendar()[:2]
+        if self._risk_day is not None and today != self._risk_day:
+            self.trades_today = 0
+            self.daily_pnl = 0.0
+        if self._risk_week is not None and this_week != self._risk_week:
+            self.weekly_pnl = 0.0
+        self._risk_day = today
+        self._risk_week = this_week
 
 
 _STACKS: dict[uuid.UUID, _UserTradingStack] = {}
@@ -179,6 +206,7 @@ async def place_order(
     instrument = await _get_instrument_by_symbol(db, payload.symbol)
 
     stack = await _stack_for(user, db)
+    stack._roll_risk_window(datetime.now(timezone.utc))
     if isinstance(stack.broker, MockBroker):
         # Only MockBroker needs a quote fed in — a real broker gets its
         # own price from the market, not from what the client submitted

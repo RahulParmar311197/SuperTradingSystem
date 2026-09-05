@@ -8,6 +8,7 @@ rejections are simulated by the underlying `MockBroker`).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Literal
 
 from app.brokers.mock import MockBroker
@@ -81,8 +82,36 @@ class PaperTradingEngine:
         self.trades_today = 0
         self.daily_pnl = 0.0
         self.weekly_pnl = 0.0
+        # Set on first `_roll_risk_window` call, not here -- `None` means
+        # "no window established yet", so the first candle never wrongly
+        # resets a freshly constructed engine.
+        self._risk_day = None
+        self._risk_week = None
+
+    def _roll_risk_window(self, now: datetime) -> None:
+        """Resets `trades_today`/`daily_pnl` at a day boundary and
+        `weekly_pnl` at an (ISO) week boundary, keyed off `now` (the
+        current candle's timestamp -- this engine's logical clock, the
+        same convention `app.smc.liquidity.detect_session_levels` uses for
+        day/week bucketing). Without this, these counters only ever reset
+        when the worker process restarts, making RiskEngine.evaluate's
+        `max_trades_per_day`/`daily_loss_limit`/`weekly_loss_limit` checks
+        lifetime-of-process limits rather than the rolling daily/weekly
+        limits they're meant to be -- see docs/ARCHITECTURE.md. Mirrors
+        `_UserTradingStack._roll_risk_window` (app/api/orders.py), which
+        does the same thing keyed off wall clock instead."""
+        today = now.date()
+        this_week = now.isocalendar()[:2]
+        if self._risk_day is not None and today != self._risk_day:
+            self.trades_today = 0
+            self.daily_pnl = 0.0
+        if self._risk_week is not None and this_week != self._risk_week:
+            self.weekly_pnl = 0.0
+        self._risk_day = today
+        self._risk_week = this_week
 
     async def on_candle(self, candle: Candle) -> PaperTradeOutcome:
+        self._roll_risk_window(candle.timestamp)
         self.candles.append(candle)
         self.broker.set_quote(self.symbol, ltp=candle.close)
         self.position_manager.mark_to_market(self.account_id, self.symbol, candle.close)

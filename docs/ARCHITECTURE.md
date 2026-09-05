@@ -427,6 +427,54 @@ supervisor half of the pipeline works correctly once
 that state through the real API possible at all, closing the loop between
 the two.
 
+## A disconnected broker was silently swallowed instead of halting the account (§74)
+
+`ReconciliationWorker.run_once()` (`app/workers/reconciliation_worker.py`)
+already handles one half of blueprint §74 "Broker Failure Handling": if
+local and broker state both come back successfully but *disagree*, it
+halts the account, records an audit entry, and notifies the user. It never
+handled the other half — the broker being unreachable at all. `get_orders`/
+`get_positions` were called with no `try`/`except` around them at all. A
+real adapter doesn't return stale or empty data when it can't reach the
+broker — it raises. `UpstoxBroker._get` calls `response.raise_for_status()`
+unconditionally, so an expired/revoked token, a network failure, or an
+outage surfaces as `httpx.HTTPStatusError`/`httpx.HTTPError`; `DhanBroker`'s
+methods still end in `NotImplementedError` (honestly, per its own
+docstring). Every adapter's own `is_healthy()` already treats exactly this
+set — `(BrokerError, httpx.HTTPError, NotImplementedError)` — as "not
+healthy"; `run_once` was the one place that didn't.
+
+That exception propagated straight out of `run_once` and up into
+`app/trading/live_reconciliation.py`'s `reconcile_all_connected_accounts`,
+which wraps each account's pass in a bare `except Exception:
+logger.exception(...)`. The result: a genuinely disconnected broker —
+exactly the failure §74 exists to handle — was silently logged and
+forgotten every reconciliation cycle. The account was never halted
+(`account_halt_reason` stayed `None`, so `POST /orders` kept accepting new
+live entries against a broker that had just proven unreachable), no
+notification reached the user, and `BrokerAccount.status` never left
+`ACTIVE` (confirmed by grep: nothing in the codebase ever writes any other
+status to that column). `NotificationType.BROKER_DISCONNECTED` had been
+defined in the model since early on and was never emitted anywhere — the
+same class of dead-value bug as `eligible_for_auto_trading` above, just in
+a notification type instead of a boolean column.
+
+Fixed by wrapping the two broker calls in `run_once` in
+`try`/`except (BrokerError, httpx.HTTPError, NotImplementedError)` and, on
+failure, doing exactly what the mismatch branch already does — `halt_account`,
+`record_audit` (`action="reconciliation.broker_unreachable"`), and a
+`BROKER_DISCONNECTED` notification — then returning a `ReconciliationReport`
+carrying the failure as its own mismatch entry rather than propagating the
+exception (so a caller checking `report.in_sync` still gets a truthful
+answer instead of an unhandled exception).
+`tests/workers/test_reconciliation_worker.py::test_reconciliation_halts_account_when_broker_is_unreachable`
+proves it: a broker stub whose `get_orders` raises `BrokerError` (unlike
+`MockBroker.set_healthy(False)`, which only changes what `is_healthy()`
+reports, never what `get_orders`/`get_positions` do) still results in the
+account being halted, a `BROKER_DISCONNECTED` notification, and the audit
+entry — reverting the fix reproduces the unhandled-exception failure
+immediately (verified by hand before committing).
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

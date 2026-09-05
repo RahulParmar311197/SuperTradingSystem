@@ -1560,6 +1560,85 @@ just seeded with) and assert the persisted `exit_price` matches the real
 fill, not the claim. Verified both fail against the pre-fix code (asserting
 the buggy client-supplied value) and pass once restored.
 
+## WebSocket channels never detected a client disconnect (§64)
+
+Every channel in `app/api/websockets.py` (`/ws/market`, `/ws/chart`,
+`/ws/scanner`, `/ws/signals`, `/ws/orders`, `/ws/positions`, `/ws/replay`)
+is a thin relay through the shared `_relay(websocket, channel)` helper.
+Before this fix, `_relay` was:
+
+```python
+async def _relay(websocket, channel):
+    await websocket.accept()
+    try:
+        async for message in subscribe(channel):
+            if websocket.application_state != WebSocketState.CONNECTED:
+                break
+            await websocket.send_json(message)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        if websocket.application_state == WebSocketState.CONNECTED:
+            await websocket.close()
+```
+
+This never calls `websocket.receive()`. In the ASGI websocket protocol, a
+client disconnect — a clean close handshake *or* an abrupt drop (a killed
+tab, a phone going to sleep, wifi loss) — is only delivered to the
+application as a `{"type": "websocket.disconnect"}` message on the
+**receive** side. `WebSocket.send()` only raises `WebSocketDisconnect`
+after the *next* failed write; it can't proactively notice a client that's
+already gone. `subscribe(channel)` (`app/core/redis.py`) blocks on Redis's
+`pubsub.listen()`, so if nothing publishes to that channel after the
+client disconnects, this coroutine simply parks forever: it never calls
+`receive()` (so it can't learn about the disconnect that way) and never
+calls `send()` again either (so the failed-write path never triggers). The
+`application_state != CONNECTED` check was dead code for the same
+reason — nothing else ever touches this websocket's `application_state`
+once a real client is gone.
+
+This is a real, unbounded resource leak, not a theoretical one: uvicorn's
+`connection_lost` (fired when the transport actually dies) closes the
+transport but never cancels the already-running ASGI application task, so
+the leaked task and the Redis pub/sub subscription it holds open both
+survive indefinitely. The per-user channels are the worst case — `/ws/orders`
+and `/ws/positions` only publish when *that specific user* places an order
+or their position changes, so a user who opens the dashboard and later
+closes the tab without another order ever firing leaks a task and a Redis
+subscription for the rest of the process's life. Ordinary client behavior
+(switching tabs, a phone sleeping, a page reload) makes this an ongoing
+leak over a trading day, eventually threatening Redis's `maxclients` limit
+and the API process's own memory/FD limits — the same *class* of bug as
+"A real Postgres connection leak, finally found" above, just in the
+WebSocket/Redis-pubsub layer instead of the DB layer.
+
+Fixed by running two tasks concurrently per connection: the existing
+forward loop (`_forward`, unchanged logic) and a new `_watch_for_disconnect`
+loop that calls `websocket.receive()` and returns as soon as it sees a
+`websocket.disconnect` message (any other message type — clients aren't
+expected to send anything on these one-way broadcast channels — is just
+ignored). `_relay` now `asyncio.wait`s on both with
+`return_when=FIRST_COMPLETED`, cancels whichever is still pending, and
+propagates any real (non-disconnect) exception from whichever finished
+first. Cancelling the forward task mid-`async for` while it's blocked
+inside `subscribe(channel)`'s `pubsub.listen()` correctly triggers that
+generator's own `finally` block (`pubsub.unsubscribe`/`pubsub.aclose`),
+which is exactly the cleanup that was never reached before.
+
+New `tests/api/test_websockets.py::test_relay_detects_disconnect_and_cleans_up_the_subscription`
+calls `_relay` directly against a minimal fake `WebSocket` double whose
+`receive()` resolves to a disconnect message after a short delay, with
+nothing ever published to the channel — deliberately not using
+`starlette.testclient.WebSocketTestSession` (`with client.websocket_connect(...):`),
+whose own `__exit__` cancels the underlying ASGI app task unconditionally
+via its anyio `TaskGroup` teardown, which would mask this exact bug
+regardless of whether `_relay` itself ever learned about the disconnect.
+Wrapped in `asyncio.wait_for(..., timeout=2.0)` and asserts the Redis
+channel's `PUBSUB NUMSUB` count is `0` afterward. Verified the test times
+out against the pre-fix code (proving the leak) and passes, completing
+almost immediately with the subscription cleaned up, once the fix is
+restored.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

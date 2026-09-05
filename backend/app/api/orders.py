@@ -358,6 +358,18 @@ async def place_order(
 
     position_after = stack.position_manager.get(str(user.id), payload.symbol)
     if position_after is not None:
+        if position_after.is_open and position_after.is_long == (payload.direction == Direction.LONG):
+            # Blueprint §60: `payload.stop` is required input already used
+            # to size this order (calculate_position_size) and by the risk
+            # engine, but nothing ever attached it to the resulting
+            # position -- so no live position ever had a recorded stop,
+            # unlike PaperTradingEngine._maybe_enter (app/paper/engine.py),
+            # which already does this for every paper/auto-trade entry.
+            # Only set it when this fill opened, added to, or flipped into
+            # a position in payload.direction -- never on a fill that only
+            # reduces/closes a position in the other direction, whose stop
+            # belongs to that original entry, not this one.
+            position_after.stop = payload.stop
         position_row = await persist_position(db, user.id, instrument.id, position_after, execution_mode=execution_mode)
         realized_delta = position_after.realized_pnl - realized_pnl_before
         if realized_delta != 0 and position_before is not None:

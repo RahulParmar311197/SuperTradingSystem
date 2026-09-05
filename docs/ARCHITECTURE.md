@@ -1212,6 +1212,67 @@ Reverting either the new check or its wiring in `place_order` reproduces
 the original bug immediately in all three tests — confirmed by hand,
 both independently, before restoring the fix.
 
+## A live order's `stop` was never attached to its position (§60)
+
+`PlaceOrderRequest.stop` (`app/api/orders.py`) is required on every
+`POST /orders` call and already does real work — `calculate_position_size`
+sizes the order from `|entry - stop|`, and the risk engine's
+`valid_stop_distance`/notional checks read it too. But after that, nothing
+in `place_order` ever wrote it onto the resulting `PositionRecord.stop`.
+Compare `PaperTradingEngine._maybe_enter`-equivalent code path in
+`app/paper/engine.py` (`if created: new_position.stop = result.stop`,
+right after opening a paper/auto-trade entry) — the manual/live path is
+the one place in the codebase that took a stop as input and then dropped
+it before it reached the position it was supposed to protect.
+
+The consequence compounds: `positions.stop` (the DB column,
+`app/trading/persistence.py`) faithfully mirrors whatever's in the
+in-memory `PositionRecord` — which was always `None` for a live position,
+so the column was dead-on-arrival for every `ExecutionMode.LIVE` row even
+though the schema and persistence layer both already worked correctly for
+paper/backtest rows. A user placing a live order via this endpoint had no
+way to even confirm a stop was recorded, since `GET /positions` (and
+everything downstream of the DB row) had nothing to show.
+
+Fixed by setting `position_after.stop = payload.stop` in `place_order`,
+but only when this fill actually opened, added to, or flipped into a
+position in `payload.direction`:
+```python
+if position_after.is_open and position_after.is_long == (payload.direction == Direction.LONG):
+    position_after.stop = payload.stop
+```
+This condition matters: `POST /orders` (unlike `PaperTradingEngine`,
+which only ever evaluates a fresh entry while flat) is also how a
+position gets closed or reduced — a SHORT fill against an open LONG
+position, say. A closing/reducing fill's own `stop` has nothing to do
+with the *original* entry's protective level, so the condition above
+skips it whenever the position's final direction doesn't match the fill
+that was just placed; it still fires correctly on the flip case (a fill
+big enough to close the old side and open a fresh one in the new
+direction), since the resulting position's direction then does match.
+
+`tests/api/test_orders.py::test_live_order_records_stop_on_the_resulting_position`
+covers all three shapes: opening records the stop, adding to the same
+side updates it, and a smaller reducing fill in the opposite direction
+leaves it untouched. Reverting the fix reproduces the original bug
+immediately — the first assertion alone fails, since the DB row's `stop`
+is `None` — confirmed by hand before restoring it.
+
+**Known follow-up, deliberately not fixed here:** recording the stop is
+necessary but not sufficient for it to do anything. Nothing yet
+*enforces* a live position's stop — there is no equivalent of
+`PaperTradingEngine._maybe_exit`'s candle-driven stop/target check running
+against live positions, and `trigger_price` (present on `Order`,
+`OrderRequest`, and already forwarded by `UpstoxBroker.place_order`) is
+never threaded through `OrderManager.create_order`/`ExecutionEngine.submit`,
+so even an `order_type=SL`/`SL_M` order sends the broker a trigger price
+of `0`, not the user's stop. Actually enforcing a live stop needs either a
+monitoring worker (polling open live positions' `.stop` against fresh
+quotes and submitting a closing order, analogous to `_maybe_exit`) or
+wiring `trigger_price` end-to-end so the broker holds the protective order
+natively — both larger, separate pieces of work than restoring the value
+this fix closes the gap on.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

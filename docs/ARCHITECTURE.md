@@ -959,6 +959,62 @@ process alive across midnight would need that reset logic added to both
 places identically; tracked as a follow-up, not folded into this fix so
 as to keep it scoped to restoring parity between the two paths.
 
+## "Daily"/"weekly" risk limits never reset — they were lifetime-of-process limits (§56-57)
+
+This is the direct follow-up flagged (and deliberately deferred) by the
+previous fix above: making `daily_pnl`/`weekly_pnl` actually accumulate
+was necessary but not sufficient. Neither `_UserTradingStack`
+(`app/api/orders.py`) nor `PaperTradingEngine` (`app/paper/engine.py`)
+ever reset `trades_today`/`daily_pnl`/`weekly_pnl` at a day or week
+boundary — both are long-lived in-memory objects (`_STACKS` in
+`app/api/orders.py`, `AutoTradeSupervisor._engines` in
+`app/workers/auto_trade_worker.py`) that persist for the life of the API
+process or worker, so in practice these counters only ever cleared on a
+restart.
+
+The consequence: `max_trades_per_day` (`app/risk/engine.py`, default 10)
+checks `proposal.trades_today < limits.max_trades_per_day` — once a
+user's *cumulative* order count since the process last restarted hits 10,
+every order is rejected from then on, not just for the rest of that
+trading day. `daily_loss_limit`/`weekly_loss_limit` have the mirror
+problem: a bad trading day early in a long-running process's uptime keeps
+suppressing new trades on every later day too, since `daily_pnl` never
+zeroes out to start the next day's evaluation from a clean baseline — the
+opposite of what a "daily" limit is supposed to do. A production
+deployment (a long-lived process is the norm, not periodic per-day
+restarts) would have these limits silently stop being daily/weekly and
+start being "since we last deployed."
+
+Fixed by giving both classes a `_roll_risk_window(now)` method that
+tracks the current UTC calendar day and ISO week as bucket keys (`(now.date()`
+and `now.isocalendar()[:2]` respectively — the same bucketing
+`app.smc.liquidity.detect_session_levels` already uses for day/week
+liquidity levels) and resets `trades_today`/`daily_pnl` when the day key
+changes, and `weekly_pnl` when the week key changes:
+- `_UserTradingStack._roll_risk_window` is called at the top of
+  `place_order` with `datetime.now(timezone.utc)` — the manual/live order
+  path has no other clock to use.
+- `PaperTradingEngine._roll_risk_window` is called at the top of
+  `on_candle` with `candle.timestamp` instead — this engine already
+  treats candle time as its logical clock everywhere else, and doing the
+  same here means a backtest-speed replay of paper trading doesn't roll
+  its risk window on wall-clock ticks that have nothing to do with the
+  simulated market time.
+
+Both methods guard on the stored bucket key being `None` (a freshly
+constructed stack/engine has no "today" to compare against yet) so the
+very first call establishes the window without spuriously zeroing
+counters that were never non-zero anyway.
+
+`tests/api/test_orders.py::test_user_trading_stack_resets_daily_and_weekly_counters_at_boundaries`
+and `tests/paper/test_engine.py::test_paper_engine_resets_daily_and_weekly_counters_at_boundaries`
+drive each `_roll_risk_window` directly across a same-day call (nothing
+resets), a next-day call (daily counters reset, weekly does not, since
+the fixture week starts on a Monday), and a next-week call (weekly resets
+too). Reverting either method to a no-op reproduces the original bug
+immediately — both new tests fail because the counters never zero out —
+confirmed by hand before restoring the fix.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

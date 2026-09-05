@@ -1,3 +1,5 @@
+from datetime import timedelta
+
 import pytest
 
 from app.paper.engine import PaperTradingEngine
@@ -69,3 +71,32 @@ async def test_paper_engine_respects_risk_kill_switch():
 
     assert saw_rejection is True
     assert engine.trades_today == 0
+
+
+@pytest.mark.asyncio
+async def test_paper_engine_resets_daily_and_weekly_counters_at_boundaries():
+    # Regression test: `trades_today`/`daily_pnl`/`weekly_pnl` used to
+    # persist for the lifetime of the engine -- only a full worker restart
+    # ever cleared them -- making RiskEngine.evaluate's
+    # max_trades_per_day/daily_loss_limit/weekly_loss_limit checks
+    # lifetime-of-process limits rather than the rolling daily/weekly
+    # limits they're meant to be.
+    candles = make_candles(SETUP)
+    engine = PaperTradingEngine(_strategy(), symbol="TESTSYM", starting_balance=100_000)
+    for candle in candles:
+        await engine.on_candle(candle)
+
+    assert engine.trades_today == 1
+    assert engine.daily_pnl > 0
+    assert engine.weekly_pnl == engine.daily_pnl
+
+    # Candles start on a Monday (see tests/smc/conftest.py) -- a day later
+    # is still the same ISO week, so only the daily counters reset.
+    engine._roll_risk_window(candles[-1].timestamp + timedelta(days=1))
+    assert engine.trades_today == 0
+    assert engine.daily_pnl == 0.0
+    assert engine.weekly_pnl > 0
+
+    # A week later is a new ISO week -- weekly_pnl resets too.
+    engine._roll_risk_window(candles[-1].timestamp + timedelta(days=7))
+    assert engine.weekly_pnl == 0.0

@@ -468,3 +468,43 @@ async def test_daily_loss_limit_is_enforced_after_a_real_realized_loss(require_i
                 assert any(n.type == NotificationType.DAILY_LOSS_LIMIT for n in notifications)
         finally:
             await _cleanup(user_id, instrument_id)
+
+
+async def test_user_trading_stack_resets_daily_and_weekly_counters_at_boundaries():
+    # Regression test: `_UserTradingStack.trades_today`/`daily_pnl`/
+    # `weekly_pnl` used to persist for the lifetime of the API process --
+    # only a restart ever cleared them -- making RiskEngine.evaluate's
+    # max_trades_per_day/daily_loss_limit/weekly_loss_limit checks
+    # lifetime-of-process limits rather than the rolling daily/weekly
+    # limits they're meant to be.
+    from datetime import datetime, timedelta, timezone
+
+    from app.api.orders import _UserTradingStack
+    from app.brokers.mock import MockBroker
+
+    stack = _UserTradingStack(MockBroker())
+    monday = datetime(2026, 1, 5, 10, 0, tzinfo=timezone.utc)
+    stack._roll_risk_window(monday)
+    stack.trades_today = 5
+    stack.daily_pnl = -1500.0
+    stack.weekly_pnl = -1500.0
+
+    # Same day -- nothing resets.
+    stack._roll_risk_window(monday + timedelta(hours=2))
+    assert stack.trades_today == 5
+    assert stack.daily_pnl == -1500.0
+    assert stack.weekly_pnl == -1500.0
+
+    # Next day, same ISO week -- daily counters reset, weekly does not.
+    stack._roll_risk_window(monday + timedelta(days=1))
+    assert stack.trades_today == 0
+    assert stack.daily_pnl == 0.0
+    assert stack.weekly_pnl == -1500.0
+
+    # A week later -- a new ISO week -- weekly resets too.
+    stack.trades_today = 3
+    stack.daily_pnl = -200.0
+    stack._roll_risk_window(monday + timedelta(days=7))
+    assert stack.trades_today == 0
+    assert stack.daily_pnl == 0.0
+    assert stack.weekly_pnl == 0.0

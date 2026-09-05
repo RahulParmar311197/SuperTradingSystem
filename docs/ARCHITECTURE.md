@@ -2024,6 +2024,64 @@ once it started doing so. Both cleanup helpers now delete `Notification`
 rows before deleting the `User` row, matching the ordering already used
 for every other FK-dependent table in those same helpers.
 
+## Upstox adapter's 200-with-error-envelope leaking a raw exception and permanently wedging the order
+
+`UpstoxBroker.place_order` (`app/brokers/upstox/adapter.py`) is the one
+place in the whole system where a real broker's HTTP response becomes a
+live order's fate, and it had a gap in exactly the failure mode that
+matters most: an ordinary broker-level rejection (insufficient margin,
+market closed, invalid instrument) crashing the request instead of
+producing a normal rejected order.
+
+Upstox, like most broker APIs, can return **HTTP 200** with a
+`{"status": "error", "errors": [...]}` body for this kind of failure —
+this module's own `_unwrap` helper already detects that shape and raises
+`BrokerError` for it (used correctly everywhere else in this adapter:
+`get_account`, `get_positions`, `get_orders`, `get_quote`,
+`get_option_chain` all let it propagate, because a lookup failing is
+supposed to be an exception). `place_order`, however, is different: its
+contract (now written down explicitly on `Broker.place_order` in
+`app/brokers/base.py`) is that a broker-level rejection must come back as
+an `OrderResult(status=REJECTED, ...)`, not raise — and the code only
+caught `httpx.HTTPStatusError` (a 4xx/5xx status), never the `BrokerError`
+that the exact same rejection produces when Upstox reports it via a 200
+status with an error-shaped body instead.
+
+The failure this produced was worse than a bad error message. Before
+`ExecutionEngine.submit` (`app/trading/execution.py`) ever calls
+`place_order`, the order has already been registered in
+`OrderManager.create_order` under its idempotency key
+(`app/trading/order_manager.py`) and transitioned to `SUBMITTED`. Neither
+`ExecutionEngine.submit` nor its callers (`POST /orders`, `POST
+/options/execute`) wrap that call in a `try`/`except`, so an uncaught
+`BrokerError` propagated all the way to FastAPI's generic exception
+handler — the client got a bare 500, with no order row ever persisted to
+Postgres and no notification. Worse, because the idempotency key was
+already mapped to this order *before* the broker call, retrying the exact
+same order (same user/symbol/direction/entry/stop) hit
+`create_order`'s `created=False` short-circuit and never called
+`place_order` again — the order was permanently stuck at `SUBMITTED` in
+the in-memory `OrderManager`, invisible in the database, un-retriable,
+until the process restarted.
+
+Fixed by adding an `except BrokerError` alongside the existing
+`except httpx.HTTPStatusError` in `place_order`, returning the same
+`OrderResult(status=REJECTED, rejection_reason=str(exc))` shape either
+way — this is exactly what `ExecutionEngine.submit` already knows how to
+handle (transitions the order to `REJECTED`, a legitimate terminal state
+for that idempotency key), and flows through the same `ORDER_REJECTED`
+notification/audit logic on `POST /orders`/`POST /options/execute` that a
+4xx-style rejection already used. The `Broker.place_order` abstract
+method's docstring now states this contract explicitly, since the sibling
+`DhanBroker` adapter is still a stub (`raise NotImplementedError` on every
+method) and will need the same care once implemented.
+
+New `tests/brokers/test_upstox_adapter.py::test_place_order_200_error_envelope_returns_rejected_result_not_an_exception`
+mocks a 200 response with an error-shaped body and asserts `place_order`
+returns a normal `REJECTED` `OrderResult` rather than raising. Verified to
+fail (with an unhandled `BrokerError`) against the pre-fix code and pass
+once the fix is restored.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

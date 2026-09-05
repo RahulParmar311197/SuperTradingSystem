@@ -96,7 +96,20 @@ class Broker(ABC):
     async def get_quote(self, symbol: str) -> Quote: ...
 
     @abstractmethod
-    async def place_order(self, request: OrderRequest) -> OrderResult: ...
+    async def place_order(self, request: OrderRequest) -> OrderResult:
+        """A broker-level rejection (bad margin, closed market, invalid
+        instrument, ...) must always be returned as
+        `OrderResult(status=OrderStatus.REJECTED, rejection_reason=...)`,
+        never raised as `BrokerError` or any other exception -- callers
+        (`ExecutionEngine.submit`) have no try/except around this call, and
+        the caller has already registered the order under its idempotency
+        key before calling, so an uncaught exception here both 500s the
+        request and permanently wedges the order (a retry with the same
+        order params short-circuits on the idempotency key and never calls
+        this method again). This applies equally to a rejection surfaced as
+        an HTTP 4xx/5xx *and* one surfaced as an HTTP 200 with an
+        error-shaped body -- catch both."""
+        ...
 
     @abstractmethod
     async def modify_order(self, broker_order_id: str, **changes) -> OrderResult: ...

@@ -190,6 +190,31 @@ async def test_place_order_rejection_returns_rejected_result_not_an_exception():
 
 
 @pytest.mark.asyncio
+async def test_place_order_200_error_envelope_returns_rejected_result_not_an_exception():
+    # Regression test: Upstox (like most broker APIs) can return HTTP 200
+    # with a {"status": "error", ...} body for an ordinary validation
+    # failure -- `_unwrap` turns that into a raised BrokerError, and
+    # place_order's except clause used to only catch httpx.HTTPStatusError,
+    # so this shape propagated out uncaught. Callers (ExecutionEngine.submit,
+    # then POST /orders / /options/execute) have no try/except around
+    # place_order, so an uncaught exception here would both 500 the request
+    # and permanently wedge the order: OrderManager.create_order already
+    # registered it under its idempotency key before this call, so a retry
+    # with the same order params short-circuits with created=False and
+    # never calls place_order again.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response(200, {"status": "error", "errors": [{"message": "Insufficient margin"}]})
+
+    broker = _broker_with_transport(handler)
+    result = await broker.place_order(
+        OrderRequest(idempotency_key="k1", symbol="NSE_EQ|X", direction=Direction.LONG, order_type=OrderType.MARKET, quantity=10)
+    )
+
+    assert result.status == OrderStatus.REJECTED
+    assert "Insufficient margin" in result.rejection_reason
+
+
+@pytest.mark.asyncio
 async def test_cancel_order():
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "DELETE"

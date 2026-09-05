@@ -403,3 +403,68 @@ async def test_place_order_rejected_for_daily_loss_limit_notifies_distinctly(req
                 assert notifications[0].type == NotificationType.DAILY_LOSS_LIMIT
         finally:
             await _cleanup(user_id, instrument_id)
+
+
+async def test_daily_loss_limit_is_enforced_after_a_real_realized_loss(require_infra):
+    # Regression test: `_UserTradingStack.daily_pnl`/`weekly_pnl`
+    # (app/api/orders.py) were initialized to 0.0 and never updated
+    # anywhere else in the file -- unlike `PaperTradingEngine.daily_pnl`/
+    # `weekly_pnl` (app/paper/engine.py), which correctly accumulate
+    # realized P&L in `_maybe_exit`. That meant RiskEngine.evaluate's
+    # daily_loss_limit check (app/risk/engine.py) could never fail for this
+    # path -- proposal.daily_pnl was always 0 -- no matter how much the
+    # account actually lost. Unlike the two tests above, this places a real
+    # loss (no monkeypatching RiskEngine.evaluate) and confirms a
+    # subsequent order is genuinely rejected because of it.
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        async with async_session_factory() as db:
+            instrument = Instrument(
+                symbol=f"ORDDLR{uuid.uuid4().hex[:6].upper()}", exchange="NSE", market=MarketType.EQUITY, instrument_type="EQ"
+            )
+            db.add(instrument)
+            await db.commit()
+            await db.refresh(instrument)
+            instrument_id = instrument.id
+
+        try:
+            # Open a long position: risk_per_trade_pct=0.5% of a 100,000
+            # MockBroker balance / (100-95) stop distance -> 100 shares.
+            r = client.post(
+                "/orders",
+                json={"symbol": instrument.symbol, "direction": "LONG", "entry": 100.0, "stop": 95.0},
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+
+            # Close it at a steep loss: 100 shares * (100 - 50) = 5,000
+            # realized loss -- 5% of the 100,000 account balance, well past
+            # the default 2% daily limit. This order is itself evaluated
+            # *before* its own loss is realized, so it must still succeed.
+            r = client.post(
+                "/orders",
+                json={"symbol": instrument.symbol, "direction": "SHORT", "entry": 50.0, "stop": 55.0},
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+
+            # A third order must now be blocked by the daily loss limit --
+            # before the fix, stack.daily_pnl was still 0.0 here and this
+            # would have been approved.
+            r = client.post(
+                "/orders",
+                json={"symbol": instrument.symbol, "direction": "LONG", "entry": 100.0, "stop": 95.0},
+                headers=headers,
+            )
+            assert r.status_code == 403, r.text
+            assert "Daily loss" in r.text
+
+            async with async_session_factory() as db:
+                notifications = (
+                    await db.execute(select(Notification).where(Notification.user_id == user_id))
+                ).scalars().all()
+                assert any(n.type == NotificationType.DAILY_LOSS_LIMIT for n in notifications)
+        finally:
+            await _cleanup(user_id, instrument_id)

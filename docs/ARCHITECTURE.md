@@ -259,6 +259,70 @@ one.
   through — those live in `app/api/orders.py`'s in-memory `_STACKS`,
   which the `worker` process can never see.
 
+## A TOCTOU race in per-user trading stack creation
+
+`app/api/orders.py`'s `_stack_for(user, db)` is the lookup-or-create for a
+user's `_UserTradingStack` (its `OrderManager`/`PositionManager`/`RiskEngine`
+and resolved `Broker`) in the in-memory `_STACKS` registry described above.
+Before this fix it read:
+
+```python
+if user.id not in _STACKS:
+    broker = await resolve_broker(db, user)
+    _STACKS[user.id] = _UserTradingStack(broker)
+return _STACKS[user.id]
+```
+
+The check and the write straddle a real `await` — `resolve_broker` runs a
+`BrokerAccount` query against Postgres — with nothing serializing access in
+between. Two concurrent first calls for the same user (two browser tabs
+opening right after login, or a frontend firing `GET /positions` and
+`POST /orders` back to back) can both observe `user.id not in _STACKS` as
+`True` before either finishes resolving its broker. Each then builds its
+own `_UserTradingStack`; whichever write lands second silently replaces the
+first in the dict. If the first request had already placed an order through
+its (now-discarded) stack — the order itself is still correctly persisted
+to Postgres via `app.trading.persistence`, that part never depended on
+`_STACKS` — every subsequent call in that process resolves to the *second*
+stack's `OrderManager`/`PositionManager`, which never saw it. Since
+`GET /orders`, `GET /positions`, and `GET /portfolio` all read the in-memory
+managers rather than re-querying Postgres, that order becomes permanently
+invisible through the API for the rest of the process's life, and a later
+`POST /orders/{id}/cancel` on it 404s even though it genuinely exists in the
+database. This is the same class of bug as the ones already fixed for
+`/paper/*` and `/replay/*` (missing ownership checks) in that it's an
+in-memory-registry correctness gap invisible to any test that only exercises
+one request at a time — every existing test in `tests/api/test_orders.py`
+issues requests sequentially through a single `TestClient`, so none of them
+could have caught it.
+
+Fixed with standard double-checked locking, keyed per user so unrelated
+users' stack creation never blocks on each other:
+
+```python
+_STACK_LOCKS: dict[uuid.UUID, asyncio.Lock] = {}
+
+async def _stack_for(user: User, db: AsyncSession) -> _UserTradingStack:
+    if user.id not in _STACKS:
+        lock = _STACK_LOCKS.setdefault(user.id, asyncio.Lock())
+        async with lock:
+            if user.id not in _STACKS:
+                broker = await resolve_broker(db, user)
+                _STACKS[user.id] = _UserTradingStack(broker)
+    return _STACKS[user.id]
+```
+
+`dict.setdefault` for the lock itself needs no additional protection: plain
+dict access between two `await` points can't interleave within a single
+event loop, so two coroutines calling `setdefault` "concurrently" (i.e.
+back to back with no `await` in between) always agree on the same `Lock`
+instance. `tests/api/test_orders.py::test_concurrent_stack_for_calls_share_one_stack`
+proves the fix directly — it monkeypatches `resolve_broker` to sleep before
+resolving (widening the race window on demand rather than relying on timing
+luck) and asserts two concurrent `_stack_for` calls for the same user return
+the *same* stack object; reverting the lock reproduces the failure
+immediately (verified by hand before committing this fix).
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

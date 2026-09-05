@@ -609,6 +609,51 @@ tests: reverting the new `create_notification` calls reproduces the
 missing `TRADE_EXECUTED` row immediately (verified by hand before
 committing), failing four tests across both files.
 
+## A daily-loss-limit rejection looked like any other rejection (§63)
+
+`RiskEngine.evaluate` (`app/risk/engine.py`) already computes the daily
+loss check as its own named `RiskCheck("daily_loss_limit", daily_loss_pct
+< limits.max_daily_loss_pct, f"Daily loss {daily_loss_pct:.2f}% vs limit
+{limits.max_daily_loss_pct}%")`, one of eleven checks it evaluates in
+order. But `RiskDecisionResult` (`app/risk/limits.py`) only ever surfaced
+that as a single collapsed `reason` string (the first failed check's
+`detail` or `name`) — nothing preserved *which* check it was as a stable,
+matchable identity. `PaperTradingEngine.on_candle` then passed that bare
+string straight into `PaperTradeOutcome.risk_rejected_reason`, so by the
+time either caller (`app/api/paper.py`'s `feed_candle`,
+`app/workers/auto_trade_worker.py`'s `_process`) saw the rejection, there
+was no reliable way to tell a daily-loss-limit veto apart from a
+max-open-positions veto, a correlated-exposure veto, or a stale-market-data
+veto — every one fired the same generic `NotificationType.ORDER_REJECTED`.
+Blueprint §63 lists "Daily loss limit" as its own distinct notification
+event, separate from a generic order rejection; `DAILY_LOSS_LIMIT` sat
+unused in the enum the same way `BROKER_DISCONNECTED` and
+`eligible_for_auto_trading` once did.
+
+Fixed by adding `PaperTradeOutcome.risk_failed_check: str | None` — the
+failed check's `name` (e.g. `"daily_loss_limit"`), taken from
+`RiskDecisionResult.failed_checks[0].name` (a property that already
+existed) rather than parsing the free-text `reason`. Both call sites now
+pick `NotificationType.DAILY_LOSS_LIMIT` when `risk_failed_check ==
+"daily_loss_limit"`, falling back to `ORDER_REJECTED` for every other
+kind of veto — the same small-dict/ternary dispatch pattern already used
+for `SL_HIT`/`TP_HIT` a few sections above.
+`tests/api/test_paper.py::test_paper_trading_notifies_daily_loss_limit_distinctly`
+and `tests/workers/test_auto_trade_worker.py::test_supervisor_notifies_daily_loss_limit_distinctly`
+each monkeypatch `RiskEngine.evaluate` to return a rejection whose
+`checks` list contains a failed `RiskCheck("daily_loss_limit", ...)` (as
+opposed to the pre-existing generic-rejection tests, which pass an empty
+`checks` list and still correctly fall back to `ORDER_REJECTED`) and
+assert the resulting notification is `DAILY_LOSS_LIMIT` specifically.
+Reverting the dispatch logic in either call site reproduces the generic
+notification immediately (verified by hand before committing).
+
+Three `NotificationType` values remain unwired after this round:
+`SETUP_DETECTED`, `MARKET_DATA_STALE`, and `AUTO_TRADING_DISABLED` — each
+a different subsystem (scanner-side pattern detection, the market-data
+freshness halt path, and an auto-trading kill-switch respectively),
+deliberately left open for future rounds rather than folded into this fix.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

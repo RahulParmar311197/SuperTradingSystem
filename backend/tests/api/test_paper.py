@@ -15,7 +15,7 @@ from app.database.models.users import User, UserSession
 from app.database.session import async_session_factory
 from app.main import app
 from app.risk.engine import RiskEngine
-from app.risk.limits import RiskDecision, RiskDecisionResult
+from app.risk.limits import RiskCheck, RiskDecision, RiskDecisionResult
 
 pytestmark = pytest.mark.asyncio
 
@@ -334,5 +334,58 @@ async def test_paper_trading_notifies_on_risk_rejected_entry(require_infra, monk
                 ).scalars().all()
                 assert len(audits) >= 1
                 assert all(a.details["reason"] == "forced rejection for test" for a in audits)
+        finally:
+            await _cleanup([user_id], [strategy_id], instrument.id)
+
+
+async def test_paper_trading_notifies_daily_loss_limit_distinctly(require_infra, monkeypatch):
+    # Regression test: `RiskEngine.evaluate` already names the specific
+    # check that failed (a structured `RiskCheck("daily_loss_limit", ...)`
+    # among others), but `PaperTradingEngine.on_candle` used to collapse
+    # every rejection into the same free-text `risk_rejected_reason`, so
+    # `feed_candle` had no way to tell a daily-loss-limit rejection apart
+    # from any other kind of veto -- every one fired the same generic
+    # NotificationType.ORDER_REJECTED, even though blueprint §63 lists
+    # "Daily loss limit" as its own distinct notification event.
+    monkeypatch.setattr(
+        RiskEngine,
+        "evaluate",
+        lambda self, proposal: RiskDecisionResult(
+            RiskDecision.REJECT,
+            [RiskCheck("daily_loss_limit", False, "Daily loss 3.00% vs limit 2.0%")],
+            "Daily loss 3.00% vs limit 2.0%",
+        ),
+    )
+
+    with TestClient(app) as client:
+        token, user_id = await _register(client, "paperdailyloss")
+        headers = {"Authorization": f"Bearer {token}"}
+        instrument = await _make_instrument()
+        strategy_id = await _create_strategy(client, headers, instrument.symbol)
+
+        try:
+            r = client.post("/paper", json={"strategy_id": str(strategy_id), "symbol": instrument.symbol}, headers=headers)
+            assert r.status_code == 200, r.text
+            session_id = r.json()["session_id"]
+
+            start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
+            for i, (o, h, low, c) in enumerate(_SETUP):
+                ts = (start + timedelta(minutes=i)).isoformat()
+                r = client.post(
+                    f"/paper/{session_id}/candle",
+                    json={"timestamp": ts, "open": o, "high": h, "low": low, "close": c, "volume": 10},
+                    headers=headers,
+                )
+                assert r.status_code == 200, r.text
+
+            r = client.get(f"/paper/{session_id}", headers=headers)
+            assert r.json()["open_position"] is None
+
+            async with async_session_factory() as db:
+                notifications = (
+                    await db.execute(select(Notification).where(Notification.user_id == user_id))
+                ).scalars().all()
+                assert len(notifications) >= 1
+                assert all(n.type == NotificationType.DAILY_LOSS_LIMIT for n in notifications)
         finally:
             await _cleanup([user_id], [strategy_id], instrument.id)

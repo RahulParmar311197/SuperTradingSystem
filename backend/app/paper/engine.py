@@ -8,6 +8,7 @@ rejections are simulated by the underlying `MockBroker`).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 from app.brokers.mock import MockBroker
 from app.database.models.strategy import Direction
@@ -31,6 +32,13 @@ class PaperTradeOutcome:
     order_created: bool = False
     risk_rejected_reason: str | None = None
     closed_position_pnl: float | None = None
+    # Which side of the bracket actually closed the position -- `None` iff
+    # `closed_position_pnl` is also `None` (nothing closed this candle).
+    # `_maybe_exit` already knows this (it branches on it explicitly to
+    # pick `exit_price`); this just stops that answer from being thrown
+    # away, so callers can fire NotificationType.SL_HIT/TP_HIT (blueprint
+    # §63) instead of a generic POSITION_CLOSED for every exit.
+    exit_reason: Literal["stop_loss", "take_profit"] | None = None
 
 
 class PaperTradingEngine:
@@ -71,8 +79,8 @@ class PaperTradingEngine:
 
         position = self.position_manager.get(self.account_id, self.symbol)
         if position is not None and position.is_open:
-            closed_pnl = await self._maybe_exit(position, candle)
-            return PaperTradeOutcome(signal=None, closed_position_pnl=closed_pnl)
+            closed_pnl, exit_reason = await self._maybe_exit(position, candle)
+            return PaperTradeOutcome(signal=None, closed_position_pnl=closed_pnl, exit_reason=exit_reason)
 
         if len(self.candles) < 3:
             return PaperTradeOutcome(signal=None)
@@ -130,22 +138,27 @@ class PaperTradingEngine:
 
         return PaperTradeOutcome(signal=result, order_created=created)
 
-    async def _maybe_exit(self, position, candle: Candle) -> float | None:
+    async def _maybe_exit(self, position, candle: Candle) -> tuple[float | None, Literal["stop_loss", "take_profit"] | None]:
         is_long = position.is_long
         exit_price = None
+        exit_reason: Literal["stop_loss", "take_profit"] | None = None
         if is_long:
             if position.stop is not None and candle.low <= position.stop:
                 exit_price = position.stop
+                exit_reason = "stop_loss"
             elif position.target is not None and candle.high >= position.target:
                 exit_price = position.target
+                exit_reason = "take_profit"
         else:
             if position.stop is not None and candle.high >= position.stop:
                 exit_price = position.stop
+                exit_reason = "stop_loss"
             elif position.target is not None and candle.low <= position.target:
                 exit_price = position.target
+                exit_reason = "take_profit"
 
         if exit_price is None:
-            return None
+            return None, None
 
         realized_before = position.realized_pnl
         self.broker.set_quote(self.symbol, ltp=exit_price)
@@ -162,4 +175,4 @@ class PaperTradingEngine:
         pnl = position.realized_pnl - realized_before
         self.daily_pnl += pnl
         self.weekly_pnl += pnl
-        return pnl
+        return pnl, exit_reason

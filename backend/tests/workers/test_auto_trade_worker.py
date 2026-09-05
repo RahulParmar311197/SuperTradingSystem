@@ -160,6 +160,76 @@ async def test_supervisor_opens_and_journals_a_trade_end_to_end(db_instrument):
         assert float(trades[0].pnl) == pytest.approx(closed_pnl, rel=1e-6)
         assert trades[0].journal.get("symbol") == db_instrument.symbol
         assert len(notifications) == 1
+        # Regression: this dataset runs hard to target (see the comment on
+        # SETUP), so this must be TP_HIT specifically, not the generic
+        # POSITION_CLOSED every close used to fire regardless of which side
+        # of the bracket actually closed it.
+        assert notifications[0].type == NotificationType.TP_HIT
+    finally:
+        await _cleanup(user_id)
+
+
+async def test_supervisor_notifies_sl_hit_on_stop_loss_exit(db_instrument):
+    # Regression test: `_maybe_exit` always knew whether a position closed
+    # via stop or target -- it branches on exactly that to pick
+    # `exit_price` -- but that answer used to be thrown away, so a
+    # stop-loss exit fired the same generic POSITION_CLOSED notification as
+    # a take-profit exit. Mirror image of the dataset above: opens the same
+    # bullish setup, then reverses hard through the stop instead of running
+    # to target.
+    stop_loss_setup = [
+        (100, 100, 99, 100),
+        (100, 102, 100, 101),
+        (101, 103, 100, 102),
+        (102, 102, 97, 98),
+        (98, 99, 96, 97),
+        (97, 100, 96, 99),
+        (99, 108, 99, 107),
+        (107, 110, 106, 109),
+        (109, 109, 103, 104),  # retraces into the FVG -> entry
+        (104, 105, 90, 92),  # reverses hard through the stop
+    ]
+    start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
+    candles = [Candle(start + timedelta(minutes=i), o, h, l, c, 100) for i, (o, h, l, c) in enumerate(stop_loss_setup)]
+
+    async with async_session_factory() as db:
+        user = User(
+            id=uuid.uuid4(),
+            email=f"autotrade-slhit-{uuid.uuid4().hex[:8]}@example.com",
+            password_hash=hash_password("irrelevant123"),
+            name="Auto Trade SL Hit",
+            trading_permissions=[TradingPermission.AUTO_TRADE.value],
+            auto_trading_enabled=True,
+            auto_trading_risk_per_trade_pct=1.0,
+        )
+        db.add(user)
+        await db.flush()
+        strategy = StrategyRow(
+            user_id=user.id,
+            name="Bullish FVG retest",
+            definition={**STRATEGY_DEFINITION, "market": db_instrument.symbol},
+            is_active=True,
+            eligible_for_auto_trading=True,
+        )
+        db.add(strategy)
+        await db.commit()
+        user_id = user.id
+
+    try:
+        supervisor = AutoTradeSupervisor(timeframe="15m")
+        for i in range(len(candles)):
+            async with async_session_factory() as db:
+                await upsert_candles(db, db_instrument.id, "15m", [candles[i]])
+            await supervisor.run_once()
+
+        async with async_session_factory() as db:
+            trades = (await db.execute(select(TradeRow).where(TradeRow.user_id == user_id))).scalars().all()
+            notifications = (await db.execute(select(Notification).where(Notification.user_id == user_id))).scalars().all()
+
+        assert len(trades) == 1
+        assert float(trades[0].pnl) < 0.0
+        assert len(notifications) == 1
+        assert notifications[0].type == NotificationType.SL_HIT
     finally:
         await _cleanup(user_id)
 

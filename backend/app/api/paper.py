@@ -214,13 +214,23 @@ async def feed_candle(
             )
         )
         await db.commit()
+        # Blueprint §63 lists SL/TP hits as their own notification events,
+        # distinct from a generic "position closed" -- `_maybe_exit`
+        # already knows which bracket side fired; falls back to the
+        # generic type only if a position closed some other way this
+        # engine doesn't track (there currently isn't one, but nothing
+        # here should assume that stays true forever).
+        notification_type = {
+            "stop_loss": NotificationType.SL_HIT,
+            "take_profit": NotificationType.TP_HIT,
+        }.get(outcome.exit_reason, NotificationType.POSITION_CLOSED)
         await create_notification(
             db,
             user_id=user.id,
-            notification_type=NotificationType.POSITION_CLOSED,
+            notification_type=notification_type,
             title=f"{engine.symbol} paper trade closed",
             body=f"Realized P&L: {outcome.closed_position_pnl:.2f}",
-            data={"symbol": engine.symbol, "pnl": outcome.closed_position_pnl},
+            data={"symbol": engine.symbol, "pnl": outcome.closed_position_pnl, "exit_reason": outcome.exit_reason},
         )
         session.open_snapshot = None
         session.opened_at = None

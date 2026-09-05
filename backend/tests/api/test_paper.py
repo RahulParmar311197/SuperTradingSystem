@@ -210,6 +210,66 @@ async def test_paper_trading_persists_trade_and_notification_on_close(require_in
 
                 notification = (await db.execute(select(Notification).where(Notification.user_id == user_id))).scalar_one()
                 assert "paper trade closed" in notification.title
+                # Regression: this dataset runs hard to target (see the
+                # comment on _SETUP), so this must be TP_HIT specifically,
+                # not the generic POSITION_CLOSED every close used to fire
+                # regardless of which side of the bracket actually closed it.
+                assert notification.type == NotificationType.TP_HIT
+        finally:
+            await _cleanup([user_id], [strategy_id], instrument.id)
+
+
+async def test_paper_trading_notifies_sl_hit_on_stop_loss_exit(require_infra):
+    # Regression test: `_maybe_exit` always knew whether a position closed
+    # via stop or target -- it branches on exactly that to pick
+    # `exit_price` -- but that answer used to be thrown away, so a
+    # stop-loss exit fired the same generic POSITION_CLOSED notification
+    # as a take-profit exit. This dataset is the mirror image of the one
+    # above: it opens the same bullish setup, then reverses hard through
+    # the stop instead of running to target.
+    stop_loss_setup = [
+        (100, 100, 99, 100),
+        (100, 102, 100, 101),
+        (101, 103, 100, 102),
+        (102, 102, 97, 98),
+        (98, 99, 96, 97),
+        (97, 100, 96, 99),
+        (99, 108, 99, 107),
+        (107, 110, 106, 109),
+        (109, 109, 103, 104),  # retraces into the FVG -> entry
+        (104, 105, 90, 92),  # reverses hard through the stop
+    ]
+
+    with TestClient(app) as client:
+        token, user_id = await _register(client, "paperslhit")
+        headers = {"Authorization": f"Bearer {token}"}
+        instrument = await _make_instrument()
+        strategy_id = await _create_strategy(client, headers, instrument.symbol)
+
+        try:
+            r = client.post("/paper", json={"strategy_id": str(strategy_id), "symbol": instrument.symbol}, headers=headers)
+            assert r.status_code == 200, r.text
+            session_id = r.json()["session_id"]
+
+            start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
+            for i, (o, h, low, c) in enumerate(stop_loss_setup):
+                ts = (start + timedelta(minutes=i)).isoformat()
+                r = client.post(
+                    f"/paper/{session_id}/candle",
+                    json={"timestamp": ts, "open": o, "high": h, "low": low, "close": c, "volume": 10},
+                    headers=headers,
+                )
+                assert r.status_code == 200, r.text
+
+            r = client.get(f"/paper/{session_id}", headers=headers)
+            assert r.json()["open_position"] is None
+
+            async with async_session_factory() as db:
+                trade = (await db.execute(select(Trade).where(Trade.user_id == user_id))).scalar_one()
+                assert float(trade.pnl) < 0.0
+
+                notification = (await db.execute(select(Notification).where(Notification.user_id == user_id))).scalar_one()
+                assert notification.type == NotificationType.SL_HIT
         finally:
             await _cleanup([user_id], [strategy_id], instrument.id)
 

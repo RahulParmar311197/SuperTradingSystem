@@ -525,6 +525,53 @@ subsystems) — left for a future round rather than folded into this one, to
 keep this fix's diff and its tests focused on the single concrete case
 already reproduced above.
 
+## SL/TP hits fired a generic notification instead of their own (§63)
+
+`PaperTradingEngine._maybe_exit` (`app/paper/engine.py`) decides whether a
+candle closes an open position by branching explicitly on which side of
+the bracket the price crossed — a long's stop is `candle.low <= stop`, its
+target `candle.high >= target` (and the mirror image for a short). It
+*knows* which one fired to pick the right `exit_price` — that information
+just never left the function. `PaperTradeOutcome` only carried a bare
+`closed_position_pnl: float | None`, so both callers that consume it
+(`app/api/paper.py`'s `feed_candle`, `app/workers/auto_trade_worker.py`'s
+`_process`) always fired the same generic `NotificationType.POSITION_CLOSED`
+for every close, whether it was a stop-loss or a take-profit. A grep for
+`SL_HIT`/`TP_HIT` across `app/` before this fix turned up nothing but the
+two enum declarations — not just unwired, like `BROKER_DISCONNECTED` and
+`eligible_for_auto_trading` before them, but the underlying signal was
+computed and thrown away at the one place in the codebase that actually
+had the answer.
+
+Fixed by adding `PaperTradeOutcome.exit_reason: Literal["stop_loss",
+"take_profit"] | None`, having `_maybe_exit` return it alongside `pnl`
+(both are `None` together — nothing closed) and `on_candle` pass it
+through unchanged. Both call sites now pick
+`NotificationType.SL_HIT`/`TP_HIT` from a small dict keyed on
+`exit_reason`, falling back to `POSITION_CLOSED` only if `exit_reason` is
+`None` — which can't currently happen when `closed_position_pnl` is set,
+but the fallback costs nothing and doesn't assume that invariant holds
+forever.
+
+`tests/api/test_paper.py::test_paper_trading_notifies_sl_hit_on_stop_loss_exit`
+and `tests/workers/test_auto_trade_worker.py::test_supervisor_notifies_sl_hit_on_stop_loss_exit`
+are new: each is the mirror image of an existing "runs hard to target"
+dataset — same bullish FVG setup, but reversing hard through the stop
+instead — asserting a negative-P&L `Trade` row and an `SL_HIT` (not
+`POSITION_CLOSED`) notification. The existing take-profit end-to-end tests
+in both files were also strengthened to assert `TP_HIT` specifically.
+Reverting the fix (dropping `exit_reason` from the return value) reproduces
+the original generic notification immediately on both new tests (verified
+by hand before committing).
+
+Two of the six previously-flagged unwired `NotificationType` values
+(`SETUP_DETECTED`, `TRADE_EXECUTED`, `DAILY_LOSS_LIMIT`, `MARKET_DATA_STALE`,
+`AUTO_TRADING_DISABLED` are the remaining four) are resolved by this PR.
+The rest stay open for a future round — each spans a different subsystem
+(scanner-side detection, an order-fill completion event, the market-data
+freshness halt path, and an auto-trading kill-switch) and deliberately
+isn't folded into this fix.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

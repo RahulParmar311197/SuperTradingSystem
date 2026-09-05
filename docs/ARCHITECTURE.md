@@ -797,6 +797,51 @@ with real values for both starts normally. Reverting the validator
 reproduces the silent-boot behavior immediately (verified by hand before
 committing).
 
+## No way to log out (§69)
+
+Blueprint §69's Authentication list is `JWT access token / Refresh token /
+Password hashing / Session management / Device tracking`. The first three
+existed from early on; the last two didn't, despite `UserSession`
+(`app/database/models/users.py`) already carrying exactly the columns
+"session management" and "device tracking" need — `revoked`, `device_info`,
+`expires_at`. `revoked` was only ever set to `True` in one place:
+`auth_service.refresh()`, as a side effect of rotating a used refresh
+token. No user action — logging out, revoking a specific device, reacting
+to a suspected compromise — could set it. A stolen refresh token, or a
+forgotten logged-in shared computer, stayed valid until its multi-day
+natural expiry (`refresh_token_expire_days`) with zero self-service
+remediation. `device_info` was written at every login and never read back
+by anything — collected, but write-only, making "device tracking" nothing
+more than an unused column.
+
+Fixed by adding three endpoints to `app/api/auth.py`:
+- **`POST /auth/logout`** — takes a `refresh_token` (same shape as
+  `/auth/refresh`, deliberately with no bearer-auth dependency, since a
+  user whose access token already expired but whose refresh token is
+  still live must still be able to log out) and revokes the session it
+  maps to. Lenient by design: an already-revoked session, an already-
+  rotated-out token, or outright garbage all resolve to `204` rather than
+  an error — the caller wanted to be logged out, and after this call, they
+  are. Same "a kill switch must never be harder to reach" principle
+  already applied to `POST /auto-trading/disable`.
+- **`GET /auth/sessions`** — lists the caller's currently-active sessions
+  (not revoked, not expired), finally surfacing `device_info`. This is
+  the first code in the repository that ever reads that column back.
+- **`POST /auth/sessions/{id}/revoke`** — revokes a specific session by
+  id, ownership-checked the same way `/paper/*` and `/replay/*` sessions
+  are: a non-owner gets `404`, never a `403` that would confirm the
+  session exists at all.
+
+`tests/api/test_auth_sessions.py` proves: logging out actually invalidates
+the refresh token (a subsequent `/auth/refresh` with the same token
+returns `401`); logout is idempotent for an already-revoked session and
+tolerates a garbage token without raising; `GET /auth/sessions` reflects
+`device_info` and shrinks once a listed session is revoked; a non-owner
+revoking someone else's session gets `404` and the session stays
+un-revoked. Reverting `logout()`'s body to a no-op reproduces the original
+gap immediately — the refresh token keeps working after "logout" (verified
+by hand before committing).
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

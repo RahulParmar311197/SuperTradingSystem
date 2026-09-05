@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime
 
 from pydantic import BaseModel, EmailStr, Field
 
@@ -30,5 +31,14 @@ class UserResponse(BaseModel):
     name: str
     role: str
     trading_permissions: list[str]
+
+    model_config = {"from_attributes": True}
+
+
+class SessionResponse(BaseModel):
+    id: uuid.UUID
+    device_info: str | None
+    created_at: datetime
+    expires_at: datetime
 
     model_config = {"from_attributes": True}

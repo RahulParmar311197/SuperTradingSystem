@@ -31,6 +31,17 @@ class RiskLimits:
     market_data_max_staleness_seconds: float = 10.0
     max_repeated_rejections: int = 3
     max_price_jump_pct: float = 5.0
+    # A live order's `entry` is client-supplied and only used for position
+    # sizing / notional risk math -- the broker fills a MARKET order at its
+    # own real price, independent of it. Without a check tying the two
+    # together, a client could submit an `entry` deliberately close to
+    # `stop` to inflate the sized quantity (risk_amount / |entry - stop|)
+    # while the notional-based checks below, computed as quantity * entry,
+    # stay small because they use that same manipulated `entry` -- passing
+    # every exposure check even though the broker fills the real,
+    # much-larger quantity at the real market price. See
+    # TradeRiskProposal.entry_deviation_pct.
+    max_entry_deviation_pct: float = 1.0
 
 
 class RiskDecision(StrEnum):

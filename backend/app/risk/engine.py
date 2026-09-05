@@ -31,6 +31,12 @@ class TradeRiskProposal:
     broker_healthy: bool
     repeated_rejections: int = 0
     recent_price_jump_pct: float = 0.0
+    # Percent gap between the client-supplied `entry` and the broker's own
+    # real quote for this symbol, or 0.0 when there's nothing to compare
+    # against (e.g. no live quote yet). See RiskLimits.max_entry_deviation_pct
+    # for why this exists -- entry is otherwise trusted input that both
+    # sizes the position and, unchecked, sizes its own notional risk limits.
+    entry_deviation_pct: float = 0.0
     # Blueprint §85: notional of every *other* open position correlated
     # with this one at or above RiskLimits.correlation_threshold (see
     # app.risk.correlation.correlated_exposure) — this trade's own sized
@@ -74,6 +80,14 @@ class RiskEngine:
         checks.append(RiskCheck("valid_stop_distance", risk_per_unit > 0, "Entry and stop must differ"))
         if risk_per_unit <= 0:
             return RiskDecisionResult(RiskDecision.REJECT, checks, "Entry and stop must differ")
+
+        checks.append(
+            RiskCheck(
+                "entry_matches_market",
+                proposal.entry_deviation_pct <= limits.max_entry_deviation_pct,
+                f"Entry deviates {proposal.entry_deviation_pct:.2f}% from the real quote vs limit {limits.max_entry_deviation_pct}%",
+            )
+        )
 
         quantity = proposal.proposed_quantity
         if quantity is None:

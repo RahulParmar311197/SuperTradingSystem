@@ -10,6 +10,7 @@ process.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -41,13 +42,49 @@ async def _authenticate(websocket: WebSocket) -> User | None:
     return user
 
 
+async def _forward(websocket: WebSocket, channel: str) -> None:
+    async for message in subscribe(channel):
+        await websocket.send_json(message)
+
+
+async def _watch_for_disconnect(websocket: WebSocket) -> None:
+    # These channels are one-way broadcasts -- a client isn't expected to
+    # send anything, so any message that isn't a disconnect is just
+    # ignored. This is the only way to actually learn a client went away:
+    # the ASGI websocket protocol only delivers a disconnect (clean close
+    # *or* an abrupt drop -- a killed tab, a phone going to sleep, wifi
+    # loss) as a `websocket.disconnect` message on the *receive* side.
+    # `WebSocket.send()` only turns into `WebSocketDisconnect` after the
+    # *next* failed write, and `_forward` above can go arbitrarily long
+    # between publishes (a per-user channel like /ws/orders only publishes
+    # when that user places an order) -- without a concurrent receive loop,
+    # a client that disconnects between publishes left its server-side
+    # task and Redis pub/sub subscription running forever, since nothing
+    # else ever touches this connection (uvicorn's `connection_lost` closes
+    # the transport but never cancels the running ASGI application task).
+    while True:
+        message = await websocket.receive()
+        if message["type"] == "websocket.disconnect":
+            return
+
+
 async def _relay(websocket: WebSocket, channel: str) -> None:
     await websocket.accept()
+    forward_task = asyncio.ensure_future(_forward(websocket, channel))
+    watch_task = asyncio.ensure_future(_watch_for_disconnect(websocket))
     try:
-        async for message in subscribe(channel):
-            if websocket.application_state != WebSocketState.CONNECTED:
-                break
-            await websocket.send_json(message)
+        done, pending = await asyncio.wait({forward_task, watch_task}, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        for task in pending:
+            try:
+                await task
+            except (asyncio.CancelledError, WebSocketDisconnect):
+                pass
+        for task in done:
+            exc = task.exception()
+            if exc is not None and not isinstance(exc, WebSocketDisconnect):
+                raise exc
     except WebSocketDisconnect:
         pass
     finally:

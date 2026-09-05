@@ -15,6 +15,7 @@ from app.api import (
     brokers,
     charts,
     markets,
+    notifications,
     options,
     orders,
     paper,
@@ -98,6 +99,7 @@ app.include_router(brokers.router)
 app.include_router(auto_trading.router)
 app.include_router(trading_permissions.router)
 app.include_router(admin.router)
+app.include_router(notifications.router)
 app.include_router(websockets.router)
 
 

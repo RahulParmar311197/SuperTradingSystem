@@ -120,6 +120,25 @@ rows are `PAPER` for an account with no connected broker, and the new
 all before) proves `GET /portfolio` still reports real, non-zero exposure
 for such an account.
 
+## Notifications (§63, §104)
+
+`app.notifications.service.create_notification` is real, tested code
+called from real worker paths (`app/workers/reconciliation_worker.py`,
+`app/workers/auto_trade_worker.py`) — every reconciliation halt and every
+autonomous trade actually writes a `notifications` row. But there was no
+API endpoint anywhere to read them back: `app/main.py`'s router list
+included every other domain module except this one. The rows were real,
+persisted, and permanently unreachable by any client — a write-only
+table, the inverse of the "table exists, nothing writes to it" bug found
+repeatedly elsewhere this project.
+
+`GET /notifications` (optional `unread_only`) and `PATCH
+/notifications/{id}/read` (`app/api/notifications.py`, new) fix this,
+with the same ownership check every per-user resource in this codebase
+now gets: another user's notification 404s rather than 403ing.
+`tests/api/test_notifications.py` is new — this was, like several other
+fixes this project, completely without test coverage before.
+
 ## Portfolio snapshots (§9)
 
 `portfolio_snapshots` (balance/equity/exposure/net Greeks per account) was

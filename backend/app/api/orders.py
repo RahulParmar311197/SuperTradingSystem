@@ -12,12 +12,14 @@ from app.core.audit import record_audit
 from app.core.metrics import ORDER_COUNT, RISK_REJECTION_COUNT
 from app.core.redis import account_halt_reason, channel_name, get_price_age_seconds, publish
 from app.database.models.instruments import Instrument
+from app.database.models.notifications import NotificationType
 from app.database.models.risk import RiskDecision as RiskEventDecision
 from app.database.models.risk import RiskEvent
 from app.database.models.strategy import Direction
 from app.database.models.trading import ExecutionMode, OrderStatus, OrderType
 from app.database.models.users import TradingPermission, User
 from app.database.session import get_db
+from app.notifications.service import create_notification
 from app.risk.engine import RiskEngine, TradeRiskProposal, calculate_position_size
 from app.risk.limits import RiskLimits
 from app.risk.portfolio import compute_correlated_exposure
@@ -229,6 +231,28 @@ async def place_order(
 
     if not decision.approved:
         RISK_REJECTION_COUNT.inc()
+        # Blueprint §63 mandates "Order rejected"/"Daily loss limit"
+        # notifications -- the paper (app/api/paper.py) and autonomous
+        # (app/workers/auto_trade_worker.py) trading paths both already
+        # notify on a risk rejection; this, the one path that handles real
+        # broker money, used to only raise this HTTPException and write
+        # the RiskEvent row above -- nothing else in the system (another
+        # device, GET /notifications, an admin view) ever learned a live
+        # order was blocked.
+        failed_checks = decision.failed_checks
+        notification_type = (
+            NotificationType.DAILY_LOSS_LIMIT
+            if failed_checks and failed_checks[0].name == "daily_loss_limit"
+            else NotificationType.ORDER_REJECTED
+        )
+        await create_notification(
+            db,
+            user_id=user.id,
+            notification_type=notification_type,
+            title=f"{payload.symbol} order rejected",
+            body=decision.reason or "Risk engine rejected this trade",
+            data={"symbol": payload.symbol, "reason": decision.reason},
+        )
         raise HTTPException(status.HTTP_403_FORBIDDEN, f"Risk engine rejected this trade: {decision.reason}")
 
     quantity = calculate_position_size(

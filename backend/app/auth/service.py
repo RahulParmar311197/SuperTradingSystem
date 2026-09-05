@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.security import (
@@ -85,12 +85,39 @@ async def refresh(db: AsyncSession, refresh_token: str) -> tuple[str, str]:
 
     result = await db.execute(select(UserSession).where(UserSession.id == uuid.UUID(session_id)))
     session = result.scalar_one_or_none()
-    if (
-        session is None
-        or session.revoked
-        or session.refresh_token_hash != hash_token(refresh_token)
-        or session.expires_at < datetime.now(timezone.utc)
-    ):
+    token_matches = session is not None and session.refresh_token_hash == hash_token(refresh_token)
+
+    if token_matches and session.revoked:
+        # Reuse of a refresh token that already rotated (or was logged
+        # out) is the textbook signal that it was stolen: a legitimate
+        # client and a thief racing to use the same token, or a thief
+        # replaying one whose legitimate owner already moved past it. The
+        # whole reason self-service session revocation (blueprint §69)
+        # exists is a stolen token getting real remediation -- but that
+        # only helps if the legitimate user notices, and this exact,
+        # matching, already-used token being presented again was
+        # previously treated as an ordinary "invalid token" error with no
+        # side effect at all: no revocation of whatever session the
+        # rotation produced, no audit trail, nothing. Contain it the same
+        # way a user hitting the kill switch would: revoke every active
+        # session for this user (not just the one this token names -- the
+        # rotated-to session it's not linked to at all) so a thief's live
+        # access/refresh pair is cut off too, and log it so this is a
+        # visible incident instead of a silent no-op.
+        await db.execute(
+            update(UserSession).where(UserSession.user_id == session.user_id, UserSession.revoked.is_(False)).values(revoked=True)
+        )
+        await record_audit(
+            db,
+            actor="system",
+            action="auth.refresh_token_reuse_detected",
+            user_id=session.user_id,
+            details={"session_id": str(session.id)},
+        )
+        await db.commit()
+        raise AuthError("Refresh token is no longer valid")
+
+    if session is None or session.revoked or not token_matches or session.expires_at < datetime.now(timezone.utc):
         raise AuthError("Refresh token is no longer valid")
 
     user = await get_user_by_id(db, uuid.UUID(user_id))

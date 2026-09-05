@@ -1639,6 +1639,67 @@ out against the pre-fix code (proving the leak) and passes, completing
 almost immediately with the subscription cleaned up, once the fix is
 restored.
 
+## Refresh-token reuse was never detected — a stolen token got a full rotation, silently (§69)
+
+`app/auth/service.py`'s `refresh()` correctly implements token *rotation*:
+every call revokes the presented session and issues a brand-new
+session/refresh-token pair (`_issue_tokens`, minting a fresh, unrelated
+`session_id`). But rotation is only half of the standard refresh-token
+security model. The other half — reuse *detection* — didn't exist: an
+already-rotated-out (or already-logged-out) refresh token being presented
+again fell into the exact same generic branch as a garbage/forged token or
+one that had simply expired:
+
+```python
+if (session is None or session.revoked or session.refresh_token_hash != hash_token(refresh_token)
+        or session.expires_at < datetime.now(timezone.utc)):
+    raise AuthError("Refresh token is no longer valid")
+```
+
+Presenting a refresh token that matches a session's stored hash *exactly*
+but is already marked `revoked` is not an ordinary error — it's the
+textbook signature of a stolen token: the legitimate client and a thief
+raced to use the same token, and whichever lost gets exactly this error.
+Before this fix, that signal was silently swallowed: no revocation of
+whatever session the earlier rotation produced (nothing even links back to
+it — `UserSession` has no lineage field at all), no `record_audit` call
+(unlike `login()`, which logs `login.failed`, `refresh()` never called
+`record_audit` on any branch, success or failure), and no notification.
+Blueprint §69's whole justification for adding self-service session
+management (`POST /auth/logout`, `POST /auth/sessions/{id}/revoke` — see
+"No way to log out" earlier in this document) was that a stolen refresh
+token "stayed valid until its multi-day natural expiry with no
+self-service remediation" — but that remediation only helps if the
+legitimate user notices something is wrong, and reuse detection is exactly
+the mechanism that's supposed to surface that. Without it, a thief who
+steals a refresh token (a leaked log, XSS, a compromised device) and wins
+the race gets a fully valid, long-lived session running completely
+undetected, with zero audit trail anywhere an admin or the user could ever
+find it — for an account with live broker credentials and real money on
+the line.
+
+Fixed in `refresh()`: when the presented token's hash matches a session
+that's already `revoked`, that's treated as reuse rather than an ordinary
+invalid token. The response is the same containment a user hitting the
+kill switch would get — every currently-active session for that user is
+revoked in one `UPDATE` (not just the one this token names; the session
+the original rotation produced isn't linked to it at all, so revoking
+broadly is the only reliable way to cut off whichever side of the race
+actually has live tokens) — plus a `record_audit(actor="system",
+action="auth.refresh_token_reuse_detected", ...)` row, before raising the
+same `AuthError` the caller already saw for any other invalid-token case
+(no information leak about *why* it failed). A non-matching hash or a
+missing session still falls through to the ordinary error path unchanged,
+so a plain garbage/forged token never triggers this.
+
+New `tests/api/test_auth_sessions.py::test_refresh_token_reuse_revokes_every_session_and_audits`
+logs in, rotates once to get a second token, then replays the first
+(already-rotated-out) token — asserting the reuse is rejected, that the
+*second* token (produced by the legitimate rotation, with no link back to
+the first) is also dead afterward, that every session row for the user is
+`revoked`, and that matching `AuditLog` rows exist. Verified the test
+fails against the pre-fix code and passes once the fix is restored.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

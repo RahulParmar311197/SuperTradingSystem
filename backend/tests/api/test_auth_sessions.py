@@ -71,6 +71,51 @@ async def test_logout_is_idempotent_for_an_already_revoked_or_bogus_token(requir
             await _cleanup(user_id)
 
 
+async def test_refresh_token_reuse_revokes_every_session_and_audits(require_infra):
+    # Regression test: `refresh()` correctly rotates tokens (revokes the
+    # used session, issues a fresh pair), but presenting an
+    # already-rotated-out refresh token a second time -- the textbook
+    # signal that a token was stolen and raced against the legitimate
+    # client -- used to be treated as an ordinary invalid-token error with
+    # no side effect at all: the session the rotation produced stayed
+    # live, and nothing was ever written anywhere (no AuditLog row), so a
+    # real compromise would go completely unnoticed and unremediated.
+    with TestClient(app) as client:
+        _, refresh_token_a, user_id = await _register_and_login(client, "refreshreuse")
+        try:
+            r = client.post("/auth/refresh", json={"refresh_token": refresh_token_a})
+            assert r.status_code == 200, r.text
+            refresh_token_b = r.json()["refresh_token"]
+
+            # Reusing the now-rotated-out token_a is the attack signature.
+            r = client.post("/auth/refresh", json={"refresh_token": refresh_token_a})
+            assert r.status_code == 401, r.text
+
+            # Containment: token_b (the session the legitimate rotation
+            # produced, with no link back to token_a at all) must also be
+            # dead now, not just token_a. Reusing it too is *itself* a
+            # second reuse of an already-revoked token -- caught by the
+            # same detection, hence two audit rows below, not one.
+            r = client.post("/auth/refresh", json={"refresh_token": refresh_token_b})
+            assert r.status_code == 401, r.text
+
+            async with async_session_factory() as db:
+                sessions = (await db.execute(select(UserSession).where(UserSession.user_id == user_id))).scalars().all()
+                assert len(sessions) >= 2
+                assert all(s.revoked for s in sessions)
+
+                audits = (
+                    await db.execute(
+                        select(AuditLog).where(
+                            AuditLog.user_id == user_id, AuditLog.action == "auth.refresh_token_reuse_detected"
+                        )
+                    )
+                ).scalars().all()
+                assert len(audits) == 2
+        finally:
+            await _cleanup(user_id)
+
+
 async def test_sessions_lists_device_info_and_revoke_removes_it(require_infra):
     # Regression test: UserSession.device_info has been written at every
     # login since the beginning, but nothing ever read it back --

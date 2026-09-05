@@ -69,6 +69,10 @@ class _UserTradingStack:
         self.trades_today = 0
         self.daily_pnl = 0.0
         self.weekly_pnl = 0.0
+        # Blueprint §57 "Repeated order rejection" -- consecutive
+        # broker-level rejections (see `place_order`'s update after each
+        # fresh order attempt below).
+        self.repeated_rejections = 0
         # Set on first `_roll_risk_window` call, not here -- `None` means
         # "no window established yet", so the first call never wrongly
         # resets a stack that was just created.
@@ -246,6 +250,7 @@ async def place_order(
         market_data_age_seconds=await get_price_age_seconds(payload.symbol) or 0.0,
         broker_healthy=await stack.broker.is_healthy(),
         correlated_exposure=correlated_exposure,
+        repeated_rejections=stack.repeated_rejections,
     )
     decision = stack.risk_engine.evaluate(proposal)
     db.add(
@@ -320,6 +325,14 @@ async def place_order(
         stack.trades_today += 1
 
     final_order = stack.order_manager.get(order.id)
+    if created:
+        # Blueprint §57 "Repeated order rejection" -- a run of consecutive
+        # broker-level rejections (insufficient margin, bad symbol, etc.,
+        # distinct from a risk-engine pre-trade REJECT, which never
+        # reaches the broker at all) trips `no_repeated_rejections` above
+        # on the next attempt. Reset on any order that actually executes,
+        # so a resolved issue doesn't permanently trip this.
+        stack.repeated_rejections = stack.repeated_rejections + 1 if final_order.status == OrderStatus.REJECTED else 0
     ORDER_COUNT.labels(final_order.status.value).inc()
 
     execution_mode = _execution_mode_for(stack)

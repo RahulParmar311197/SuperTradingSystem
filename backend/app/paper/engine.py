@@ -82,6 +82,10 @@ class PaperTradingEngine:
         self.trades_today = 0
         self.daily_pnl = 0.0
         self.weekly_pnl = 0.0
+        # Blueprint §57 "Repeated order rejection" -- consecutive
+        # broker-level rejections (see the update after each fresh order
+        # attempt in `on_candle` below).
+        self.repeated_rejections = 0
         # Set on first `_roll_risk_window` call, not here -- `None` means
         # "no window established yet", so the first candle never wrongly
         # resets a freshly constructed engine.
@@ -151,6 +155,7 @@ class PaperTradingEngine:
             strategy_allocation=0.0,
             market_data_age_seconds=0.0,
             broker_healthy=await self.broker.is_healthy(),
+            repeated_rejections=self.repeated_rejections,
         )
         decision = self.risk_engine.evaluate(proposal)
         if not decision.approved:
@@ -171,6 +176,10 @@ class PaperTradingEngine:
             self.order_manager.transition(order.id, OrderStatus.RISK_APPROVED)
             await self.execution_engine.submit(order.id)
             self.trades_today += 1
+            final_order = self.order_manager.get(order.id)
+            # See `_UserTradingStack`'s identical update in
+            # app/api/orders.py's `place_order` for why.
+            self.repeated_rejections = self.repeated_rejections + 1 if final_order.status == OrderStatus.REJECTED else 0
             new_position = self.position_manager.get(self.account_id, self.symbol)
             if new_position is not None:
                 new_position.stop = result.stop

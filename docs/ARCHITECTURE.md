@@ -1015,6 +1015,74 @@ too). Reverting either method to a no-op reproduces the original bug
 immediately — both new tests fail because the counters never zero out —
 confirmed by hand before restoring the fix.
 
+## The "repeated order rejection" circuit breaker never actually tripped (§57)
+
+Blueprint §57's system-level risk controls list five circuit breakers:
+market-data timeout, broker disconnect, unexpected price jump, repeated
+order rejection, and system error. `RiskEngine.evaluate`
+(`app/risk/engine.py`) already implements `no_repeated_rejections` as a
+real check —
+```python
+checks.append(
+    RiskCheck("no_repeated_rejections", proposal.repeated_rejections < limits.max_repeated_rejections)
+)
+```
+with a real threshold (`RiskLimits.max_repeated_rejections = 3`). But
+`TradeRiskProposal.repeated_rejections` defaults to `0`, and neither call
+site that constructs a `TradeRiskProposal` — `app/api/orders.py`'s
+`place_order` or `app/paper/engine.py`'s `on_candle` — ever set it to
+anything else. Since `0 < 3` is always true, this check could never fail,
+for live or paper trading, no matter how many times an account's orders
+in a row got rejected by the broker.
+
+This is a different flavor of "dead risk-check input" than the
+daily/weekly loss limit fixed earlier: `repeated_rejections` isn't about
+*risk-engine* rejections (a pre-trade `REJECT` decision never reaches the
+broker at all, and is already covered by every other check in this
+function) — it's meant to catch *broker-level* rejections (insufficient
+margin, a bad symbol, a stale/invalid session token) that happen after
+risk approval, inside `app/trading/execution.py`'s `ExecutionEngine.submit`,
+which sets `OrderStatus.REJECTED` when `broker.place_order()` comes back
+rejected. A run of these in a row is exactly the kind of "something is
+systematically wrong" signal blueprint §57 wants to trip a breaker on.
+
+Fixed by adding a `repeated_rejections` counter to both `_UserTradingStack`
+(`app/api/orders.py`) and `PaperTradingEngine` (`app/paper/engine.py`),
+mirroring the existing `trades_today`/`daily_pnl` pattern: read into the
+`TradeRiskProposal` before each attempt, then updated after a *freshly
+created* order (not a duplicate idempotent replay) finishes execution —
+incremented when the final status is `REJECTED`, reset to `0` on any
+order that actually executes. Resetting on success (rather than requiring
+manual intervention, unlike `KillSwitchState`) means a transient issue —
+a broker outage that later clears — doesn't permanently lock an account
+out once it's resolved.
+
+`tests/api/test_orders.py::test_repeated_broker_rejections_trip_the_circuit_breaker`
+uses `MockBroker.reject_probability = 1.0` (deliberately built into
+`MockBroker` for exactly this kind of deterministic test) to force 3
+consecutive real broker-level rejections through the actual `POST /orders`
+path, then confirms a 4th attempt is blocked by `no_repeated_rejections`
+before ever reaching the broker. `tests/paper/test_engine.py` adds two
+tests: `test_paper_engine_records_broker_rejections` proves a real broker
+rejection is reflected in the counter at all (the write side), and
+`test_paper_engine_enforces_repeated_rejections_limit` proves a
+pre-tripped counter actually blocks the next signal (the read side).
+Reverting either the read-side wiring (the `repeated_rejections=` proposal
+argument) or the write-side update reproduces the original bug
+immediately in the corresponding tests — confirmed by hand, both ways,
+before restoring the fix.
+
+**Known follow-up, deliberately not fixed here:** `no_abnormal_price_jump`
+has the identical shape of bug — `TradeRiskProposal.recent_price_jump_pct`
+also defaults to `0.0` and is never set by either call site, so it can
+never fail either. Unlike `repeated_rejections`, though, there is no
+existing rolling-price infrastructure to compute it from: `app/core/redis.py`
+tracks only the latest price and its age, not a previous tick to diff
+against. Fixing this properly needs a small addition (e.g. storing the
+previous tick alongside the latest one) rather than just wiring up data
+that already exists elsewhere, so it's left as a follow-up rather than
+folded into this fix.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

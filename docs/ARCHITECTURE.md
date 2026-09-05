@@ -1323,6 +1323,53 @@ wiring in `execute_options_strategy` reproduces the original bug
 immediately in all three tests — confirmed by hand, both independently,
 before restoring the fix.
 
+## Worker heartbeats flapped healthy/DOWN on perfectly healthy workers (§117)
+
+`app/core/redis.py`'s worker-heartbeat mechanism (blueprint §117
+"Workers 🟢") is a TTL'd Redis key each worker's loop refreshes on every
+pass — `GET /health`/`GET /admin/system-health` treat a missing key as
+that worker being down. The TTL (`_HEARTBEAT_TTL_SECONDS`) was `30`
+seconds. But every registered worker's `run()` loop —
+`ScannerWorker`/`AutoTradeSupervisor` (`app/workers/scanner_worker.py`,
+`app/workers/auto_trade_worker.py`, both constructed with
+`interval_seconds=60.0` in `app/workers/main.py`) and the live
+reconciliation loop (`app/trading/live_reconciliation.py`, `run()`
+defaulting to `interval_seconds=60.0` with no override anywhere) — calls
+`heartbeat()` exactly once per 60-second cycle: `run_once()`/reconcile,
+then `heartbeat(name)`, then `sleep(interval_seconds)`.
+
+30 seconds is shorter than 60 seconds. So the key expired roughly halfway
+through every single cycle, for every one of these three workers — not
+because anything was stuck or crashed, but because the TTL was simply
+set wrong relative to how often it actually gets refreshed. `worker_is_alive()`
+sawtoothed `True`→`False`→`True` forever on workers running exactly on
+schedule, making `GET /health` indistinguishable between "this worker
+crashed ten minutes ago" and "this worker is fine, it just refreshed 31
+seconds ago." Anything wired to this for alerting or a readiness probe
+would either page on every single cycle (unusable) or get tuned down
+until it stopped catching real crashes too (the standard alert-fatigue
+failure mode) — the exact opposite of what a liveness signal is for.
+`market_data`'s heartbeat wasn't affected — it refreshes per-tick, far
+more often than every 30 seconds, so its key never had the chance to
+expire between refreshes.
+
+Fixed by raising `_HEARTBEAT_TTL_SECONDS` to `90` — comfortably longer
+than the known 60-second interval, with margin for one slow pass, while
+still going stale (and reporting `DOWN`) within roughly one and a half
+cycles of an actually stuck or crashed loop. All three affected workers'
+intervals are hardcoded literals, not environment-configurable, so one
+shared constant is sufficient here — there's no scenario in this codebase
+today where a worker's own interval could outgrow this TTL without a code
+change alongside it.
+
+`tests/test_core_redis.py::test_heartbeat_ttl_exceeds_the_longest_worker_loop_interval`
+checks the actual Redis `TTL` on a freshly-set heartbeat key against the
+known 60-second interval, rather than sleeping through a real cycle in a
+test (which would either be too slow or too flaky to be worth writing).
+Reverting the constant back to `30` reproduces the original bug
+immediately — this test fails with `assert 30 > 60.0` — confirmed by hand
+before restoring the fix.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

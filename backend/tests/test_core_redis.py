@@ -74,6 +74,24 @@ async def test_worker_is_alive_only_after_a_heartbeat(require_infra):
     assert await worker_is_alive(name) is True
 
 
+async def test_heartbeat_ttl_exceeds_the_longest_worker_loop_interval(require_infra):
+    # Regression test: scanner_worker.py, auto_trade_worker.py, and
+    # live_reconciliation.py all refresh their heartbeat once per
+    # 60-second loop (interval_seconds=60.0). The TTL used to be 30s --
+    # shorter than that cadence -- so worker_is_alive() flapped False for
+    # roughly the back half of every cycle on a perfectly healthy worker,
+    # making GET /health/GET /admin/system-health indistinguishable from
+    # a real crash. Checked via the actual Redis TTL rather than sleeping
+    # through a real cycle in a test.
+    from app.core.redis import _HEARTBEAT_PREFIX, get_redis
+
+    name = f"ttlcheck-{uuid.uuid4().hex[:8]}"
+    await heartbeat(name)
+    ttl = await get_redis().ttl(f"{_HEARTBEAT_PREFIX}{name}")
+    longest_known_worker_interval_seconds = 60.0
+    assert ttl > longest_known_worker_interval_seconds
+
+
 async def test_list_halted_accounts_includes_only_currently_halted_ones(require_infra):
     account_a = f"halted-{uuid.uuid4().hex[:8]}"
     account_b = f"halted-{uuid.uuid4().hex[:8]}"

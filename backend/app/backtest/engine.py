@@ -81,7 +81,22 @@ class BacktestEngine:
                     ict=ict_context,
                 )
                 result = self.strategy_engine.evaluate(self.strategy, context)
-                if result.matched:
+                # A "retest" entry (fvg_retest/order_block_retest) names a
+                # price level inside a zone that formed in the past -- it
+                # matches the instant an unmitigated FVG/order block
+                # exists, not once price has actually traded there again
+                # (see app/strategy/engine.py's _resolve_entry_and_stop).
+                # Filling unconditionally at that level -- as this used to
+                # do -- opened a phantom position at a price the simulated
+                # market may never have offered on this candle at all,
+                # systematically distorting backtest P&L for every
+                # retest-style strategy. A real retest/limit order only
+                # fills once price actually trades through its level, so
+                # only open here when this candle's own [low, high] range
+                # contains `entry` -- for a market-entry strategy (entry ==
+                # candle.close) that's always true, so this changes nothing
+                # for that entry type.
+                if result.matched and candle.low <= result.entry <= candle.high:
                     open_trade = self._open_trade(result, candle, equity)
 
         return trades

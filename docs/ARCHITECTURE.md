@@ -1751,6 +1751,60 @@ both reusing the existing `stop_loss_setup` dataset and asserting
 Verified both fail against the pre-fix code and pass once the fix is
 restored.
 
+## The backtest engine filled "retest" entries at prices the market never traded (§46-48)
+
+`app/strategy/engine.py`'s `_resolve_entry_and_stop` computes a
+`fvg_retest`/`order_block_retest` entry as the zone's midpoint
+(`(gap.top + gap.bottom) / 2`) the moment an unmitigated FVG/order block
+exists (`evaluate_conditions` only checks "does one exist", via
+`smc.unmitigated_fvgs(...)`/`active_order_blocks(...)`) — not once price
+has actually traded back into it. That's by design at the strategy-engine
+layer: "unmitigated" genuinely means "not yet filled," and a fresh gap is
+unmitigated the instant it forms, before price has had any chance to
+retest it.
+
+The bug was one layer up, in `app/backtest/engine.py`'s `run`/`_open_trade`:
+it took `result.entry` from a matched signal and filled a simulated
+position there **unconditionally**, with no check that the current
+candle's own `[low, high]` range ever traded through that price. A
+"retest" entry is supposed to mean "wait for price to come back to this
+zone, then enter" — but the backtest engine matched and filled on the very
+candle the gap *formed*, at a price that candle may never have touched at
+all. Concretely, in this project's own `SETUP` test fixture, a bullish FVG
+forms on candle index 7 (traded range `[106, 110]`) with gap midpoint
+`103.0` — a price index 7's low of `106` never reaches — while the actual
+retest only happens one candle later, at index 8 (`range [103, 109]`,
+matching that dataset's own long-standing comment, `# retraces into the
+FVG -> entry`). The backtest engine opened the trade a full candle early,
+at an out-of-range phantom price, for every `fvg_retest`/
+`order_block_retest` strategy — a first-class, documented DSL entry
+style this platform is built around — silently distorting backtest P&L
+(wrong entry price, wrong entry timing, and since `stop`/`target` are
+computed relative to `entry`, wrong risk-reward too) for exactly the kind
+of strategy backtesting exists to validate before it's trusted for
+live/auto-trading. `app/paper/engine.py` and `app/replay/engine.py` are
+unaffected — both fill at the candle's actual `close`, a genuinely traded
+price, never at the zone's theoretical midpoint directly.
+
+Existing tests didn't catch this because they only ever asserted
+`trade.pnl > 0`/`trade.direction == "LONG"` on a dataset that still nets
+a profit regardless of which candle (or which of two nearby prices) the
+trade opened at, once price later rallies through the target.
+
+Fixed with a minimal, direction-agnostic guard in `BacktestEngine.run`:
+only call `_open_trade` when `candle.low <= result.entry <= candle.high`
+for the matching candle — otherwise keep waiting for a later candle to
+genuinely trade through the zone, the same way a real limit/retest order
+would sit unfilled. For the default market-entry type (`entry ==
+candle.close`), this check is always true, so it changes nothing for
+strategies that don't use a retest-style entry.
+
+New `tests/backtest/test_engine.py::test_backtest_only_fills_a_retest_entry_once_price_actually_trades_there`
+reuses the existing `SETUP` fixture and asserts the trade opens at
+candle index 8 (not 7) with `entry_price == 103.0` — the genuine retest,
+not the phantom one. Verified the test fails against the pre-fix code
+(it opens at index 7 instead) and passes once the fix is restored.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

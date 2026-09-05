@@ -1,3 +1,5 @@
+import pytest
+
 from app.backtest.cost_model import CostModel
 from app.backtest.engine import BacktestEngine
 from app.backtest.metrics import compute_metrics
@@ -43,6 +45,35 @@ def test_backtest_opens_and_closes_a_trade_on_target_hit():
     trade = trades[0]
     assert trade.direction == "LONG"
     assert trade.pnl > 0
+
+
+def test_backtest_only_fills_a_retest_entry_once_price_actually_trades_there():
+    # Regression test: `_resolve_entry_and_stop`'s `fvg_retest` (app/strategy/
+    # engine.py) computes the gap's midpoint as `entry` the instant an
+    # unmitigated FVG exists -- not once price has actually retraced into
+    # it. `_open_trade` used to fill unconditionally at that price even
+    # when the matching candle's own range never traded there at all: a
+    # phantom fill at a price the simulated market never offered.
+    #
+    # This dataset's bullish FVG forms on candle index 7 (SETUP[7] =
+    # (107, 110, 106, 109), traded range [106, 110]) from candles 5 and 7,
+    # giving entry = midpoint = 103.0 -- a price index 7 never traded (its
+    # low is 106). The genuine retest only happens on candle index 8
+    # ((109, 109, 103, 104), range [103, 109]) -- the dataset's own comment
+    # ("retraces into the FVG -> entry") already says so. Before the fix,
+    # the trade opened a full candle early, at index 7, at an
+    # out-of-range price.
+    candles = make_candles(SETUP)
+    engine = BacktestEngine(
+        _strategy(), starting_capital=100_000, cost_model=CostModel(brokerage_pct=0.0, slippage_pct=0.0, taxes_pct=0.0)
+    )
+
+    trades = engine.run(candles, symbol="TESTSYM")
+
+    assert len(trades) == 1
+    trade = trades[0]
+    assert trade.entry_price == pytest.approx(103.0)
+    assert trade.opened_at == candles[8].timestamp
 
 
 def test_costs_reduce_pnl_versus_zero_cost_baseline():

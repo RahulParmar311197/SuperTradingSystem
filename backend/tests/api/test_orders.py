@@ -508,3 +508,72 @@ async def test_user_trading_stack_resets_daily_and_weekly_counters_at_boundaries
     assert stack.trades_today == 0
     assert stack.daily_pnl == 0.0
     assert stack.weekly_pnl == 0.0
+
+
+async def test_repeated_broker_rejections_trip_the_circuit_breaker(require_infra):
+    # Regression test: RiskEngine.evaluate's `no_repeated_rejections` check
+    # (app/risk/engine.py, blueprint §57 "Repeated order rejection") reads
+    # `proposal.repeated_rejections`, but nothing ever set it -- it was
+    # always the TradeRiskProposal default of 0, so this check could never
+    # fail no matter how many times an account's orders were rejected by
+    # the broker in a row.
+    from app.api import orders as orders_module
+
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        async with async_session_factory() as db:
+            instrument = Instrument(
+                symbol=f"ORDRJ{uuid.uuid4().hex[:6].upper()}", exchange="NSE", market=MarketType.EQUITY, instrument_type="EQ"
+            )
+            db.add(instrument)
+            await db.commit()
+            await db.refresh(instrument)
+            instrument_id = instrument.id
+
+        try:
+            # First order builds this user's stack -- fetch it and force
+            # every subsequent broker submission to be rejected.
+            r = client.post(
+                "/orders",
+                json={"symbol": instrument.symbol, "direction": "LONG", "entry": 100.0, "stop": 95.0},
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+
+            stack = orders_module._STACKS[user_id]
+            stack.broker.reject_probability = 1.0
+
+            # 3 consecutive broker-rejected orders (distinct entry/stop so
+            # each gets its own idempotency key and actually attempts
+            # execution) -- default max_repeated_rejections is 3.
+            for entry in (101.0, 102.0, 103.0):
+                r = client.post(
+                    "/orders",
+                    json={"symbol": instrument.symbol, "direction": "LONG", "entry": entry, "stop": entry - 5},
+                    headers=headers,
+                )
+                assert r.status_code == 201, r.text
+                assert r.json()["status"] == "REJECTED"
+
+            # A 4th attempt must now be blocked by the risk engine before it
+            # ever reaches the broker -- before the fix, repeated_rejections
+            # was always 0 and this would have gone through to (and been
+            # rejected by) the broker again instead of being pre-emptively
+            # blocked.
+            r = client.post(
+                "/orders",
+                json={"symbol": instrument.symbol, "direction": "LONG", "entry": 104.0, "stop": 99.0},
+                headers=headers,
+            )
+            assert r.status_code == 403, r.text
+            assert "no_repeated_rejections" in r.text
+
+            async with async_session_factory() as db:
+                notifications = (
+                    await db.execute(select(Notification).where(Notification.user_id == user_id))
+                ).scalars().all()
+                assert any(n.type == NotificationType.ORDER_REJECTED for n in notifications)
+        finally:
+            await _cleanup(user_id, instrument_id)

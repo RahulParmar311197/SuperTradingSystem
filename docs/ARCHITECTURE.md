@@ -323,6 +323,58 @@ luck) and asserts two concurrent `_stack_for` calls for the same user return
 the *same* stack object; reverting the lock reproduces the failure
 immediately (verified by hand before committing this fix).
 
+## Autonomous trading kept running an edited strategy's *old* version
+
+`app/workers/auto_trade_worker.py`'s `AutoTradeSupervisor._process` caches
+one `PaperTradingEngine` per `(user_id, strategy_id, instrument_id)` in
+`self._engines`, built once from whatever `StrategyDefinition` existed at
+that moment. `run_once` re-fetches the `StrategyRow` and re-parses a fresh
+`StrategyDefinition` from its *current* `definition` column on every single
+pass — but `_process` only ever used that freshly-parsed object on a cache
+miss (`if engine is None`). On a cache hit, it was silently discarded, and
+`PaperTradingEngine.strategy` (set once in `__init__`, never reassigned
+anywhere in `app/paper/engine.py`) kept driving every future candle against
+whatever DSL existed the moment the engine was first built.
+
+Concretely: a user calls `PUT /strategies/{id}` to edit a strategy that's
+already running under auto-trading. This bumps `strategy_row.version` and
+rewrites `strategy_row.definition` in Postgres — but the already-running
+engine for that `(user, strategy, instrument)` key kept trading the *old*
+logic indefinitely, until the process happened to restart. Worse than
+simply stale: the `Trade` row journaled on close still stamped
+`strategy_version=strategy_row.version` — the *current*, edited version
+number — even though the trade was actually produced by the old DSL. The
+audit trail (`strategy_versions`, the whole point of blueprint §91's
+versioning table) pointed at the wrong definition, not just an outdated
+one. The same staleness applied to auto-trading risk limits
+(`risk_per_trade_pct`/`max_daily_loss_pct`/`max_trades_per_day`/
+`max_open_positions`, set via `POST /auto-trading/enable`): once an engine
+was built, those never refreshed either.
+
+This is the third instance of the same underlying pattern already fixed
+twice elsewhere in this project — a background worker and a manual/API
+code path (or, here, the worker's own re-fetch-vs-cache logic) diverging on
+which state is actually live. Fixed by tracking the strategy version each
+cached engine was last built or updated against
+(`self._engine_strategy_versions`) and, on a cache hit where the current
+`strategy_row.version` differs, swapping `engine.strategy` in place rather
+than discarding the fresh definition — deliberately *not* rebuilding the
+whole engine, since that would also reset its `MockBroker` balance and
+silently close out any currently open position. Risk limits are cheaper to
+get right: they're reconstructed from the user's current settings on every
+single pass, cache hit or not, since a plain `RiskLimits` dataclass swap has
+no state to lose.
+
+`tests/workers/test_auto_trade_worker.py::test_supervisor_picks_up_strategy_edited_after_engine_cached`
+proves the fix: it starts a strategy with a condition that can never match
+the test's bullish dataset (forcing a cache-building pass that produces no
+trade), edits the strategy in place to the real matching definition and
+bumps its version exactly like `PUT /strategies/{id}` would, then feeds the
+rest of the same dataset and asserts a trade still opens, closes, and is
+journaled with the *new* `strategy_version` — which is only possible if the
+already-cached engine actually picked up the edit. Reverting the fix
+reproduces the failure immediately (verified by hand before committing).
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

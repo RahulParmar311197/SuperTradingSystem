@@ -55,6 +55,7 @@ class AutoTradeSupervisor:
         self.timeframe = timeframe
         self.interval_seconds = interval_seconds
         self._engines: dict[tuple[str, str, str], PaperTradingEngine] = {}
+        self._engine_strategy_versions: dict[tuple[str, str, str], int] = {}
         self._opened_at: dict[tuple[str, str, str], datetime] = {}
         self._last_candle_seen: dict[tuple[str, str, str], datetime] = {}
 
@@ -115,6 +116,31 @@ class AutoTradeSupervisor:
                 ),
             )
             self._engines[key] = engine
+            self._engine_strategy_versions[key] = strategy_row.version
+        elif self._engine_strategy_versions.get(key) != strategy_row.version:
+            # The user edited this strategy (PUT /strategies/{id} bumps
+            # `version` and rewrites `definition`) since this engine was
+            # built. `PaperTradingEngine.strategy` is only ever read, never
+            # reassigned internally (see app/paper/engine.py), so without
+            # this the engine would keep evaluating every future candle
+            # against the *old* DSL indefinitely -- while the `Trade` row
+            # journaled below still stamped `strategy_row.version` (the
+            # *current* version), making the audit trail actively wrong,
+            # not just stale. Only swap the strategy definition in place;
+            # rebuilding the whole engine would also reset its `MockBroker`
+            # balance and discard any currently open position.
+            engine.strategy = strategy
+            self._engine_strategy_versions[key] = strategy_row.version
+
+        # Risk settings (`POST /auto-trading/enable`) aren't versioned like
+        # a strategy definition -- refresh them every pass so a change
+        # takes effect on this engine's very next candle instead of never.
+        engine.risk_engine.limits = RiskLimits(
+            risk_per_trade_pct=float(user.auto_trading_risk_per_trade_pct),
+            max_daily_loss_pct=float(user.auto_trading_daily_loss_limit_pct),
+            max_trades_per_day=user.auto_trading_max_trades_per_day,
+            max_open_positions=user.auto_trading_max_positions,
+        )
 
         candles = await get_candles(db, instrument.id, strategy.timeframe)
         if not candles:

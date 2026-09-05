@@ -160,3 +160,90 @@ async def test_supervisor_opens_and_journals_a_trade_end_to_end(db_instrument):
         assert len(notifications) == 1
     finally:
         await _cleanup(user_id)
+
+
+async def test_supervisor_picks_up_strategy_edited_after_engine_cached(db_instrument):
+    # Regression test: `_process` cached one `PaperTradingEngine` per
+    # (user, strategy, instrument) and only ever used the freshly re-parsed
+    # `StrategyDefinition` argument `if engine is None` -- on a cache hit it
+    # was silently discarded, so an engine kept evaluating every future
+    # candle against whatever DSL existed the moment it was first built,
+    # even after the user edited the strategy (PUT /strategies/{id} bumps
+    # `version` and rewrites `definition`). Prove the fix: start with a
+    # strategy that can never match this bullish dataset (requires a
+    # bearish setup), let the supervisor cache an engine against it on the
+    # first candle, then edit the strategy in place to the real bullish
+    # definition and bump its version -- the rest of the same dataset
+    # should still open and close a trade, which is only possible if the
+    # cached engine actually picked up the edit.
+    start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
+    candles = [Candle(start + timedelta(minutes=i), o, h, l, c, 100) for i, (o, h, l, c) in enumerate(SETUP)]
+
+    unmatchable_definition = {
+        **STRATEGY_DEFINITION,
+        "market": db_instrument.symbol,
+        "direction": "bearish",
+        "conditions": [{"type": "fvg", "direction": "bearish"}],
+    }
+
+    async with async_session_factory() as db:
+        user = User(
+            id=uuid.uuid4(),
+            email=f"autotrade-edit-{uuid.uuid4().hex[:8]}@example.com",
+            password_hash=hash_password("irrelevant123"),
+            name="Auto Trade Edited Strategy",
+            trading_permissions=[TradingPermission.AUTO_TRADE.value],
+            auto_trading_enabled=True,
+            auto_trading_risk_per_trade_pct=1.0,
+        )
+        db.add(user)
+        await db.flush()
+        strategy = StrategyRow(
+            user_id=user.id,
+            name="Bullish FVG retest",
+            definition=unmatchable_definition,
+            is_active=True,
+            eligible_for_auto_trading=True,
+        )
+        db.add(strategy)
+        await db.commit()
+        user_id = user.id
+        strategy_id = strategy.id
+
+    try:
+        supervisor = AutoTradeSupervisor(timeframe="15m")
+
+        # First candle: caches an engine bound to the unmatchable strategy.
+        async with async_session_factory() as db:
+            await upsert_candles(db, db_instrument.id, "15m", [candles[0]])
+        await supervisor.run_once()
+        assert (str(user_id), str(strategy_id), str(db_instrument.id)) in supervisor._engines
+
+        # The user edits the strategy to the real, matchable definition.
+        async with async_session_factory() as db:
+            strategy_row = await db.get(StrategyRow, strategy_id)
+            strategy_row.definition = {**STRATEGY_DEFINITION, "market": db_instrument.symbol}
+            strategy_row.version = 2
+            await db.commit()
+
+        opened = False
+        closed_pnl = None
+        for i in range(1, len(candles)):
+            async with async_session_factory() as db:
+                await upsert_candles(db, db_instrument.id, "15m", [candles[i]])
+            results = await supervisor.run_once()
+            for r in results:
+                if r["user_id"] == str(user_id):
+                    opened = opened or r["order_created"]
+                    if r["closed_pnl"] is not None:
+                        closed_pnl = r["closed_pnl"]
+
+        assert opened is True
+        assert closed_pnl is not None and closed_pnl > 0
+
+        async with async_session_factory() as db:
+            trades = (await db.execute(select(TradeRow).where(TradeRow.user_id == user_id))).scalars().all()
+        assert len(trades) == 1
+        assert trades[0].strategy_version == 2
+    finally:
+        await _cleanup(user_id)

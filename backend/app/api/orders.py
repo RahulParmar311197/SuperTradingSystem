@@ -304,6 +304,13 @@ async def place_order(
         position_row = await persist_position(db, user.id, instrument.id, position_after, execution_mode=execution_mode)
         realized_delta = position_after.realized_pnl - realized_pnl_before
         if realized_delta != 0 and position_before is not None:
+            # Mirrors PaperTradingEngine._maybe_exit (app/paper/engine.py) --
+            # without this, stack.daily_pnl/weekly_pnl stay 0.0 forever, and
+            # RiskEngine.evaluate's daily_loss_limit/weekly_loss_limit checks
+            # (app/risk/engine.py) can never fail for this path no matter how
+            # much the account has actually lost.
+            stack.daily_pnl += realized_delta
+            stack.weekly_pnl += realized_delta
             await record_trade(
                 db,
                 user_id=user.id,

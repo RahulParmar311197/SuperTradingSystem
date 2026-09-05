@@ -900,6 +900,65 @@ end-to-end. Reverting the `OrderRow(...)` construction to drop
 test fails with a `NULL` mismatch — confirmed by hand before restoring
 the fix.
 
+## The daily/weekly loss limit never actually stopped live trading (§56-57)
+
+`_UserTradingStack` (`app/api/orders.py`), the per-user in-memory
+order/position/risk bundle behind the manual/live `POST /orders` path,
+initializes `daily_pnl` and `weekly_pnl` to `0.0` alongside `trades_today`.
+`trades_today` is correctly incremented on every new order. `daily_pnl`
+and `weekly_pnl` were not — nothing in the file ever assigned to them
+again. `place_order` already computes exactly the number needed:
+`realized_delta = position_after.realized_pnl - realized_pnl_before`,
+used purely to decide whether to journal a `Trade` row, then discarded.
+
+The consequence: `RiskEngine.evaluate` (`app/risk/engine.py`) computes
+`daily_loss_pct = max(-proposal.daily_pnl, 0) / proposal.account_balance
+* 100` and rejects the trade when that exceeds `max_daily_loss_pct`
+(default 2%) — the account's core stop-trading safety control. Since
+`proposal.daily_pnl` was always `0.0` for every call from `POST /orders`,
+`daily_loss_pct` was always `0`, which always passed. The same held for
+`weekly_loss_limit`. However badly a user's live-connected account lost
+money in a day, the one path that talks to a real broker would never stop
+placing new orders because of it — the exact opposite of what a "daily
+loss limit" is for.
+
+This is a straightforward gap rather than a design choice:
+`PaperTradingEngine` (`app/paper/engine.py`), which backs `/paper/*` and
+autonomous trading, already does this correctly in `_maybe_exit`:
+```python
+pnl = position.realized_pnl - realized_before
+self.daily_pnl += pnl
+self.weekly_pnl += pnl
+```
+`app/api/orders.py`'s `place_order` never had the equivalent two lines.
+It went unnoticed because the existing daily-loss-limit test
+(`test_place_order_rejected_for_daily_loss_limit_notifies_distinctly`)
+monkeypatches `RiskEngine.evaluate` directly to force a rejection, so it
+exercises the notification-dispatch logic built on top of this bookkeeping
+without ever exercising the bookkeeping itself.
+
+Fixed by accumulating `realized_delta` into `stack.daily_pnl` and
+`stack.weekly_pnl` in `place_order`, right where it already computes
+`realized_delta` for the trade-journal decision — mirroring
+`PaperTradingEngine._maybe_exit` exactly. New test
+`test_daily_loss_limit_is_enforced_after_a_real_realized_loss` in
+`tests/api/test_orders.py` places a real loss (no monkeypatching) — open
+a long position, close it at a price far enough away to realize a loss
+past the 2% default limit — and confirms a subsequent order is genuinely
+rejected with a `DAILY_LOSS_LIMIT` notification. Reverting the two-line
+fix reproduces the original bug immediately: this new test fails because
+the third order is approved instead of rejected — confirmed by hand
+before restoring the fix.
+
+Note this fix does not add calendar-boundary resets for `daily_pnl`/
+`weekly_pnl` — neither `_UserTradingStack` nor `PaperTradingEngine` reset
+these counters at day/week boundaries today, since both are in-memory
+structures whose lifetime in the current single-process deployment
+roughly matches a trading session. A production deployment that keeps a
+process alive across midnight would need that reset logic added to both
+places identically; tracked as a follow-up, not folded into this fix so
+as to keep it scoped to restoring parity between the two paths.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

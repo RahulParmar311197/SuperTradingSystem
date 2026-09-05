@@ -1805,6 +1805,50 @@ candle index 8 (not 7) with `entry_price == 103.0` — the genuine retest,
 not the phantom one. Verified the test fails against the pre-fix code
 (it opens at index 7 instead) and passes once the fix is restored.
 
+## `ScannerWorker` wrote a fresh `Signal` row and re-published to `/ws/signals` on every pass a match stayed valid (§28-29, §66)
+
+`ScannerWorker._persist_new_setups` (raw SMC pattern detections, blueprint
+§9's `setups` table) already dedups correctly: it explicitly reads back
+existing `(setup_type, detected_at)` pairs before inserting, so re-scanning
+the same historical candles on every pass never duplicates a row. Its
+sibling `_evaluate` — the function that turns a strategy match into a
+`Signal` row and a `/ws/signals` publish — had no such guard at all: every
+single pass where `outcome.matched` was `True` unconditionally wrote a new
+`Signal` and re-published, with zero check for "have I already recorded
+this exact match."
+
+That matters because `ScannerWorker` runs on a fixed wall-clock cadence
+(`interval_seconds=60.0` in production, `app/workers/main.py`) against a
+candle timeframe that changes far less often (`timeframe="15m"`) — the
+same closed candle set gets re-evaluated roughly 15 times before the next
+candle even closes. Many strategy conditions stay satisfied for as long as
+the underlying structure persists — `{"type": "fvg", "direction":
+"bullish"}` (checked via `smc.unmitigated_fvgs(...)`) is true for as long
+as that gap remains unfilled, often many bars. So one genuine trading
+setup wrote a fresh, near-identical `Signal` row and fired a fresh
+`/ws/signals` event on every single pass for as long as it stayed
+valid — flooding `GET /signals`'s 200-row window (potentially pushing
+genuinely distinct, older signals out of it entirely) and spamming every
+connected client with the same "new signal" alert once a minute, training
+users to ignore exactly the notifications live scanning exists to
+surface.
+
+Fixed the same way `_persist_new_setups` already does it, adapted to
+`Signal`'s shape (which has no fixed `detected_at` the way a raw SMC event
+does — a signal's "identity" is its computed trade parameters): before
+writing, `_evaluate` now reads back the most recent `Signal` for this
+`(instrument_id, strategy_id)` pair and skips the insert/publish when its
+`direction`/`entry`/`stop`/`target` are unchanged from the new match — the
+zone actually shifting (a new gap, a different level) still writes a new
+row, since that's a genuinely new opportunity, not a repeat.
+
+New `tests/workers/test_scanner_worker.py::test_scanner_dedups_signals_across_passes`
+mirrors the existing `test_scanner_persists_setups_and_dedups_across_passes`
+test for `setups`: runs `run_once()` twice over the same unchanged candle
+history and asserts exactly one `Signal` row exists both times (the same
+row, by id). Verified it fails against the pre-fix code (a second row
+appears after the second pass) and passes once the fix is restored.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

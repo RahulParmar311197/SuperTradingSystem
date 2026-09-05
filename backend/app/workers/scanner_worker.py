@@ -149,6 +149,35 @@ class ScannerWorker:
                 logger.warning("Unrecognized strategy direction %r for instrument %s; skipping signal", outcome.direction, instrument.id)
                 return result if outcome.matched else None
 
+            # Same dedup problem `_persist_new_setups` above already
+            # solves for `setups`, left open here: this worker re-scans
+            # the same closed candles on every pass (interval_seconds=60
+            # vs a 15m timeframe means ~15 passes before the underlying
+            # data even changes), and a condition like "an unmitigated FVG
+            # exists" stays true for as long as that gap stays unfilled --
+            # often many passes. Without this check, one genuine setup
+            # wrote a fresh `Signal` row and re-published to /ws/signals
+            # every single pass for as long as it remained valid, flooding
+            # `GET /signals`'s 200-row window and spamming connected
+            # clients with the same "signal" repeatedly. Only the zone
+            # actually changing (a new entry/stop/target) is a genuinely
+            # new signal worth recording again.
+            latest_stmt = (
+                select(Signal)
+                .where(Signal.instrument_id == instrument.id, Signal.strategy_id == strategy_id)
+                .order_by(Signal.generated_at.desc())
+                .limit(1)
+            )
+            latest = (await db.execute(latest_stmt)).scalar_one_or_none()
+            if (
+                latest is not None
+                and latest.direction == trade_direction
+                and round(float(latest.entry), 6) == round(outcome.entry, 6)
+                and round(float(latest.stop), 6) == round(outcome.stop, 6)
+                and round(float(latest.target), 6) == round(outcome.target, 6)
+            ):
+                return result
+
             db.add(
                 Signal(
                     instrument_id=instrument.id,

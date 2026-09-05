@@ -94,6 +94,84 @@ async def test_scanner_finds_a_match_and_persists_a_signal(db_instrument):
             await db.commit()
 
 
+async def test_scanner_dedups_signals_across_passes(db_instrument):
+    # Regression test: unlike `_persist_new_setups` (see the dedup test
+    # below, for the sibling `setups` table), `_evaluate` wrote a brand
+    # new `Signal` row and re-published to /ws/signals on *every* scan
+    # pass a strategy continued to match -- with no dedup at all. In
+    # production this worker re-scans the same closed 15m candle set
+    # ~15 times per candle (interval_seconds=60 vs timeframe=15m,
+    # app/workers/main.py), and a condition like "an unmitigated FVG
+    # exists" stays true for as long as that gap remains unfilled --
+    # often many passes -- so one genuine setup flooded `GET /signals`
+    # and spammed connected clients with duplicate alerts every minute.
+    start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
+    candles = [Candle(start + timedelta(minutes=i), o, h, l, c, 100) for i, (o, h, l, c) in enumerate(SETUP)]
+
+    async with async_session_factory() as db:
+        user = User(
+            id=uuid.uuid4(),
+            email=f"scannerdedup-{uuid.uuid4().hex[:8]}@example.com",
+            password_hash=hash_password("irrelevant123"),
+            name="Scanner Dedup Test",
+        )
+        db.add(user)
+        await db.flush()
+
+        strategy = StrategyRow(
+            user_id=user.id,
+            name="Bullish FVG retest",
+            definition={
+                "name": "Bullish FVG retest",
+                "market": "TESTSYM",
+                "timeframe": "15m",
+                "direction": "bullish",
+                "conditions": [{"type": "fvg", "direction": "bullish"}],
+                "entry": {"type": "fvg_retest"},
+                "risk": {"risk_percent": 1.0, "minimum_rr": 2.0},
+            },
+            is_active=True,
+        )
+        db.add(strategy)
+        await db.commit()
+        strategy_id = strategy.id
+        user_id = user.id
+
+        await upsert_candles(db, db_instrument.id, "15m", candles)
+
+    try:
+        worker = ScannerWorker(timeframe="15m")
+        await worker.run_once()
+
+        async with async_session_factory() as db:
+            signals = (
+                await db.execute(
+                    select(SignalRow).where(SignalRow.instrument_id == db_instrument.id, SignalRow.strategy_id == strategy_id)
+                )
+            ).scalars().all()
+        assert len(signals) == 1
+        first_signal_id = signals[0].id
+
+        # A second pass over the same, unchanged candle history -- the
+        # gap is still unmitigated, so the strategy matches again -- must
+        # not write a second row for the same still-active setup.
+        await worker.run_once()
+        async with async_session_factory() as db:
+            signals_after = (
+                await db.execute(
+                    select(SignalRow).where(SignalRow.instrument_id == db_instrument.id, SignalRow.strategy_id == strategy_id)
+                )
+            ).scalars().all()
+        assert len(signals_after) == 1
+        assert signals_after[0].id == first_signal_id
+    finally:
+        async with async_session_factory() as db:
+            await db.execute(delete(SignalRow).where(SignalRow.strategy_id == strategy_id))
+            await db.execute(delete(StrategyRow).where(StrategyRow.id == strategy_id))
+            await db.execute(delete(User).where(User.id == user_id))
+            await db.commit()
+
+
 async def test_scanner_persists_setups_and_dedups_across_passes(db_instrument):
     # Regression test for the `setups` table (blueprint §9): raw SMC
     # detections behind a scan (structure breaks, FVGs, order blocks) had

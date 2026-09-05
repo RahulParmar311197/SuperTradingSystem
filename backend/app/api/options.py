@@ -240,6 +240,12 @@ async def execute_options_strategy(
     # endpoint permanently unusable rather than honestly degraded.
     liquidity_warnings: list[str] = []
     liquidity_acceptable = True
+    # Worst-case deviation across legs, not summed -- one leg's claimed
+    # premium being wildly off from the real market is already enough
+    # reason to reject the whole strategy (blueprint §56/§57's
+    # "entry_matches_market" precedent, extended here to options premiums:
+    # see RiskLimits.max_premium_deviation_pct).
+    premium_deviation_pct = 0.0
     for leg in payload.legs:
         snapshot = await _latest_option_snapshot(db, instruments[leg.symbol].id)
         if snapshot is None:
@@ -256,6 +262,11 @@ async def execute_options_strategy(
         if not assessment.acceptable:
             liquidity_acceptable = False
             liquidity_warnings.extend(f"{leg.symbol}: {r}" for r in assessment.rejections)
+        if snapshot.bid is not None and snapshot.ask is not None:
+            mid = (float(snapshot.bid) + float(snapshot.ask)) / 2
+            if mid:
+                deviation = abs(leg.premium - mid) / mid * 100
+                premium_deviation_pct = max(premium_deviation_pct, deviation)
 
     stack = await _stack_for(user, db)
     open_positions = stack.position_manager.open_positions(str(user.id))
@@ -268,6 +279,7 @@ async def execute_options_strategy(
         payoff=payoff,
         broker_healthy=await stack.broker.is_healthy(),
         liquidity_acceptable=liquidity_acceptable,
+        premium_deviation_pct=premium_deviation_pct,
     )
     decision = evaluate_options_risk(risk_proposal, limits=stack.risk_engine.limits)
     if not decision.approved:

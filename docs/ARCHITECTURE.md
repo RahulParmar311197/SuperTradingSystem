@@ -1273,6 +1273,56 @@ wiring `trigger_price` end-to-end so the broker holds the protective order
 natively — both larger, separate pieces of work than restoring the value
 this fix closes the gap on.
 
+## A forged options leg `premium` could launder an oversized order the same way `entry` could (§56-57)
+
+The same vulnerability as "A forged `entry` could launder an oversized
+live order past every notional risk check" above, reopened in a
+different endpoint that fix never touched: `POST /options/execute`.
+
+`ExecuteOptionLegRequest.premium` is fully client-controlled and feeds
+straight into `compute_payoff_summary` — `payoff.max_loss`/
+`capital_requirement`, which `evaluate_options_risk`'s `exposure_limit`
+check reads directly. Unlike `POST /orders`, an options leg's `quantity`
+isn't derived from any risk-sized formula either — it's independent
+client input — so a client could submit a large `quantity` and a
+premium far from reality (small for a long leg, large for a short one)
+and still show a small `max_loss`, clearing `exposure_limit`. On
+submission, a real broker fills the `MARKET` order at its own price,
+completely disconnected from the claimed `premium` — only `MockBroker`
+is seeded from it (`stack.broker.set_quote(leg.symbol, ltp=leg.premium)`),
+same as the `POST /orders` case.
+
+What made this one easy to miss: `execute_options_strategy` already
+fetches each leg's real `OptionSnapshot` (bid/ask) for the liquidity
+check — the data needed to catch this was already being pulled from the
+database on every call, then discarded once `evaluate_liquidity` was
+done with it, never compared against the claimed `premium`.
+
+Fixed the same way as the `entry` case: a new `OptionsRiskProposal.premium_deviation_pct`
+field (default `0.0`) and a `premium_matches_market` check in
+`evaluate_options_risk`, gated by a new `RiskLimits.max_premium_deviation_pct`
+(default `5.0%` — wider than `max_entry_deviation_pct`'s `1.0%`, since
+option premiums genuinely move more between quotes than an equity's last
+traded price). `execute_options_strategy`'s existing per-leg liquidity
+loop now also computes `abs(leg.premium - mid) / mid * 100` against each
+snapshot's bid/ask mid when both are present, tracking the *worst*
+deviation across all legs — one leg with a wildly wrong premium is
+reason enough to reject the whole strategy. When no leg has snapshot
+data (still the common case — no options-chain ingestion pipeline exists
+in this environment), the deviation stays `0.0`, a no-op, exactly
+mirroring the existing "warn, don't reject" treatment liquidity already
+gets for missing data.
+
+`tests/risk/test_options_risk.py` adds unit tests mirroring the `entry`
+case's: default no-op, and a 10% deviation rejected against the 5%
+default. `tests/api/test_options_execute.py::test_execute_rejects_when_premium_deviates_from_real_quote`
+seeds a real `OptionChainSnapshot`/`OptionContract`/`OptionSnapshot` with
+a known bid/ask and confirms `POST /options/execute` genuinely rejects a
+claimed premium far from that mid. Reverting either the check or its
+wiring in `execute_options_strategy` reproduces the original bug
+immediately in all three tests — confirmed by hand, both independently,
+before restoring the fix.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

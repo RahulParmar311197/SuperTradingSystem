@@ -42,6 +42,14 @@ class RiskLimits:
     # much-larger quantity at the real market price. See
     # TradeRiskProposal.entry_deviation_pct.
     max_entry_deviation_pct: float = 1.0
+    # Same idea as max_entry_deviation_pct, for POST /options/execute's
+    # per-leg `premium` -- also client-supplied, also only used for
+    # position sizing / payoff math (compute_payoff_summary), also
+    # ignored by a real broker filling a MARKET order at its own price.
+    # A wider default than max_entry_deviation_pct: option premiums are
+    # inherently more volatile between quotes than an equity's last
+    # traded price. See OptionsRiskProposal.premium_deviation_pct.
+    max_premium_deviation_pct: float = 5.0
 
 
 class RiskDecision(StrEnum):

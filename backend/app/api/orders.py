@@ -358,6 +358,18 @@ async def place_order(
 
     position_after = stack.position_manager.get(str(user.id), payload.symbol)
     if position_after is not None:
+        # A genuine fill actually happened on this call -- as opposed to
+        # `position_after` merely reflecting an existing position
+        # unchanged by a broker-rejected order (ExecutionEngine.submit
+        # never calls apply_fill when the broker rejects, see below).
+        just_filled = created and final_order.status in (
+            OrderStatus.FILLED,
+            OrderStatus.PARTIALLY_FILLED,
+            OrderStatus.MONITORING,
+        )
+        opened_or_added = (
+            just_filled and position_after.is_open and position_after.is_long == (payload.direction == Direction.LONG)
+        )
         if position_after.is_open and position_after.is_long == (payload.direction == Direction.LONG):
             # Blueprint §60: `payload.stop` is required input already used
             # to size this order (calculate_position_size) and by the risk
@@ -404,6 +416,37 @@ async def place_order(
                 target=position_before["target"],
                 position_id=position_row.id,
                 execution_mode=execution_mode,
+            )
+            # Blueprint §63/§104 list "Position closed" as a required
+            # notification event -- POST /orders is the one path that
+            # handles real broker money and used to notify only on
+            # rejection (see the create_notification call above), never
+            # on an actual fill. There's no live stop-loss/take-profit
+            # enforcement worker yet (see docs/ARCHITECTURE.md), so unlike
+            # PaperTradingEngine there's no exit_reason to distinguish
+            # SL_HIT/TP_HIT from an ordinary manual close -- every live
+            # close is POSITION_CLOSED.
+            await create_notification(
+                db,
+                user_id=user.id,
+                notification_type=NotificationType.POSITION_CLOSED,
+                title=f"{payload.symbol} position closed",
+                body=f"Realized P&L: {realized_delta:.2f}",
+                data={"symbol": payload.symbol, "pnl": realized_delta},
+            )
+        if opened_or_added:
+            # Same blueprint requirement, the open side -- fired once per
+            # order that actually filled and opened/added to/flipped into
+            # a position in payload.direction (never on a broker-rejected
+            # order, which leaves `position_after` reflecting whatever
+            # existed before this call, unchanged).
+            await create_notification(
+                db,
+                user_id=user.id,
+                notification_type=NotificationType.TRADE_EXECUTED,
+                title=f"{payload.symbol} order executed",
+                body=f"Opened {payload.direction.value} position in {payload.symbol}",
+                data={"symbol": payload.symbol, "direction": payload.direction.value},
             )
 
     await record_audit(

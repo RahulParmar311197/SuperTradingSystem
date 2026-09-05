@@ -134,6 +134,67 @@ async def test_execute_bull_call_spread_persists_both_legs(require_infra):
             await _cleanup(user_id, [long_leg.id, short_leg.id])
 
 
+async def test_execute_notifies_on_trade_executed_and_position_closed(require_infra):
+    # Regression test: `execute_options_strategy` only ever called
+    # `create_notification` on risk rejection -- a real fill that opens or
+    # closes a live position never notified at all, unlike
+    # app/api/paper.py and app/workers/auto_trade_worker.py, which both
+    # already fire TRADE_EXECUTED/POSITION_CLOSED for the identical event.
+    # This endpoint places real orders through the same broker/risk/
+    # persistence pipeline as POST /orders (its own docstring says so),
+    # so it needs the exact same parity fix.
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+        long_leg, short_leg = await _make_two_leg_instruments(f"NOTIF{uuid.uuid4().hex[:5].upper()}")
+
+        try:
+            r = client.post(
+                "/options/execute",
+                json={
+                    "strategy_name": "bull_call_spread",
+                    "legs": [
+                        {"symbol": long_leg.symbol, "direction": "LONG", "quantity": 1, "premium": 120.0},
+                        {"symbol": short_leg.symbol, "direction": "SHORT", "quantity": 1, "premium": 50.0},
+                    ],
+                },
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+
+            async with async_session_factory() as db:
+                notifications = (await db.execute(select(Notification).where(Notification.user_id == user_id))).scalars().all()
+            assert len(notifications) == 2
+            assert all(n.type == NotificationType.TRADE_EXECUTED for n in notifications)
+
+            # Close both legs with the exact reversal (a bear call spread,
+            # same defined-risk shape as the existing exit_price test) --
+            # each closing leg must fire its own POSITION_CLOSED.
+            r = client.post(
+                "/options/execute",
+                json={
+                    "strategy_name": "bull_call_spread_close",
+                    "legs": [
+                        {"symbol": long_leg.symbol, "direction": "SHORT", "quantity": 1, "premium": 125.0},
+                        {"symbol": short_leg.symbol, "direction": "LONG", "quantity": 1, "premium": 55.0},
+                    ],
+                },
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+
+            async with async_session_factory() as db:
+                notifications = (await db.execute(select(Notification).where(Notification.user_id == user_id))).scalars().all()
+            assert len(notifications) == 4
+            by_type = {}
+            for n in notifications:
+                by_type[n.type] = by_type.get(n.type, 0) + 1
+            assert by_type[NotificationType.TRADE_EXECUTED] == 2
+            assert by_type[NotificationType.POSITION_CLOSED] == 2
+        finally:
+            await _cleanup(user_id, [long_leg.id, short_leg.id])
+
+
 async def test_execute_rejects_empty_legs(require_infra):
     with TestClient(app) as client:
         token, user_id = await _register_and_grant_live_trade(client)

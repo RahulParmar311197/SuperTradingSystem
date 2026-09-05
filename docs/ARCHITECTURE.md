@@ -1954,6 +1954,76 @@ condition (no `resume_account` in between) and assert exactly one
 Verified both fail against the pre-fix code and pass once the fix is
 restored.
 
+## Missing TRADE_EXECUTED/POSITION_CLOSED notifications on live orders and options
+
+`POST /orders` and `POST /options/execute` are the two live-trading entry
+points, and both already notified the user when a *proposal was rejected*
+by the risk engine (`ORDER_REJECTED`, added in an earlier round). Neither
+one, however, ever created a `Notification` row when the order actually
+succeeded — an order that opened a new position, added to one, or closed
+one out silently updated the database and returned an HTTP response, with
+nothing appearing in `GET /notifications` or on any subscribed websocket
+channel. This was a real parity gap against the paper-trading and
+auto-trade paths (`app/api/paper.py`, `app/workers/auto_trade_worker.py`),
+which already fire `NotificationType.TRADE_EXECUTED` on entry and
+`POSITION_CLOSED` (or `SL_HIT`/`TP_HIT`) on exit — a user trading live
+capital was worse-informed than one running the paper simulator.
+
+Fixed by adding the same two notification sites to both live paths, using
+existing signals already computed in each handler rather than new state:
+
+- `app/api/orders.py`: `POST /orders` already computes `position_after`
+  (the position after this order settles) and `realized_delta` (nonzero
+  only when this order closed out or reduced an existing position). A new
+  `just_filled`/`opened_or_added` guard — identical in spirit to the one
+  already used elsewhere in this file to avoid mistaking a broker-rejected
+  order for a fill — distinguishes "this call actually opened or added to
+  a position" (`created and final_order.status in {FILLED,
+  PARTIALLY_FILLED, MONITORING}` and the resulting position is open in the
+  requested direction) from a same-direction order that the broker
+  rejected, which would otherwise still see `position_after` reflecting
+  the unchanged prior position and falsely look like a fill. `TRADE_EXECUTED`
+  fires when `opened_or_added` is true; `POSITION_CLOSED` fires whenever
+  `realized_delta != 0`, using the same `realized_delta` value already
+  used to update `daily_pnl`/`weekly_pnl` and to call `record_trade`, so
+  the notification body reports the same real fill price the journal
+  entry does (see the earlier fill-price-accuracy fix in this document).
+- `app/api/options.py`: `POST /options/execute` applies the identical
+  pair of checks per leg, using `leg.direction`/`leg.symbol` in place of
+  `payload.direction`/`payload.symbol`.
+
+There is deliberately no `SL_HIT`/`TP_HIT` distinction on either live
+path, unlike paper/auto-trade: those two notification types exist because
+the paper engine and auto-trade supervisor themselves evaluate stop-loss
+and take-profit levels bar-by-bar and know which one triggered a given
+exit. No equivalent live stop-loss/take-profit enforcement worker exists
+yet (a limitation already called out elsewhere in this document and in
+`docs/PRODUCTION_READINESS.md`) — every live position close, for whatever
+reason the caller closed it, is reported as the generic `POSITION_CLOSED`,
+which is accurate to what the system actually knows.
+
+New `tests/api/test_orders.py::test_live_order_notifies_on_trade_executed_and_position_closed`
+opens a LONG position (asserts exactly one `TRADE_EXECUTED` notification)
+and then closes it with an opposing SHORT order (asserts a second
+notification, `POSITION_CLOSED`, whose body contains the real realized
+P&L). New `tests/api/test_options_execute.py::test_execute_notifies_on_trade_executed_and_position_closed`
+does the equivalent for a two-leg bull call spread closed by its exact
+reversal (bear call spread), asserting two `TRADE_EXECUTED` notifications
+on open and two more (`POSITION_CLOSED`, one per leg) on close. Both were
+verified to fail against the pre-fix code and pass once the fix is
+restored.
+
+This change also exposed a latent gap in two unrelated, previously-passing
+tests: `tests/api/test_portfolio.py` and
+`tests/api/test_admin_portfolio_snapshot.py` both place a successful live
+order as part of their setup, and their `_cleanup()` helpers delete the
+test `User` row without first deleting any `Notification` rows for that
+user — harmless before this fix, since a successful order never wrote a
+notification, but a `notifications_user_id_fkey` foreign-key violation
+once it started doing so. Both cleanup helpers now delete `Notification`
+rows before deleting the `User` row, matching the ordering already used
+for every other FK-dependent table in those same helpers.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

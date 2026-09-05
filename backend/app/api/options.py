@@ -354,6 +354,18 @@ async def execute_options_strategy(
 
         position_after = stack.position_manager.get(str(user.id), leg.symbol)
         if position_after is not None:
+            # Same "did a real fill actually happen" guard as
+            # app/api/orders.py's place_order -- a broker-rejected leg
+            # leaves `position_after` reflecting whatever existed before
+            # this call, unchanged.
+            just_filled = created and final_order.status in (
+                OrderStatus.FILLED,
+                OrderStatus.PARTIALLY_FILLED,
+                OrderStatus.MONITORING,
+            )
+            opened_or_added = (
+                just_filled and position_after.is_open and position_after.is_long == (leg.direction == Direction.LONG)
+            )
             position_row = await persist_position(db, user.id, instrument.id, position_after, execution_mode=execution_mode)
             realized_delta = position_after.realized_pnl - realized_pnl_before
             if realized_delta != 0 and position_before is not None:
@@ -372,6 +384,28 @@ async def execute_options_strategy(
                     pnl=realized_delta,
                     position_id=position_row.id,
                     execution_mode=execution_mode,
+                )
+                # Blueprint §63/§104 parity with app/api/orders.py's
+                # identical fix -- this endpoint places real orders
+                # through the same broker/risk/persistence pipeline (its
+                # own docstring says so) but used to only notify on
+                # rejection, never on an actual closing fill.
+                await create_notification(
+                    db,
+                    user_id=user.id,
+                    notification_type=NotificationType.POSITION_CLOSED,
+                    title=f"{leg.symbol} position closed",
+                    body=f"Realized P&L: {realized_delta:.2f}",
+                    data={"symbol": leg.symbol, "pnl": realized_delta},
+                )
+            if opened_or_added:
+                await create_notification(
+                    db,
+                    user_id=user.id,
+                    notification_type=NotificationType.TRADE_EXECUTED,
+                    title=f"{leg.symbol} order executed",
+                    body=f"Opened {leg.direction.value} position in {leg.symbol}",
+                    data={"symbol": leg.symbol, "direction": leg.direction.value, "strategy_name": payload.strategy_name},
                 )
 
         await record_audit(

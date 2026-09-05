@@ -11,13 +11,24 @@ service) — an in-memory flag here would never be seen there.
 Resuming is deliberately NOT automatic: a mismatch means something needs a
 human look, so `resume_account` must be called explicitly (e.g. from an
 admin action) once the discrepancy is understood and resolved.
+
+Blueprint §74 "Broker Failure Handling" also covers the case a plain state
+*mismatch* doesn't: the broker being unreachable at all (expired/revoked
+token, network failure, an outage). `get_orders`/`get_positions` on a real
+adapter raise rather than return an empty/stale result in that case (see
+`UpstoxBroker._get`'s `response.raise_for_status()`, and the same
+`(BrokerError, httpx.HTTPError, NotImplementedError)` surface every
+adapter's own `is_healthy()` already treats as "not healthy") — that
+failure is caught below the same way a mismatch is: halt, audit, notify.
 """
 
 from __future__ import annotations
 
 import logging
 
-from app.brokers.base import Broker
+import httpx
+
+from app.brokers.base import Broker, BrokerError
 from app.core.audit import record_audit
 from app.core.redis import halt_account
 from app.database.models.notifications import NotificationType
@@ -46,8 +57,32 @@ class ReconciliationWorker:
         self.position_manager = position_manager
 
     async def run_once(self) -> ReconciliationReport:
-        broker_orders = await self.broker.get_orders()
-        broker_positions = await self.broker.get_positions()
+        try:
+            broker_orders = await self.broker.get_orders()
+            broker_positions = await self.broker.get_positions()
+        except (BrokerError, httpx.HTTPError, NotImplementedError) as exc:
+            reason = f"Broker unreachable during reconciliation: {exc}"
+            logger.warning("Reconciliation could not reach the broker for account %s: %s", self.account_id, exc)
+            await halt_account(self.account_id, reason)
+
+            async with async_session_factory() as db:
+                await record_audit(
+                    db,
+                    actor="system",
+                    action="reconciliation.broker_unreachable",
+                    user_id=self.user_id,
+                    details={"error": str(exc)},
+                )
+                await create_notification(
+                    db,
+                    user_id=self.user_id,
+                    notification_type=NotificationType.BROKER_DISCONNECTED,
+                    title="Broker disconnected",
+                    body="Could not reach the broker during reconciliation — new entries are halted until this is resolved.",
+                    data={"error": str(exc)},
+                )
+            return ReconciliationReport(order_mismatches=[reason])
+
         local_orders = self.order_manager.list_all(self.account_id)
         local_positions = self.position_manager.open_positions(self.account_id)
 

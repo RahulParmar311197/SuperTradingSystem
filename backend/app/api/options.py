@@ -13,11 +13,15 @@ from app.core.audit import record_audit
 from app.core.redis import account_halt_reason
 from app.database.models.instruments import Instrument
 from app.database.models.instruments import MarketType as InstrumentMarketType
+from app.database.models.notifications import NotificationType
 from app.database.models.options import OptionContract, OptionSnapshot
+from app.database.models.risk import RiskDecision as RiskEventDecision
+from app.database.models.risk import RiskEvent
 from app.database.models.strategy import Direction
 from app.database.models.trading import OrderStatus, OrderType
 from app.database.models.users import TradingPermission, User
 from app.database.session import get_db
+from app.notifications.service import create_notification
 from app.options.greeks import OptionType, black_scholes_greeks, black_scholes_price
 from app.options.liquidity_filter import evaluate_liquidity
 from app.options.payoff import OptionLeg, compute_payoff_summary
@@ -282,7 +286,35 @@ async def execute_options_strategy(
         premium_deviation_pct=premium_deviation_pct,
     )
     decision = evaluate_options_risk(risk_proposal, limits=stack.risk_engine.limits)
+    db.add(
+        RiskEvent(
+            user_id=user.id,
+            decision=RiskEventDecision.APPROVE if decision.approved else RiskEventDecision.REJECT,
+            reason=decision.reason,
+            checks={c.name: c.passed for c in decision.checks},
+        )
+    )
+    await db.commit()
+
     if not decision.approved:
+        # Blueprint §63 mandates an "Order rejected" notification -- the
+        # equity path (POST /orders, app/api/orders.py) already fires one
+        # and writes this same RiskEvent audit row on rejection; this
+        # endpoint places real orders through that same broker/risk/
+        # persistence pipeline (see this function's own docstring) but
+        # used to only raise the HTTPException below, with no RiskEvent
+        # row and no notification either -- nothing else in the system
+        # (another device, GET /notifications, an admin view) ever
+        # learned an options strategy was blocked, and no audit trail
+        # existed for *any* options risk decision, approved or not.
+        await create_notification(
+            db,
+            user_id=user.id,
+            notification_type=NotificationType.ORDER_REJECTED,
+            title=f"{payload.strategy_name} options strategy rejected",
+            body=decision.reason or "Risk engine rejected this strategy",
+            data={"strategy_name": payload.strategy_name, "reason": decision.reason},
+        )
         raise HTTPException(status.HTTP_403_FORBIDDEN, f"Risk engine rejected this strategy: {decision.reason}")
 
     batch_id = uuid.uuid4()

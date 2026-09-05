@@ -1402,6 +1402,52 @@ both persisted `Order` rows' `broker_account_id` match it. Reverting the
 one-line fix reproduces the original bug immediately — confirmed by hand
 before restoring it.
 
+## Options risk decisions left no audit trail and rejections never notified (§63)
+
+A second sibling-endpoint gap in `app/api/options.py`'s `execute_options_strategy`,
+found the same way as the `broker_account_id` one above: it evaluates
+`evaluate_options_risk(...)` but, until this fix, did nothing with the
+result besides checking `decision.approved` —
+```python
+decision = evaluate_options_risk(risk_proposal, limits=stack.risk_engine.limits)
+if not decision.approved:
+    raise HTTPException(status.HTTP_403_FORBIDDEN, f"Risk engine rejected this strategy: {decision.reason}")
+```
+Compare `POST /orders`'s `place_order` (`app/api/orders.py`), which for
+the identical kind of event always persists a `RiskEvent` row — approved
+*or* rejected — before checking `decision.approved`, and on rejection
+also fires an `ORDER_REJECTED` notification before raising. That fix
+("Live order rejections were the one path that never notified", earlier
+in this document) predates this endpoint's `/execute` action having this
+shape; two *later* rounds patched `execute_options_strategy` for other
+`orders.py`-parity gaps (the forged-premium check, `broker_account_id`)
+but both missed this one.
+
+Concretely: a multi-leg options strategy rejected for excessive
+projected exposure, unacceptable liquidity, a forged premium, stale
+market data, or an unhealthy broker got only the one-shot 403 response.
+`GET /notifications` never showed it. No `RiskEvent` audit row existed to
+reconstruct what happened — and unlike every other trading path in this
+codebase (paper, auto-trade, manual orders), there was no persistent
+record that a risk decision had been evaluated for this account's
+options activity at all, approvals included.
+
+Fixed by mirroring `place_order`'s pattern exactly: an unconditional
+`RiskEvent(user_id, decision, reason, checks)` write right after
+`evaluate_options_risk` returns, and — only on rejection — a
+`create_notification(..., NotificationType.ORDER_REJECTED, ...)` call
+before the `HTTPException`. `evaluate_options_risk` has no
+`daily_loss_limit`-equivalent check the way `RiskEngine.evaluate` does,
+so no ternary is needed here — `ORDER_REJECTED` is the only notification
+type this path can produce.
+
+New `tests/api/test_options_execute.py::test_execute_risk_rejection_writes_audit_row_and_notifies`
+drives the same oversized spread the existing exposure-limit test already
+uses and asserts both a `RiskEvent` row (`decision == REJECT`) and a
+`Notification` row (`type == ORDER_REJECTED`) exist afterward. Reverting
+the fix reproduces the original bug immediately — this test fails with
+zero rows in both tables — confirmed by hand before restoring it.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

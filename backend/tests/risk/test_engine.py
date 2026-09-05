@@ -104,3 +104,26 @@ def test_rejects_when_exposure_limit_exceeded():
     proposal = _base_proposal(current_exposure=50_000.0)
     result = RiskEngine(limits=limits).evaluate(proposal)
     assert result.decision == RiskDecision.REJECT
+
+
+def test_entry_deviation_defaults_to_a_no_op():
+    # entry_deviation_pct defaults to 0.0 -- a clean trade must still
+    # approve even though max_entry_deviation_pct exists.
+    result = RiskEngine().evaluate(_base_proposal())
+    assert any(c.name == "entry_matches_market" and c.passed for c in result.checks)
+
+
+def test_rejects_when_entry_deviates_from_the_real_market_quote():
+    # Regression test: a client-supplied `entry` is otherwise trusted
+    # input used both to size the position (calculate_position_size) and
+    # to size that same position's notional risk checks (exposure_limit et
+    # al., computed as quantity * entry). Picking an `entry` close to
+    # `stop` inflates quantity while those notional checks -- computed
+    # from that same forged entry -- still look small, letting an
+    # oversized order clear every exposure check before the broker fills
+    # the real quantity at its own, unrelated real price. This check
+    # exists specifically to catch that gap.
+    proposal = _base_proposal(entry_deviation_pct=5.0)  # default limit is 1.0%
+    result = RiskEngine().evaluate(proposal)
+    assert result.decision == RiskDecision.REJECT
+    assert any(c.name == "entry_matches_market" and not c.passed for c in result.checks)

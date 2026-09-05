@@ -218,6 +218,17 @@ async def place_order(
         # the caller.
         stack.broker.set_quote(payload.symbol, ltp=payload.entry)
 
+    # Blueprint §56/§57: `payload.entry` is otherwise trusted input used
+    # both to size the position (calculate_position_size) and to size that
+    # same position's notional risk checks (exposure_limit et al.) --
+    # unchecked, a client could pick `entry` close to `stop` to inflate
+    # quantity while those notional checks, computed from the same forged
+    # entry, still look small. Comparing against the broker's own quote
+    # closes that gap; for MockBroker this is always 0% since the seed
+    # above just set its quote to `payload.entry`.
+    quote = await stack.broker.get_quote(payload.symbol)
+    entry_deviation_pct = abs(payload.entry - quote.ltp) / quote.ltp * 100 if quote.ltp else 0.0
+
     account = await stack.broker.get_account()
     open_positions = stack.position_manager.open_positions(str(user.id))
     current_exposure = sum(abs(p.quantity) * p.average_price for p in open_positions)
@@ -255,6 +266,7 @@ async def place_order(
         # market_data_age_seconds above -- no prior tick means no jump to
         # flag, not an infinite one.
         recent_price_jump_pct=await get_price_jump_pct(payload.symbol) or 0.0,
+        entry_deviation_pct=entry_deviation_pct,
     )
     decision = stack.risk_engine.evaluate(proposal)
     db.add(

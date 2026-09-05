@@ -1141,6 +1141,77 @@ and now price jumps — all three of §56-57's account/system-level checks
 that had a real implementation and a real threshold, but no live data
 feeding them.
 
+## A forged `entry` could launder an oversized live order past every notional risk check (§56-57)
+
+Every risk-check input fixed in the last three rounds (`daily_pnl`,
+`repeated_rejections`, `recent_price_jump_pct`) was a case of a *missing*
+value — a field nobody set. This one is different: `POST /orders`'s
+`entry`/`stop` are always set, by the client, with zero validation
+(`PlaceOrderRequest`, `app/api/orders.py`) — and that trust turns the risk
+engine's own math into a way around it.
+
+`calculate_position_size` (`app/risk/engine.py`) sizes a position purely
+from the client-supplied gap between `entry` and `stop`:
+```python
+risk_per_unit = abs(entry - stop)
+risk_amount = account_balance * (risk_percent / 100)
+quantity = risk_amount / risk_per_unit
+```
+Every notional-based risk check in the same `evaluate()` call —
+`exposure_limit`, `strategy_allocation_limit`, `correlated_exposure_limit`
+— then computes that trade's notional as `quantity * proposal.entry`,
+using the *same* client-supplied `entry`. Substituting the formula above:
+```
+notional = (risk_amount / |entry - stop|) * entry
+```
+A client can make `|entry - stop|` arbitrarily small (e.g. `entry=150.0,
+stop=149.9`) to make `quantity` arbitrarily large, while `notional`
+(computed from that same tiny gap and that same `entry`) stays whatever
+size the client wants it to look like — small enough to clear every
+exposure check. For `MockBroker`, this is harmless: `place_order` already
+seeds `MockBroker`'s quote from `payload.entry` before evaluating risk
+(`if isinstance(stack.broker, MockBroker): stack.broker.set_quote(...)`,
+with the comment "never let a real order's fill price be dictated by the
+caller" already flagging that this is deliberately mock-only behavior),
+so the mock fill happens at the same fabricated price the risk math used.
+But a real broker (Upstox/Dhan) fills a MARKET order at its own,
+completely independent real market price — so the *quantity* computed
+from the forged `entry`/`stop` gap is what actually gets submitted
+(`ExecutionEngine.submit`, `OrderRequest(quantity=order.quantity, ...)`),
+executed at a real price that has nothing to do with the notional the
+risk engine just approved.
+
+Fixed by adding a new `RiskEngine.evaluate` check, `entry_matches_market`,
+against a new `TradeRiskProposal.entry_deviation_pct` field and
+`RiskLimits.max_entry_deviation_pct` (default 1.0%). `place_order` now
+fetches the broker's own quote right after the existing `MockBroker`
+seeding step —
+```python
+quote = await stack.broker.get_quote(payload.symbol)
+entry_deviation_pct = abs(payload.entry - quote.ltp) / quote.ltp * 100 if quote.ltp else 0.0
+```
+— so for `MockBroker` this is always `0%` (the quote was just set *from*
+`payload.entry`, by the same existing seeding step), leaving paper trading
+completely unaffected, while for a real broker it reflects a genuine gap
+between the claimed and real price. `PaperTradingEngine` doesn't need
+this at all: its `entry` comes from the strategy engine's own analysis of
+real candle data, never from arbitrary client input, so this specific
+exploit doesn't apply there.
+
+`tests/risk/test_engine.py` adds a unit test proving `entry_deviation_pct`
+defaults to a no-op (mirroring the pattern already established for
+`correlated_exposure`) and one proving a 5% deviation is rejected against
+the 1% default limit. `tests/api/test_orders.py` adds a `_FakeRealBroker`
+test double — a minimal `Broker` implementation whose quote is fixed and
+independent of client input, standing in for a real connected broker
+since `MockBroker` cannot exercise this scenario by design — and
+`test_entry_far_from_the_real_broker_quote_is_rejected`, which swaps a
+live stack's broker to it mid-test and confirms `POST /orders` genuinely
+rejects an order whose claimed `entry` is far from that fixed quote.
+Reverting either the new check or its wiring in `place_order` reproduces
+the original bug immediately in all three tests — confirmed by hand,
+both independently, before restoring the fix.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

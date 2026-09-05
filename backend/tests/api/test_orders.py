@@ -6,11 +6,12 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import delete, select
 
+from app.brokers.base import AccountInfo, Broker, BrokerOrder, BrokerPosition, OrderRequest, OrderResult, Quote
 from app.core.encryption import encrypt_credentials
 from app.database.models.instruments import Instrument, MarketType, OptionType
 from app.database.models.notifications import Notification, NotificationType
 from app.database.models.risk import AuditLog, RiskEvent
-from app.database.models.trading import ExecutionMode, Order, OrderEvent, Position, Trade
+from app.database.models.trading import ExecutionMode, Order, OrderEvent, OrderStatus, Position, Trade
 from app.database.models.users import BrokerAccount, BrokerAccountStatus, BrokerName, User, UserSession
 from app.database.session import async_session_factory
 from app.main import app
@@ -621,5 +622,100 @@ async def test_abnormal_price_jump_blocks_a_new_order(require_infra):
                     await db.execute(select(Notification).where(Notification.user_id == user_id))
                 ).scalars().all()
                 assert any(n.type == NotificationType.ORDER_REJECTED for n in notifications)
+        finally:
+            await _cleanup(user_id, instrument_id)
+
+
+class _FakeRealBroker(Broker):
+    """A minimal non-`MockBroker` double whose quote is fixed and
+    independent of whatever `entry` a client submits -- unlike
+    `MockBroker`, whose quote `place_order` always seeds from
+    `payload.entry` by design. Stands in for a real connected broker
+    (Upstox/Dhan) so `test_entry_far_from_the_real_broker_quote_is_rejected`
+    below can exercise `entry_matches_market` end-to-end through
+    `POST /orders` without live broker credentials."""
+
+    def __init__(self, quote_price: float, balance: float = 100_000.0) -> None:
+        self.quote_price = quote_price
+        self.balance = balance
+
+    async def get_account(self) -> AccountInfo:
+        return AccountInfo(account_id="FAKE", balance=self.balance, equity=self.balance)
+
+    async def get_positions(self) -> list[BrokerPosition]:
+        return []
+
+    async def get_orders(self) -> list[BrokerOrder]:
+        return []
+
+    async def get_quote(self, symbol: str) -> Quote:
+        return Quote(symbol=symbol, ltp=self.quote_price)
+
+    async def place_order(self, request: OrderRequest) -> OrderResult:
+        return OrderResult(
+            broker_order_id=str(uuid.uuid4()),
+            status=OrderStatus.FILLED,
+            filled_quantity=request.quantity,
+            average_fill_price=self.quote_price,
+        )
+
+    async def modify_order(self, broker_order_id: str, **changes) -> OrderResult:
+        raise NotImplementedError
+
+    async def cancel_order(self, broker_order_id: str) -> OrderResult:
+        return OrderResult(broker_order_id=broker_order_id, status=OrderStatus.CANCELLED)
+
+    async def is_healthy(self) -> bool:
+        return True
+
+
+async def test_entry_far_from_the_real_broker_quote_is_rejected(require_infra):
+    # Regression test, end-to-end: `payload.entry` is otherwise trusted
+    # input used both to size the position (calculate_position_size) and
+    # to size that same position's notional risk checks (exposure_limit et
+    # al., computed as quantity * entry) -- a client picking `entry` close
+    # to `stop` inflates quantity while those notional checks, computed
+    # from that same forged entry, still look small. `MockBroker` can't
+    # exercise this (its quote is always seeded from `payload.entry`, by
+    # design), so this uses `_FakeRealBroker`, whose quote is independent
+    # of client input -- like a real connected broker.
+    from app.api import orders as orders_module
+
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        async with async_session_factory() as db:
+            instrument = Instrument(
+                symbol=f"ORDDEV{uuid.uuid4().hex[:6].upper()}", exchange="NSE", market=MarketType.EQUITY, instrument_type="EQ"
+            )
+            db.add(instrument)
+            await db.commit()
+            await db.refresh(instrument)
+            instrument_id = instrument.id
+
+        try:
+            # First order builds this user's stack against the default
+            # MockBroker, then swap in a broker with a fixed real quote.
+            r = client.post(
+                "/orders",
+                json={"symbol": instrument.symbol, "direction": "LONG", "entry": 100.0, "stop": 95.0},
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+
+            stack = orders_module._STACKS[user_id]
+            stack.broker = _FakeRealBroker(quote_price=100.0)
+
+            # The real quote is 100.0 -- claiming entry=150 with a tiny
+            # stop distance would otherwise inflate quantity while looking
+            # harmless in notional terms.
+            r = client.post(
+                "/orders",
+                json={"symbol": instrument.symbol, "direction": "LONG", "entry": 150.0, "stop": 149.9},
+                headers=headers,
+            )
+            assert r.status_code == 403, r.text
+            assert "Entry deviates" in r.text
         finally:
             await _cleanup(user_id, instrument_id)

@@ -100,3 +100,65 @@ async def refresh(db: AsyncSession, refresh_token: str) -> tuple[str, str]:
     # Rotate: revoke the used refresh token and issue a new pair.
     session.revoked = True
     return await _issue_tokens(db, user, device_info=session.device_info)
+
+
+async def logout(db: AsyncSession, refresh_token: str) -> None:
+    """Blueprint §69 "Session management": before this, `UserSession.revoked`
+    was only ever set as a side effect of `refresh()` rotating a used
+    token -- no user action could revoke a session, so a stolen refresh
+    token or a forgotten logged-in shared computer stayed valid until its
+    multi-day natural expiry with no self-service remediation. Lenient by
+    design (never raises for an already-revoked/rotated-out session, the
+    same "a kill switch must never be harder to reach" principle as
+    `POST /auto-trading/disable`) -- the caller wanted to be logged out,
+    and that's already true.
+    """
+    try:
+        payload = decode_token_payload(refresh_token, TokenType.REFRESH)
+    except InvalidTokenError:
+        return
+    session_id = payload.get("sid")
+    if not session_id:
+        return
+
+    result = await db.execute(select(UserSession).where(UserSession.id == uuid.UUID(session_id)))
+    session = result.scalar_one_or_none()
+    if session is not None and not session.revoked:
+        session.revoked = True
+        await db.commit()
+        await record_audit(db, actor="user", action="user.logged_out", user_id=session.user_id)
+
+
+async def list_sessions(db: AsyncSession, user_id: uuid.UUID) -> list[UserSession]:
+    """Blueprint §69 "Device tracking": `device_info` has been collected at
+    login since the beginning, but nothing ever read it back -- this is
+    the first endpoint that actually surfaces it. Only currently-active
+    sessions (not revoked, not yet expired) are worth showing; a long
+    history of dead sessions isn't "device tracking", it's noise."""
+    result = await db.execute(
+        select(UserSession)
+        .where(
+            UserSession.user_id == user_id,
+            UserSession.revoked.is_(False),
+            UserSession.expires_at > datetime.now(timezone.utc),
+        )
+        .order_by(UserSession.created_at.desc())
+    )
+    return list(result.scalars().all())
+
+
+async def revoke_session(db: AsyncSession, user_id: uuid.UUID, session_id: uuid.UUID) -> bool:
+    """Returns whether a session owned by `user_id` was found and revoked
+    -- the caller turns a `False` into a 404, the same "never confirm
+    another user's resource exists" pattern already used for /paper/* and
+    /replay/* sessions."""
+    result = await db.execute(select(UserSession).where(UserSession.id == session_id))
+    session = result.scalar_one_or_none()
+    if session is None or session.user_id != user_id:
+        return False
+    session.revoked = True
+    await db.commit()
+    await record_audit(
+        db, actor="user", action="user.session_revoked", user_id=user_id, details={"session_id": str(session_id)}
+    )
+    return True

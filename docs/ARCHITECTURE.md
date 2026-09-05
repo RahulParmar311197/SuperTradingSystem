@@ -375,6 +375,58 @@ journaled with the *new* `strategy_version` — which is only possible if the
 already-cached engine actually picked up the edit. Reverting the fix
 reproduces the failure immediately (verified by hand before committing).
 
+## No API path could ever promote a strategy to `eligible_for_auto_trading` (§77)
+
+`strategies.eligible_for_auto_trading` defaults to `False`
+(`app/database/models/strategy.py`), and `AutoTradeSupervisor.run_once`
+(`app/workers/auto_trade_worker.py`) only considers strategies matching
+`WHERE is_active IS TRUE AND eligible_for_auto_trading IS TRUE`. Before this
+fix, nothing in the API ever wrote that column: `POST /strategies`
+(`create_strategy`) left it at the DB default, and `PUT /strategies/{id}`
+(`update_strategy`) only ever touched `definition`/`name`/`version` — its
+request body is the raw `StrategyDefinition` DSL model, which has no field
+for it at all. The only place in the entire repository that ever set
+`eligible_for_auto_trading=True` was test fixtures constructing a
+`StrategyRow` directly against the database, bypassing the API entirely.
+
+The practical effect: regardless of a user completing the account-level
+`POST /auto-trading/enable` switch (with `confirm: true`, the AUTO_TRADE
+permission, and sane risk limits), `strategy_rows` in
+`AutoTradeSupervisor.run_once` was guaranteed empty for every real account,
+so the entire autonomous order-placement/risk-check/journaling path —
+Stage 10 of the blueprint, the feature `AutoTradeSupervisor` exists to
+implement — was unreachable dead code in production. Blueprint §77
+describes exactly the missing piece: a strategy is meant to graduate
+through `Backtest → Out-of-sample → Replay → Paper trading → Risk review →
+Limited live deployment` before being marked eligible for autonomous
+trading; that graduation step didn't exist anywhere.
+
+Fixed by adding `PATCH /strategies/{id}/status`
+(`app/api/strategies.py:update_strategy_status`) — deliberately a separate
+endpoint from `PUT /strategies/{id}` (editing the DSL) rather than folding
+eligibility into it, so promoting a strategy to autonomous trading is never
+an incidental side effect of an unrelated definition edit. Turning
+`eligible_for_auto_trading` **on** requires the `AUTO_TRADE` permission
+(403 without it) and an explicit `confirm: true` (400 without it) — the
+same two-gate pattern `POST /auto-trading/enable` already uses for the
+account-level switch. Turning it **off**, and toggling `is_active` in
+either direction, needs neither: demoting a strategy or deactivating it
+must never be harder than promoting it, the same asymmetry
+`POST /auto-trading/disable` already establishes as a kill-switch
+principle. Every status change is audit-logged
+(`action="strategy.status_updated"`).
+
+`tests/api/test_strategy_status.py` proves the gating end to end:
+promoting without the `AUTO_TRADE` permission is rejected (403), promoting
+with the permission but without `confirm` is rejected (400), a correctly
+confirmed promotion actually persists, and demoting/deactivating need
+neither check. `tests/workers/test_auto_trade_worker.py`'s existing
+`test_supervisor_opens_and_journals_a_trade_end_to_end` already proves the
+supervisor half of the pipeline works correctly once
+`eligible_for_auto_trading` is `True` — this fix is what makes reaching
+that state through the real API possible at all, closing the loop between
+the two.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

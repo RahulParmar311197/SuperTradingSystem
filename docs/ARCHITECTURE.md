@@ -572,6 +572,43 @@ The rest stay open for a future round — each spans a different subsystem
 freshness halt path, and an auto-trading kill-switch) and deliberately
 isn't folded into this fix.
 
+## Opening a trade never notified anyone (§63)
+
+Blueprint §63 lists "Trade executed" as its own notification event,
+alongside "Order rejected", "Position closed", "SL hit", and "TP hit" — all
+of which were wired by the previous two rounds. `TRADE_EXECUTED` itself
+was still dead: `app/api/paper.py`'s `feed_candle` and
+`app/workers/auto_trade_worker.py`'s `_process` both only called
+`record_audit` inside their `if outcome.order_created:` branch, never
+`create_notification`. Every sibling branch in both functions —
+`risk_rejected_reason` (`ORDER_REJECTED`) and `closed_position_pnl`
+(`SL_HIT`/`TP_HIT`) — already notified; opening a position was the one
+event in the whole lifecycle that stayed silent. A user running manual
+paper trading or autonomous auto-trading got notified when an entry was
+rejected and when a position closed, but nothing at all when a trade
+actually opened — `GET /notifications` would never return a
+`TRADE_EXECUTED` row no matter how many trades ran.
+
+Fixed by adding a `create_notification(NotificationType.TRADE_EXECUTED,
+...)` call right after the existing `record_audit` in both
+`order_created` branches, matching the wording style of the adjacent
+`ORDER_REJECTED` blocks. This is the fourth and, for the notification
+system specifically, the last of the previously-flagged unwired
+`NotificationType` values within this trading lifecycle — `SETUP_DETECTED`,
+`DAILY_LOSS_LIMIT`, and `MARKET_DATA_STALE`/`AUTO_TRADING_DISABLED` are
+different subsystems (scanner-side detection, the risk engine's own daily
+check, and the market-data-freshness/kill-switch paths respectively) and
+remain open for future rounds.
+
+Every existing end-to-end test that opens and then closes a position in
+`tests/api/test_paper.py` and `tests/workers/test_auto_trade_worker.py`
+was updated to assert exactly two notifications now land per full
+open-then-close cycle (`TRADE_EXECUTED` plus whichever close type fired),
+instead of the previous one — these updated assertions are the regression
+tests: reverting the new `create_notification` calls reproduces the
+missing `TRADE_EXECUTED` row immediately (verified by hand before
+committing), failing four tests across both files.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

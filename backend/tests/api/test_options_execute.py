@@ -7,6 +7,7 @@ from sqlalchemy import delete, select
 
 from app.core.encryption import encrypt_credentials
 from app.database.models.instruments import Instrument, MarketType, OptionType
+from app.database.models.notifications import Notification, NotificationType
 from app.database.models.options import OptionChainSnapshot, OptionContract, OptionSnapshot
 from app.database.models.risk import AuditLog, RiskEvent
 from app.database.models.trading import ExecutionMode, Order, OrderEvent, Position, Trade
@@ -75,6 +76,7 @@ async def _cleanup(user_id: uuid.UUID, instrument_ids: list[uuid.UUID]) -> None:
         await db.execute(delete(Trade).where(Trade.user_id == user_id))
         await db.execute(delete(Position).where(Position.user_id == user_id))
         await db.execute(delete(RiskEvent).where(RiskEvent.user_id == user_id))
+        await db.execute(delete(Notification).where(Notification.user_id == user_id))
         await db.execute(delete(AuditLog).where(AuditLog.user_id == user_id))
         await db.execute(delete(UserSession).where(UserSession.user_id == user_id))
         await db.execute(delete(User).where(User.id == user_id))
@@ -172,6 +174,48 @@ async def test_execute_rejects_when_projected_loss_exceeds_exposure_limit(requir
             async with async_session_factory() as db:
                 orders = (await db.execute(select(Order).where(Order.user_id == user_id))).scalars().all()
                 assert orders == []  # nothing should have been placed
+        finally:
+            await _cleanup(user_id, [long_leg.id, short_leg.id])
+
+
+async def test_execute_risk_rejection_writes_audit_row_and_notifies(require_infra):
+    # Regression test: unlike POST /orders (app/api/orders.py's
+    # place_order), which always writes a RiskEvent audit row and fires an
+    # ORDER_REJECTED notification on a risk rejection, execute_options_strategy
+    # used to only raise the HTTPException -- no RiskEvent row for *any*
+    # options risk decision (approved or rejected), and no notification.
+    # GET /notifications never showed a blocked options strategy, and no
+    # audit trail existed to reconstruct what happened.
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+        long_leg, short_leg = await _make_two_leg_instruments(f"AUDIT{uuid.uuid4().hex[:5].upper()}")
+
+        try:
+            # Same oversized spread as the exposure-limit test above.
+            r = client.post(
+                "/options/execute",
+                json={
+                    "strategy_name": "bull_call_spread",
+                    "legs": [
+                        {"symbol": long_leg.symbol, "direction": "LONG", "quantity": 1000, "premium": 120.0},
+                        {"symbol": short_leg.symbol, "direction": "SHORT", "quantity": 1000, "premium": 50.0},
+                    ],
+                },
+                headers=headers,
+            )
+            assert r.status_code == 403, r.text
+
+            async with async_session_factory() as db:
+                risk_events = (await db.execute(select(RiskEvent).where(RiskEvent.user_id == user_id))).scalars().all()
+                assert len(risk_events) == 1
+                assert risk_events[0].decision.value == "REJECT"
+
+                notifications = (
+                    await db.execute(select(Notification).where(Notification.user_id == user_id))
+                ).scalars().all()
+                assert len(notifications) == 1
+                assert notifications[0].type == NotificationType.ORDER_REJECTED
         finally:
             await _cleanup(user_id, [long_leg.id, short_leg.id])
 

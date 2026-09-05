@@ -842,6 +842,64 @@ un-revoked. Reverting `logout()`'s body to a no-op reproduces the original
 gap immediately — the refresh token keeps working after "logout" (verified
 by hand before committing).
 
+## `Order.broker_account_id` was declared but never populated (§50, §53)
+
+`Order` (`app/database/models/trading.py`) has carried a nullable
+`broker_account_id` foreign key to `broker_accounts` from early on — the
+column that exists specifically so a placed order can be traced back to
+*which* of a user's connected broker accounts actually executed it (a user
+can, over time, connect and disconnect several). Nothing in the codebase
+ever wrote to it. `grep -rn "broker_account_id" app/` found exactly one
+hit before this fix: the column's own declaration. Every order ever
+persisted — live, paper, or otherwise — had `broker_account_id = NULL`,
+silently. This matters the moment a user reconnects a broker under a new
+`BrokerAccount` row (e.g. after a disconnect/reconnect, or switching from
+Upstox to Dhan): without this column, there is no way to answer "which
+account placed this specific historical order" from the `orders` table
+alone, which blueprint §50/§53's broker-abstraction design assumes is
+possible (it's exactly the kind of per-account audit trail a real trading
+system needs before it can be trusted with real money).
+
+The root cause was `app/trading/broker_resolver.py`'s `resolve_broker()`:
+it already looked up the user's active `BrokerAccount` row to decide which
+adapter to build (`MockBroker`, `UpstoxBroker`, or `DhanBroker`), but
+returned only the adapter — `account.id` was read, used to decrypt
+credentials, and then discarded once the adapter was constructed. Nothing
+downstream ever had the id to pass along, so `Order.broker_account_id`
+couldn't have been populated by any amount of application-layer wiring
+without touching this function first.
+
+Fixed by changing `resolve_broker`'s return type from `Broker` to
+`tuple[Broker, uuid.UUID | None]` — `None` specifically for the no-account
+case (`MockBroker` with nothing connected, Stage 9's honest default: there
+is no account to attribute a paper order to), and the resolved account's
+id in every other case, including the `BrokerName.PAPER` "connected but
+explicitly paper" case, where a real `BrokerAccount` row exists even
+though it still trades against `MockBroker`. The id then threads through:
+`app/api/orders.py`'s `_UserTradingStack` now stores `broker_account_id`
+alongside its `broker` (set once, at stack creation, in `_stack_for`), and
+both `persist_order(...)` call sites (`place_order`, `cancel_order`) pass
+`stack.broker_account_id` through to `app/trading/persistence.py`'s
+`persist_order()`, which now accepts a `broker_account_id` parameter
+(`None` by default, since backtest/replay/paper-session code paths that
+call `persist_order` never had a `BrokerAccount` to resolve in the first
+place) and writes it onto the `OrderRow` at creation.
+
+`tests/trading/test_broker_resolver.py`'s existing four resolution-path
+tests now assert on the returned id as well as the adapter type (`None`
+for no-account and disconnected-account cases; the connected account's own
+id for active Upstox/Dhan accounts). `tests/api/test_orders.py` adds
+`test_place_order_records_which_broker_account_executed_it`, which
+connects an ACTIVE `PAPER` `BrokerAccount` (chosen specifically so the
+test exercises the real `POST /orders` HTTP path without needing live
+Upstox/Dhan credentials — `PAPER` still resolves to `MockBroker`, but,
+unlike the no-account case, does so with a real account id to check
+against) and asserts the persisted `Order.broker_account_id` matches it
+end-to-end. Reverting the `OrderRow(...)` construction to drop
+`broker_account_id` reproduces the original bug immediately — this new
+test fails with a `NULL` mismatch — confirmed by hand before restoring
+the fix.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

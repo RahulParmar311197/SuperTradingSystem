@@ -23,6 +23,8 @@ that.
 
 from __future__ import annotations
 
+import uuid
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -34,7 +36,14 @@ from app.core.encryption import decrypt_credentials
 from app.database.models.users import BrokerAccount, BrokerAccountStatus, BrokerName, User
 
 
-async def resolve_broker(db: AsyncSession, user: User) -> Broker:
+async def resolve_broker(db: AsyncSession, user: User) -> tuple[Broker, uuid.UUID | None]:
+    """Returns the resolved adapter alongside the `BrokerAccount.id` it was
+    built from (`None` for `MockBroker`, since there's no connected account
+    to attribute a paper trade to) -- `Order.broker_account_id` exists
+    specifically so a placed order can be traced back to which of a user's
+    (possibly several, over time) connected broker accounts executed it;
+    without returning it here, no caller could ever populate that column.
+    """
     stmt = (
         select(BrokerAccount)
         .where(BrokerAccount.user_id == user.id, BrokerAccount.status == BrokerAccountStatus.ACTIVE)
@@ -42,7 +51,7 @@ async def resolve_broker(db: AsyncSession, user: User) -> Broker:
     )
     account = (await db.execute(stmt)).scalars().first()
     if account is None:
-        return MockBroker(starting_balance=100_000.0)
+        return MockBroker(starting_balance=100_000.0), None
 
     credentials = decrypt_credentials(account.encrypted_credentials)
 
@@ -50,14 +59,14 @@ async def resolve_broker(db: AsyncSession, user: User) -> Broker:
         access_token = credentials.get("access_token")
         if not access_token:
             raise BrokerError(f"Connected Upstox account {account.id} has no access_token stored")
-        return UpstoxBroker(access_token=access_token)
+        return UpstoxBroker(access_token=access_token), account.id
 
     if account.broker == BrokerName.DHAN:
         client_id = credentials.get("client_id")
         access_token = credentials.get("access_token")
         if not client_id or not access_token:
             raise BrokerError(f"Connected Dhan account {account.id} is missing client_id/access_token")
-        return DhanBroker(client_id=client_id, access_token=access_token)
+        return DhanBroker(client_id=client_id, access_token=access_token), account.id
 
     # BrokerName.PAPER — an explicit paper-mode "connection" trades mock.
-    return MockBroker(starting_balance=100_000.0)
+    return MockBroker(starting_balance=100_000.0), account.id

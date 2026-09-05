@@ -40,6 +40,7 @@ async def persist_order(
     strategy_id: uuid.UUID | None = None,
     strategy_version: int | None = None,
     execution_mode: ExecutionMode = ExecutionMode.LIVE,
+    broker_account_id: uuid.UUID | None = None,
 ) -> OrderRow:
     """Insert-or-update the DB mirror of `order`, appending any
     `OrderEvent` rows not yet persisted. Safe to call after every state
@@ -48,6 +49,9 @@ async def persist_order(
     `execution_mode` only takes effect when the row is first created (an
     order's execution mode can't change across its own state transitions)
     — callers must pass the same value on every call for a given order.
+    `broker_account_id` is `None` for paper/backtest/replay orders, which
+    have no connected `BrokerAccount` to attribute to — only
+    `app/api/orders.py`'s manual/live path ever has one to pass.
     """
     row = (
         await db.execute(select(OrderRow).where(OrderRow.idempotency_key == order.idempotency_key))
@@ -58,6 +62,7 @@ async def persist_order(
             id=order.id,
             user_id=user_id,
             instrument_id=instrument_id,
+            broker_account_id=broker_account_id,
             strategy_id=strategy_id,
             strategy_version=strategy_version,
             idempotency_key=order.idempotency_key,

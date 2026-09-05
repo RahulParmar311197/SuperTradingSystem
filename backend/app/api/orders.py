@@ -58,8 +58,9 @@ class _UserTradingStack:
     `UpstoxBroker`/`DhanBroker` for one who has connected one.
     """
 
-    def __init__(self, broker) -> None:
+    def __init__(self, broker, broker_account_id: uuid.UUID | None = None) -> None:
         self.broker = broker
+        self.broker_account_id = broker_account_id
         self.order_manager = OrderManager()
         self.position_manager = PositionManager()
         self.risk_engine = RiskEngine(limits=RiskLimits())
@@ -95,8 +96,8 @@ async def _stack_for(user: User, db: AsyncSession) -> _UserTradingStack:
         lock = _STACK_LOCKS.setdefault(user.id, asyncio.Lock())
         async with lock:
             if user.id not in _STACKS:
-                broker = await resolve_broker(db, user)
-                _STACKS[user.id] = _UserTradingStack(broker)
+                broker, broker_account_id = await resolve_broker(db, user)
+                _STACKS[user.id] = _UserTradingStack(broker, broker_account_id)
     return _STACKS[user.id]
 
 
@@ -294,7 +295,9 @@ async def place_order(
     ORDER_COUNT.labels(final_order.status.value).inc()
 
     execution_mode = _execution_mode_for(stack)
-    await persist_order(db, final_order, user.id, instrument.id, execution_mode=execution_mode)
+    await persist_order(
+        db, final_order, user.id, instrument.id, execution_mode=execution_mode, broker_account_id=stack.broker_account_id
+    )
 
     position_after = stack.position_manager.get(str(user.id), payload.symbol)
     if position_after is not None:
@@ -354,7 +357,14 @@ async def cancel_order(
     ORDER_COUNT.labels(final_order.status.value).inc()
 
     instrument = await _get_instrument_by_symbol(db, final_order.symbol)
-    await persist_order(db, final_order, user.id, instrument.id, execution_mode=_execution_mode_for(stack))
+    await persist_order(
+        db,
+        final_order,
+        user.id,
+        instrument.id,
+        execution_mode=_execution_mode_for(stack),
+        broker_account_id=stack.broker_account_id,
+    )
 
     await record_audit(db, actor="user", action="order.cancelled", user_id=user.id, details={"order_id": str(order_id)})
     await _publish_order_event(user, final_order)

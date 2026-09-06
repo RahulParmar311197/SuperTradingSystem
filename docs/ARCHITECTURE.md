@@ -2365,6 +2365,59 @@ the then-nonexistent `current_index` keyword — the test file could not
 even be written against the old signature) and pass once the fix is
 restored.
 
+## A strategy could use AND/OR/NOT operators the DSL declares but silently could never fire
+
+Blueprint §33 lists the Strategy DSL's operators as `AND, OR, NOT,
+GREATER_THAN, LESS_THAN, CROSSES, TOUCHES, WITHIN`, and `ConditionOperator`
+(`app/strategy/dsl.py`) faithfully declares all eight — but
+`_numeric_compare` in `app/strategy/evaluator.py`, the only place
+`Condition.operator` is ever read, only branches on
+`GREATER_THAN`/`LESS_THAN`/`WITHIN`/`TOUCHES`/`CROSSES`. `AND`/`OR`/`NOT`
+had no handling anywhere in the codebase and fell through to
+`evaluate_condition`'s final `return False`, unconditionally, regardless
+of the actual indicator value being compared.
+
+This was reachable, not just a theoretical schema/implementation
+mismatch: `app/ai/strategy_builder.py`'s system prompt tells the AI
+"Only use condition types, operators, and entry types the schema
+defines" — actively inviting it to use `NOT`/`AND`/`OR` since they're
+right there in the schema — and `StrategyDefinition.model_validate` (the
+backend's sole validation gate, per that file's own docstring) accepted
+them with no error. A strategy like "RSI NOT within [40, 60]"
+(`type=indicator, name=rsi, operator=NOT, min_value=40, max_value=60`)
+passed validation cleanly, looked like a normal persisted strategy, and
+would never fire on any candle, ever — with nothing anywhere (no log, no
+error, no field) indicating why. That's a worse failure mode than a
+crash for a trading system: it silently wastes a trader's or the AI
+strategy generator's effort on something that looks like it should
+eventually trigger but structurally never can.
+
+Implementing real boolean composition properly is a larger redesign than
+this fix warrants: `Condition` is a flat leaf (`StrategyDefinition.conditions`'s
+own comment says "implicit AND across the list," and blueprint §34's
+worked example only ever shows that flat-list form) — `AND`/`OR` are
+naturally combinators over multiple conditions, not a single leaf's
+comparison mode, so supporting them would mean restructuring the DSL to
+support nested condition groups, not just adding a branch to
+`_numeric_compare`. Given that ambiguity and scope, the fix here is
+honesty rather than a speculative redesign: `Condition` now has a
+Pydantic field validator that rejects `operator in
+{AND, OR, NOT}` at validation time with a clear message, so a strategy
+using one of them fails loudly — a 422 from `POST`/`PUT /strategies`, or
+a `StrategyBuilderError` from `app.ai.strategy_builder.parse_strategy_json`
+(which already catches `pydantic.ValidationError` and re-raises with the
+AI's raw output attached) — instead of being silently accepted into a
+strategy that can never trigger.
+
+New `tests/strategy/test_dsl.py` (previously no dedicated DSL-level test
+module existed) parametrizes over all three unimplemented operators,
+asserting `Condition(...)` raises `ValidationError` with a message
+mentioning "not yet implemented," and a sibling test confirms the three
+genuinely-implemented operators (`GREATER_THAN`/`LESS_THAN`/`WITHIN`)
+still construct normally. Verified to fail against the pre-fix code (no
+`ValidationError` raised at all for `AND`/`OR`/`NOT`) and pass once the
+fix is restored.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

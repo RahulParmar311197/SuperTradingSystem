@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.brokers.mock import MockBroker
 from app.database.models.strategy import Direction
 from app.database.models.trading import OrderStatus, OrderType
@@ -18,6 +20,7 @@ from app.ict.engine import ICTConfig, ICTEngine
 from app.risk.engine import RiskEngine, TradeRiskProposal, calculate_position_size
 from app.risk.kill_switch import load_kill_switch_state
 from app.risk.limits import RiskLimits
+from app.risk.portfolio import compute_correlated_exposure
 from app.smc.engine import SMCConfig, SMCEngine
 from app.smc.types import Candle
 from app.strategy.context import EvaluationContext
@@ -143,7 +146,7 @@ class PaperTradingEngine:
         self._risk_day = today
         self._risk_week = this_week
 
-    async def on_candle(self, candle: Candle) -> PaperTradeOutcome:
+    async def on_candle(self, candle: Candle, db: AsyncSession | None = None) -> PaperTradeOutcome:
         self._roll_risk_window(candle.timestamp)
         self.candles.append(candle)
         self.broker.set_quote(self.symbol, ltp=candle.close)
@@ -193,6 +196,27 @@ class PaperTradingEngine:
         strategy_allocation = sum(
             abs(p.quantity) * p.average_price for p in open_positions if p.strategy_id == self.strategy.name
         )
+        # Blueprint §85: mirrors app/api/orders.py's identical computation
+        # for the live path. `db` is optional here (unlike orders.py, which
+        # always has a request-scoped session) so unit tests exercising
+        # this engine without a database keep working -- a caller with no
+        # session gets the same "no correlation data available" 0.0
+        # `compute_correlated_exposure` itself already falls back to for a
+        # symbol with no candle history, never a hard failure.
+        other_position_notionals = {
+            p.symbol: abs(p.quantity) * p.average_price for p in open_positions if p.symbol != self.symbol
+        }
+        correlated_exposure = (
+            await compute_correlated_exposure(
+                db,
+                target_symbol=self.symbol,
+                target_notional=0.0,
+                open_position_notionals=other_position_notionals,
+                threshold=self.risk_engine.limits.correlation_threshold,
+            )
+            if db is not None
+            else 0.0
+        )
         proposal = TradeRiskProposal(
             account_id=self.account_id,
             strategy_id=self.strategy.name,
@@ -205,6 +229,7 @@ class PaperTradingEngine:
             weekly_pnl=self.weekly_pnl,
             current_exposure=current_exposure,
             strategy_allocation=strategy_allocation,
+            correlated_exposure=correlated_exposure,
             market_data_age_seconds=0.0,
             broker_healthy=await self.broker.is_healthy(),
             repeated_rejections=self.repeated_rejections,

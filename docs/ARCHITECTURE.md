@@ -2829,6 +2829,72 @@ Verified to fail against the pre-fix code (`PositionRecord` has no
 `strategy_id` attribute at all) via `git stash`, then pass once the fix
 is restored.
 
+## Correlated exposure was never computed for paper and autonomous trading
+
+Blueprint §85's "Correlated exposure" risk check exists to stop an account
+from looking diversified while actually being one concentrated bet spread
+across instruments that move together — e.g. two different Nifty
+financials that are 95% correlated. `RiskLimits.max_correlated_exposure_pct`
+and `RiskEngine.evaluate`'s `correlated_exposure_limit` check are both
+correctly implemented, and `app/risk/portfolio.py`'s
+`compute_correlated_exposure` does the real work: it looks up each open
+symbol's `Instrument`, pulls its recent candle history, builds a
+correlation matrix against the target symbol, and returns the notional
+that should count against the limit. `app/api/orders.py`'s live order
+path calls this function on every order and passes the result into
+`TradeRiskProposal.correlated_exposure`.
+
+`PaperTradingEngine.on_candle` — the single code path that builds a
+`TradeRiskProposal` for both manual paper trading (`app/api/paper.py`)
+and fully autonomous trading (`AutoTradeSupervisor` /
+`app/workers/auto_trade_worker.py`, which drives this same engine) never
+called `compute_correlated_exposure` at all. `TradeRiskProposal`'s
+`correlated_exposure` field simply kept its dataclass default of `0.0` on
+every call, so `correlated_exposure_limit` could never fail for paper or
+autonomous trading no matter how concentrated an account actually was in
+correlated instruments — the check was correctly implemented and
+completely unreachable outside the one live-order code path.
+
+`compute_correlated_exposure` needs a database session to look up
+instruments and candle history, but `on_candle` previously took no
+session at all — it's driven directly from in-memory candles in both call
+sites, and the wide unit test suite in `tests/paper/test_engine.py`
+exercises it with plain `Candle` objects and no database. Fixed by adding
+an optional `db: AsyncSession | None = None` parameter to `on_candle`,
+threaded through from its two production callers (`app/api/paper.py`'s
+`feed_candle`, which already has a request-scoped session, and
+`app/workers/auto_trade_worker.py`'s `_process`, which already has one
+too). When a session is available, `on_candle` computes
+`other_position_notionals` from every other open position in the shared
+`PositionManager` and calls `compute_correlated_exposure` exactly the way
+`app/api/orders.py` already does, passing the result into the proposal.
+When `db` is `None` — every existing DB-free unit test — it falls back to
+`0.0`, the same "no correlation data available yet" convention already
+used elsewhere in this engine (`market_data_age_seconds`,
+`recent_price_jump_pct`). `compute_correlated_exposure` itself already
+degrades gracefully (partial or zero data) for a symbol with no
+registered instrument or insufficient candle history, so a caller that
+does pass a session never risks a hard failure over incomplete market
+data.
+
+New `tests/paper/test_engine.py::test_correlated_exposure_limit_blocks_a_position_in_a_correlated_instrument`
+runs two `PaperTradingEngine`s on two different symbols with identical
+close-price history (correlation of 1.0, comfortably above a 0.5
+threshold), sharing one `PositionManager`. The first engine opens a
+position normally; `max_correlated_exposure_pct` is then tightened to
+half of that position's own notional share of the account — a threshold
+the already-open position alone must already exceed, regardless of how
+`RiskEngine.evaluate` internally sizes the second engine's own candidate
+trade (it recomputes size internally via `RiskLimits.risk_per_trade_pct`,
+not the strategy's own `risk.risk_percent`, so the two can differ; sizing
+the threshold off the already-open position's own notional keeps the test
+correct either way). The second engine's matching entry signal is then
+asserted to be rejected specifically on `correlated_exposure_limit`, with
+no second position opened. Verified to fail against the pre-fix code (the
+new test calls `on_candle(candle, db)`, which raises against the
+one-argument pre-fix signature) via `git stash`, then pass once the fix
+is restored.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

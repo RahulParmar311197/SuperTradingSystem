@@ -12,19 +12,39 @@ numbers.
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from app.smc.types import Candle
+
+
+def _returns(closes: list[float]) -> list[float]:
+    """Simple close-to-close returns over an already-ordered close series."""
+    return [(closes[i] - closes[i - 1]) / closes[i - 1] for i in range(1, len(closes)) if closes[i - 1] != 0]
 
 
 def close_returns(candles: list[Candle]) -> list[float]:
     """Simple close-to-close returns, oldest first."""
-    closes = [c.close for c in candles]
-    return [(closes[i] - closes[i - 1]) / closes[i - 1] for i in range(1, len(closes)) if closes[i - 1] != 0]
+    return _returns([c.close for c in candles])
+
+
+def closes_by_timestamp(candles: list[Candle]) -> dict[datetime, float]:
+    """Closes keyed by candle timestamp, so two instruments' series can be
+    aligned on the bars they actually share before being correlated."""
+    return {c.timestamp: c.close for c in candles}
 
 
 def pearson_correlation(a: list[float], b: list[float]) -> float | None:
-    """Pearson correlation of two equal-length return series. Returns
-    `None` when there isn't enough data to say anything (fewer than 2
-    points, or a series with zero variance) rather than a misleading 0.0."""
+    """Pearson correlation of two return series that are already aligned
+    point-for-point — aligning them is the caller's job (see
+    `build_correlation_matrix`, which intersects on timestamps first).
+    Returns `None` when there isn't enough data to say anything (fewer
+    than 2 points, or a series with zero variance) rather than a
+    misleading 0.0.
+
+    Series of differing length are truncated from the tail purely as a
+    defensive fallback; correlating unaligned series that way is
+    meaningless, which is exactly the bug `build_correlation_matrix` now
+    prevents upstream."""
     n = min(len(a), len(b))
     if n < 2:
         return None
@@ -40,13 +60,30 @@ def pearson_correlation(a: list[float], b: list[float]) -> float | None:
     return cov / (var_a * var_b) ** 0.5
 
 
-def build_correlation_matrix(returns_by_symbol: dict[str, list[float]]) -> dict[frozenset[str], float]:
-    """Pairwise correlation for every symbol pair with computable data."""
-    symbols = list(returns_by_symbol)
+def build_correlation_matrix(closes_by_symbol: dict[str, dict[datetime, float]]) -> dict[frozenset[str], float]:
+    """Pairwise correlation for every symbol pair with computable data.
+
+    Takes closes keyed by timestamp, not bare return lists, because two
+    instruments' histories are not interchangeable by position: an
+    illiquid symbol prints fewer bars over the same wall-clock span, and a
+    symbol listed later simply starts later. Each pair is intersected on
+    the timestamps both actually have, *then* returns are computed over
+    that shared series, so every pair of points being correlated covers
+    the same interval. Correlating by list position instead — taking the
+    last N of each — silently compares one instrument's recent history
+    against another's older history and reports a number with no meaning.
+    """
+    symbols = list(closes_by_symbol)
     matrix: dict[frozenset[str], float] = {}
     for i, sym_a in enumerate(symbols):
         for sym_b in symbols[i + 1 :]:
-            corr = pearson_correlation(returns_by_symbol[sym_a], returns_by_symbol[sym_b])
+            closes_a, closes_b = closes_by_symbol[sym_a], closes_by_symbol[sym_b]
+            shared = sorted(set(closes_a) & set(closes_b))
+            if len(shared) < 3:  # need >= 3 closes to get >= 2 returns
+                continue
+            corr = pearson_correlation(
+                _returns([closes_a[t] for t in shared]), _returns([closes_b[t] for t in shared])
+            )
             if corr is not None:
                 matrix[frozenset((sym_a, sym_b))] = corr
     return matrix

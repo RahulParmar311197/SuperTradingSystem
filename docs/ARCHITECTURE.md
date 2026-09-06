@@ -3058,6 +3058,80 @@ sweep, where SMC convention places resting liquidity above the highest of
 the equal highs. That is a behavioural change to the detector rather than
 a fix to this defect, and is better evaluated on its own.
 
+## ScannerWorker ignored each strategy's declared timeframe
+
+`StrategyDefinition.timeframe` is a first-class field of the DSL — blueprint
+§34's example strategy carries `"timeframe": "15m"` as a property of the
+*strategy*, not of whatever happens to be scanning it. Every other consumer
+honours it: `BacktestEngine` and `PaperTradingEngine` both build their
+`EvaluationContext` with `self.strategy.timeframe`, and
+`AutoTradeSupervisor._process` loads candles with
+`get_candles(db, instrument.id, strategy.timeframe)` — the supervisor keeps
+its own `self.timeframe` attribute purely for a startup log line, which is
+itself evidence of the intended contract.
+
+`ScannerWorker.run_once` was the sole outlier. It loaded exactly one candle
+series per instrument, for the worker's own `self.timeframe` (wired as
+`"15m"` in `app/workers/main.py`), analyzed it once, and then evaluated
+**every** active strategy against that single context — the strategy query
+has no timeframe filter, and `strategy.timeframe` was never read anywhere
+in the file. A strategy the user declared on `1h` was therefore matched
+against 15m structure.
+
+The consequences compound. `StrategyEngine._resolve_entry_and_stop` derives
+the entry from `context.current_price` and the stop from the 15m dealing
+range, so the published levels belong to a timeframe the strategy never
+asked for — and a 15m dealing range is materially tighter than a 1h one.
+Since `calculate_position_size` is `risk_amount / abs(entry - stop)`, a user
+acting on that signal takes a position several times larger than the
+strategy was designed for, with every downstream notional check computed
+from the same undersized stop distance. The persisted `Signal.timeframe`
+reads `"15m"` for a `1h` strategy, and `GET /signals` reports it that way.
+Worse, `AutoTradeSupervisor` reloads the *correct* `1h` series for that same
+strategy row, so the signal the user was alerted about and the trade the
+autonomous supervisor actually evaluates come from two different candle
+series, with nothing reconciling them.
+
+The event-type conditions are distorted rather than merely rescaled:
+`bos`/`mss`/`choch`/`liquidity_sweep` filter on
+`current_index - event.index < condition.lookback`, so a `lookback=5` on a
+1h strategy means five hours, but evaluated on 15m candles it silently
+becomes 75 minutes — a different filter, not a scaled one. And for a
+strategy declared on a timeframe this deployment never derives at all
+(`derived_timeframes=["5m", "15m"]`), the worker did not report missing
+data; it quietly substituted 15m and emitted a confident signal.
+
+Fixed by building contexts lazily and caching them per timeframe, keyed off
+each strategy's own `strategy.timeframe`. The scan timeframe is still always
+analyzed (so the `setups` journal, which records raw per-timeframe structure
+detections independent of any strategy, keeps behaving exactly as before),
+and the "analyze once per instrument" saving survives for the common case
+where every strategy shares the scan timeframe. When a strategy's own
+timeframe has no usable history the strategy is **skipped**, never evaluated
+against a substitute series — a signal computed off the wrong candles is
+worse than no signal. `Signal.timeframe` already read `context.timeframe`,
+so it became correct automatically.
+
+Every pre-existing scanner test paired `ScannerWorker(timeframe="15m")` with
+strategy fixtures hard-coding `"timeframe": "15m"`, so the substitution was
+a no-op in all of them and none could have caught this. The new
+`tests/workers/test_scanner_worker.py::test_scanner_uses_each_strategys_own_timeframe`
+registers a `1h` strategy against an instrument whose 15m series is
+deliberately flat (no FVG, never matches) while only its 1h series contains
+the setup. It asserts first that with no 1h history the strategy produces no
+signal at all — rather than being evaluated against 15m — and then, once 1h
+candles exist, that exactly one signal is emitted and persisted with
+`timeframe == "1h"`. Verified to fail against the pre-fix code via
+`git stash`, then pass once the fix is restored.
+
+Two related observations are deliberately left out of this change.
+`strategy.market` is ignored by the same query, so a strategy declared for
+one market is still evaluated against every active instrument; that is a
+real scoping question but a broader behavioural change than this fix.
+Separately, `compute_correlated_exposure` correlates return series by list
+position rather than by timestamp, so two instruments with different candle
+coverage produce a meaningless correlation — worth its own investigation.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

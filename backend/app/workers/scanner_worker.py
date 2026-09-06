@@ -55,29 +55,65 @@ class ScannerWorker:
                     logger.exception("Strategy %s has an invalid definition; skipping", strategy_row.id)
 
             for instrument in instruments:
-                candles = await get_candles(db, instrument.id, self.timeframe)
-                if len(candles) < 3:
-                    continue
+                # `StrategyDefinition.timeframe` is a first-class field of the
+                # strategy, and every other consumer of the DSL honours it --
+                # BacktestEngine, PaperTradingEngine and AutoTradeSupervisor
+                # all load candles for `strategy.timeframe` (the supervisor
+                # keeps its own `self.timeframe` purely for logging). This
+                # worker used to load one series for `self.timeframe` and
+                # evaluate *every* active strategy against it, silently
+                # substituting the scan timeframe for the one the user
+                # declared: a 1h strategy was matched against 15m structure,
+                # its entry/stop came off a 15m dealing range, and the
+                # persisted Signal was labelled "15m". Contexts are built
+                # lazily and cached per timeframe so the "analyze once per
+                # instrument" saving survives for the common case where every
+                # strategy shares the scan timeframe.
+                contexts: dict[str, EvaluationContext | None] = {}
 
-                # Computed once per instrument (not once per strategy):
-                # raw structure detection doesn't depend on any strategy,
-                # and every active strategy would otherwise re-derive an
-                # identical SMC/ICT read of the same candles.
-                smc_context = self.smc_engine.analyze(candles)
-                ict_context = self.ict_engine.analyze(candles)
-                await self._persist_new_setups(db, instrument.id, self.timeframe, smc_context)
+                async def _context_for(timeframe: str) -> EvaluationContext | None:
+                    if timeframe in contexts:
+                        return contexts[timeframe]
+                    candles = await get_candles(db, instrument.id, timeframe)
+                    if len(candles) < 3:
+                        contexts[timeframe] = None
+                        return None
+                    smc_context = self.smc_engine.analyze(candles)
+                    if timeframe == self.timeframe:
+                        # `setups` journal raw structure detections for the
+                        # timeframe actually being scanned, independent of any
+                        # strategy -- so only the scan timeframe's read is
+                        # persisted, not every timeframe a strategy asked for.
+                        await self._persist_new_setups(db, instrument.id, timeframe, smc_context)
+                    contexts[timeframe] = EvaluationContext(
+                        symbol=instrument.symbol,
+                        timeframe=timeframe,
+                        timestamp=candles[-1].timestamp,
+                        current_price=candles[-1].close,
+                        smc=smc_context,
+                        ict=self.ict_engine.analyze(candles),
+                        current_index=len(candles) - 1,
+                    )
+                    return contexts[timeframe]
 
-                context = EvaluationContext(
-                    symbol=instrument.symbol,
-                    timeframe=self.timeframe,
-                    timestamp=candles[-1].timestamp,
-                    current_price=candles[-1].close,
-                    smc=smc_context,
-                    ict=ict_context,
-                    current_index=len(candles) - 1,
-                )
+                # Always analyze the scan timeframe, even if no strategy uses
+                # it, so `setups` keeps being journaled as before.
+                await _context_for(self.timeframe)
 
                 for strategy_id, strategy in strategies:
+                    context = await _context_for(strategy.timeframe)
+                    if context is None:
+                        # No usable history on the strategy's own timeframe.
+                        # Skip it rather than falling back to the scan
+                        # timeframe -- a signal computed off the wrong series
+                        # is worse than no signal.
+                        logger.debug(
+                            "No %s candles for %s; skipping strategy %s",
+                            strategy.timeframe,
+                            instrument.symbol,
+                            strategy_id,
+                        )
+                        continue
                     result = await self._evaluate(db, strategy, strategy_id, instrument, context)
                     if result is not None:
                         results.append(result)

@@ -59,6 +59,90 @@ def test_strategy_with_only_fvg_condition_matches_when_gap_present():
         assert result.matched is False
 
 
+def test_market_entry_below_the_dealing_range_low_does_not_emit_an_inverted_long():
+    # Regression test: the default "market" entry type resolves to
+    # `entry=current_price, stop=dealing_range.range_low` for a long, and the
+    # dealing range is only the most recent confirmed swing high/low -- it is
+    # not guaranteed to bracket the current price. Once price drifts below the
+    # range low, this produced a matched LONG whose stop sat *above* its entry.
+    # Nothing downstream could catch it (`RiskEngine` measures the stop with
+    # `abs(entry - stop)` and `TradeRiskProposal` carries no direction), and
+    # `_maybe_exit`/`_check_exit` then read `candle.low <= stop` as a stop-loss
+    # hit on the very next candle -- filling above the entry and booking a
+    # guaranteed profit labelled `stop_loss`, which also inflated `daily_pnl`
+    # and so loosened the daily-loss halt.
+    #
+    # A zigzag establishes a confirmed swing high and swing low, then price
+    # drifts steadily below that swing low. The jitter keeps every high/low
+    # unique so the strict-uniqueness swing detector actually confirms them.
+    closes = [100, 96, 92, 97, 103, 110, 116, 112, 107, 103, 99, 104, 110, 117, 124, 119, 113, 106, 99, 92, 85]
+    ohlc = []
+    previous = None
+    for index, close in enumerate(closes):
+        open_ = previous if previous is not None else close
+        jitter = index * 0.013
+        ohlc.append((open_, max(open_, close) + 1 + jitter, min(open_, close) - 1 - jitter, close))
+        previous = close
+
+    candles = make_candles(ohlc)
+    context = _build_context(candles)
+
+    # The setup this test depends on: price is genuinely below the range low.
+    assert context.smc.dealing_range is not None
+    assert context.current_price < context.smc.dealing_range.range_low
+
+    strategy = StrategyDefinition(
+        name="Market entry long",
+        market="TESTSYM",
+        timeframe="15m",
+        direction="bullish",
+        conditions=[],
+        entry=EntryConfig(),  # default: "market"
+        risk=RiskConfig(risk_percent=1.0, minimum_rr=2.0),
+    )
+
+    result = StrategyEngine().evaluate(strategy, context)
+
+    assert result.matched is False
+    assert "stop_on_wrong_side_of_entry" in result.missing
+    # Nothing downstream should ever see an inverted bracket.
+    assert result.entry is None and result.stop is None
+
+
+def test_market_entry_inside_the_dealing_range_still_emits_a_valid_long():
+    # The guard above must not suppress the ordinary case: with price above
+    # the range low, a market-entry long is still a well-formed signal.
+    closes = [100, 96, 92, 97, 103, 110, 116, 112, 107, 103, 99, 104, 110, 117, 124, 119, 113]
+    ohlc = []
+    previous = None
+    for index, close in enumerate(closes):
+        open_ = previous if previous is not None else close
+        jitter = index * 0.013
+        ohlc.append((open_, max(open_, close) + 1 + jitter, min(open_, close) - 1 - jitter, close))
+        previous = close
+
+    candles = make_candles(ohlc)
+    context = _build_context(candles)
+
+    assert context.smc.dealing_range is not None
+    assert context.current_price > context.smc.dealing_range.range_low
+
+    strategy = StrategyDefinition(
+        name="Market entry long",
+        market="TESTSYM",
+        timeframe="15m",
+        direction="bullish",
+        conditions=[],
+        entry=EntryConfig(),
+        risk=RiskConfig(risk_percent=1.0, minimum_rr=2.0),
+    )
+
+    result = StrategyEngine().evaluate(strategy, context)
+
+    assert result.matched is True
+    assert result.stop < result.entry < result.target
+
+
 def test_strategy_fails_when_required_condition_missing():
     candles = make_candles(BULLISH_SETUP)
     context = _build_context(candles)

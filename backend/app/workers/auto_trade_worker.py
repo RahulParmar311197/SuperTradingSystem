@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from datetime import datetime
 
 from sqlalchemy import select
@@ -179,7 +180,22 @@ class AutoTradeSupervisor:
 
         position_before = engine.position_manager.get(engine.account_id, engine.symbol)
         snapshot = None
+        # The strategy that actually opened this position, stamped by
+        # `PaperTradingEngine` when the entry filled. `PositionManager` is
+        # shared per *user* and keyed only by (account_id, symbol), while an
+        # engine exists per (user, strategy, instrument) -- so whichever
+        # strategy is iterated first reaches a shared position and runs
+        # `_maybe_exit` on it, even when a different strategy opened it.
+        # Without this, the closing engine journaled the trade against
+        # *itself*: wrong `strategy_id`, wrong `strategy_version`, wrong
+        # journal/notification name, and `opened_at` falling back to the
+        # closing candle because `_opened_at` is keyed by the opener's
+        # triple. `None` means the position predates this attribution (or
+        # came from a path that doesn't stamp it), in which case the
+        # observing engine is still the best answer available.
+        owner_strategy_id = None
         if position_before is not None and position_before.is_open:
+            owner_strategy_id = position_before.strategy_id
             snapshot = {
                 "direction": Direction.LONG if position_before.is_long else Direction.SHORT,
                 "quantity": abs(position_before.quantity),
@@ -279,7 +295,21 @@ class AutoTradeSupervisor:
             )
 
         if outcome.closed_position_pnl is not None and snapshot is not None:
-            opened_at = self._opened_at.pop(key, latest.timestamp)
+            # Journal against whoever opened the position, not whoever
+            # happened to observe the close -- see `owner_strategy_id`
+            # above. The owner's row carries the `version` that was live
+            # when the entry was taken, which is what blueprint §91 means
+            # by "always know exactly which version created a trade".
+            owner_row = strategy_row
+            owner_key = key
+            if owner_strategy_id is not None and owner_strategy_id != str(strategy_row.id):
+                owner_row = await db.get(StrategyRow, uuid.UUID(owner_strategy_id)) or strategy_row
+                owner_key = (str(user.id), owner_strategy_id, str(instrument.id))
+            # The opener stamped `_opened_at` under its own triple, so pop
+            # the owner's key -- popping this engine's would miss and fall
+            # back to the closing candle, collapsing the holding period to
+            # zero.
+            opened_at = self._opened_at.pop(owner_key, latest.timestamp)
             risk_per_unit = abs(snapshot["entry_price"] - snapshot["stop"]) if snapshot["stop"] else None
             r_multiple = (
                 (outcome.closed_position_pnl / snapshot["quantity"]) / risk_per_unit if risk_per_unit else None
@@ -288,8 +318,8 @@ class AutoTradeSupervisor:
                 TradeRow(
                     user_id=user.id,
                     instrument_id=instrument.id,
-                    strategy_id=strategy_row.id,
-                    strategy_version=strategy_row.version,
+                    strategy_id=owner_row.id,
+                    strategy_version=owner_row.version,
                     execution_mode=ExecutionMode.PAPER,
                     direction=snapshot["direction"],
                     entry_price=snapshot["entry_price"],
@@ -302,7 +332,7 @@ class AutoTradeSupervisor:
                     opened_at=opened_at,
                     closed_at=latest.timestamp,
                     journal={
-                        "strategy": strategy_row.name,
+                        "strategy": owner_row.name,
                         "symbol": instrument.symbol,
                         "timeframe": strategy.timeframe,
                     },
@@ -322,7 +352,7 @@ class AutoTradeSupervisor:
                 notification_type=notification_type,
                 title=f"{instrument.symbol} auto-trade closed",
                 body=f"Realized P&L: {outcome.closed_position_pnl:.2f}",
-                data={"strategy": strategy_row.name, "pnl": outcome.closed_position_pnl, "exit_reason": outcome.exit_reason},
+                data={"strategy": owner_row.name, "pnl": outcome.closed_position_pnl, "exit_reason": outcome.exit_reason},
             )
 
         return {

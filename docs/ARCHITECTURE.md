@@ -3504,6 +3504,90 @@ reuses that same fixture with `max_trades_per_day=1` and
 `RiskWindow` exists holding `trades_today == 1`. Verified to fail against
 the pre-fix code with `assert 2 == 1`.
 
+## A closed autonomous trade was journaled against the wrong strategy
+
+`PositionManager` is shared per **user** and keyed only by `(account_id,
+symbol)`, but `AutoTradeSupervisor` runs one `PaperTradingEngine` per
+`(user, strategy, instrument)` triple. `PaperTradingEngine.on_candle` calls
+`_maybe_exit` on whatever position exists for its `(account_id, symbol)`
+without ever checking who opened it:
+
+```python
+position = self.position_manager.get(self.account_id, self.symbol)
+if position is not None and position.is_open:
+    closed_pnl, exit_reason, exit_price = await self._maybe_exit(position, candle)
+```
+
+So with two eligible strategies on one instrument, whichever is iterated
+first reaches the shared position and books the exit for a position the
+*other* strategy opened. The journaling site then recorded that trade
+against itself:
+
+```python
+strategy_id=strategy_row.id,
+strategy_version=strategy_row.version,
+```
+
+Reproduced with one user, one instrument, and two eligible strategies —
+`NEVER-MATCH` (version 7, inserted first, a bearish order-block DSL that
+cannot fire on this data) and `WORKING` (version 3, the bullish FVG fixture
+that does):
+
+```
+journaled against : NEVER-MATCH   strategy_version=7
+journal.strategy  : NEVER-MATCH
+opened_at=09:24  closed_at=09:24  identical=True
+pnl=181.82  (fill numbers themselves are genuine)
+```
+
+Four wrong outputs for one trade. The `strategy_id`, `strategy_version` and
+`journal.strategy` all name a strategy that produced no signal at all —
+`GET /strategies/{id}/versions/7` resolves to a DSL that could not have
+produced this trade. And `opened_at` collapses onto the closing candle,
+because `self._opened_at` is keyed by the *opener's* triple, so the
+observing engine's `pop` misses and falls back to `latest.timestamp`; every
+holding-period figure read off that row is zero. Entry, exit, quantity,
+stop, target and P&L are all correct — the position snapshot is genuine.
+Only the identity is wrong.
+
+This is the same partially-applied-fix shape as the section above: the
+`PositionManager` and then the `RiskWindow` were promoted to per-user, but
+the exit and journaling path still assumed one strategy per position. The
+correct owner was already being recorded — `PaperTradingEngine` stamps
+`new_position.strategy_id = self.strategy_id` when an entry fills, added so
+`max_strategy_allocation_pct` could attribute notional — the journaling
+site simply never consulted it.
+
+Fixed by capturing `position_before.strategy_id` as the owner and, when it
+differs from the observing engine's strategy, loading that `StrategyRow`
+for the `strategy_id`, `strategy_version` and journal/notification name,
+and popping `_opened_at` under the *owner's* triple so the real entry
+timestamp is used. A `None` owner (a position predating this attribution,
+or from a path that does not stamp it) still falls back to the observing
+engine, which is the best answer available.
+
+Deliberately **not** fixed by having a non-owning engine skip the position
+entirely. That would also correct the attribution, but it changes *when* a
+position closes: if the owning strategy is later deactivated or made
+ineligible while its position is open, no engine would ever close it and
+the position would be orphaned. Attributing correctly leaves the existing
+"whoever sees it closes it" behaviour intact and only fixes the identity —
+a smaller blast radius on the one path that runs unattended.
+
+Every one of the twelve pre-existing tests in
+`tests/workers/test_auto_trade_worker.py` creates exactly **one**
+`StrategyRow` per user, so `assert trades[0].strategy_id == strategy_id`
+held no matter what the code did — both sides were the same value. The
+`strategy` half of the engine key had no coverage at all, even though
+`run_once` iterates every eligible strategy against every active
+instrument, which makes several strategies sharing an instrument the normal
+configuration rather than an edge case. The new
+`test_supervisor_journals_a_close_against_the_strategy_that_opened_it`
+registers both strategies, asserts the trade is journaled against `WORKING`
+at version 3 (and explicitly *not* against `NEVER-MATCH`), and asserts
+`opened_at < closed_at`. Verified to fail against the pre-fix code on the
+strategy id.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

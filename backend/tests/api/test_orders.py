@@ -6,7 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import delete, select
 
-from app.brokers.base import AccountInfo, Broker, BrokerOrder, BrokerPosition, OrderRequest, OrderResult, Quote
+from app.brokers.base import AccountInfo, Broker, BrokerError, BrokerOrder, BrokerPosition, OrderRequest, OrderResult, Quote
 from app.core.encryption import encrypt_credentials
 from app.database.models.instruments import Instrument, MarketType, OptionType
 from app.database.models.notifications import Notification, NotificationType
@@ -969,5 +969,110 @@ async def test_closing_trade_records_the_real_fill_price_not_the_claimed_entry(r
                 trade = (await db.execute(select(Trade).where(Trade.user_id == user_id))).scalar_one()
                 assert float(trade.exit_price) == pytest.approx(101.0)
                 assert float(trade.exit_price) != pytest.approx(101.5)
+        finally:
+            await _cleanup(user_id, instrument_id)
+
+
+class _NeverFillsBroker(Broker):
+    """A broker double whose orders never fill (stay `ACKNOWLEDGED`) and
+    whose `cancel_order` always fails, standing in for a real broker
+    reporting an ordinary cancel-time race (the order already filled or was
+    already cancelled broker-side) -- `MockBroker`'s orders always fill
+    immediately, so there'd otherwise be no way to reach `POST
+    /orders/{id}/cancel` with a still-cancelable order at all."""
+
+    async def get_account(self) -> AccountInfo:
+        return AccountInfo(account_id="NEVERFILL", balance=100_000.0, equity=100_000.0)
+
+    async def get_positions(self) -> list[BrokerPosition]:
+        return []
+
+    async def get_orders(self) -> list[BrokerOrder]:
+        return []
+
+    async def get_quote(self, symbol: str) -> Quote:
+        return Quote(symbol=symbol, ltp=100.0)
+
+    async def place_order(self, request: OrderRequest) -> OrderResult:
+        return OrderResult(broker_order_id=str(uuid.uuid4()), status=OrderStatus.ACKNOWLEDGED, filled_quantity=0)
+
+    async def modify_order(self, broker_order_id: str, **changes) -> OrderResult:
+        raise NotImplementedError
+
+    async def cancel_order(self, broker_order_id: str) -> OrderResult:
+        raise BrokerError("Order already complete")
+
+    async def is_healthy(self) -> bool:
+        return True
+
+
+async def test_cancel_order_broker_failure_is_surfaced_cleanly_and_leaves_status_unchanged(require_infra):
+    # Regression test: `UpstoxBroker.cancel_order` had no try/except at
+    # all -- an ordinary broker-level cancel failure (the order already
+    # filled or was already cancelled in the meantime; not a bug, just a
+    # race) propagated as a raw exception straight through `POST
+    # /orders/{id}/cancel`, which had no try/except of its own either. That
+    # both 500'd the request AND left the order permanently stuck: the
+    # exception fired before `order_manager.transition(..., CANCELLED, ...)`
+    # ever ran, so the order stayed at its prior status in both the
+    # in-memory OrderManager and (since persist_order also never ran) the
+    # database, forever, with no way for the client to tell what happened.
+    from app.api import orders as orders_module
+
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        async with async_session_factory() as db:
+            instrument = Instrument(
+                symbol=f"ORDCXL{uuid.uuid4().hex[:6].upper()}", exchange="NSE", market=MarketType.EQUITY, instrument_type="EQ"
+            )
+            db.add(instrument)
+            await db.commit()
+            await db.refresh(instrument)
+            instrument_id = instrument.id
+
+        try:
+            # First order builds this user's stack against the default
+            # MockBroker, then swap in a broker that never fills orders and
+            # always fails to cancel them.
+            r = client.post(
+                "/orders",
+                json={"symbol": instrument.symbol, "direction": "LONG", "entry": 100.0, "stop": 95.0},
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+
+            stack = orders_module._STACKS[user_id]
+            stack.broker = _NeverFillsBroker()
+            stack.execution_engine.broker = stack.broker
+
+            # Different stop from the first order above -- the idempotency
+            # key (app/api/orders.py) is derived from
+            # user/symbol/direction/entry/stop, so reusing the exact same
+            # values here would return the *first* order unchanged (already
+            # MONITORING against MockBroker) instead of placing a new one
+            # against `_NeverFillsBroker`. Entry stays at 100.0, matching
+            # `_NeverFillsBroker.get_quote`'s fixed 100.0 ltp, so this isn't
+            # itself rejected by the entry_matches_market check.
+            r = client.post(
+                "/orders",
+                json={"symbol": instrument.symbol, "direction": "LONG", "entry": 100.0, "stop": 94.0},
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+            order_id = r.json()["id"]
+            assert r.json()["status"] == "ACKNOWLEDGED"
+
+            r = client.post(f"/orders/{order_id}/cancel", headers=headers)
+            assert r.status_code == 502, r.text
+            assert "Order already complete" in r.text
+
+            # The order must be left exactly as it was, never silently
+            # marked CANCELLED and never vanished.
+            r = client.get("/orders", headers=headers)
+            assert r.status_code == 200, r.text
+            order = next(o for o in r.json() if o["id"] == order_id)
+            assert order["status"] == "ACKNOWLEDGED"
         finally:
             await _cleanup(user_id, instrument_id)

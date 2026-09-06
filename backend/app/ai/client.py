@@ -17,6 +17,17 @@ class AIUnavailableError(Exception):
     a silent fallback to a guess."""
 
 
+class AIProviderError(Exception):
+    """Raised when a *configured* provider's API call itself failed (rate
+    limit, timeout, connection error, non-2xx status) -- distinct from
+    `AIUnavailableError` (no provider configured at all) and from a
+    `ValueError` (the provider answered, but its content wasn't usable,
+    e.g. not valid JSON). Concrete `AIClient` implementations should catch
+    their SDK's own exception types and re-raise as this, so callers have
+    exactly one type to handle for "the call to the provider failed"
+    regardless of which provider is configured."""
+
+
 class AIClient(ABC):
     @abstractmethod
     async def complete_json(self, prompt: str, system: str | None = None) -> dict:

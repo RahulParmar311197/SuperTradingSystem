@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.ai.client import AIUnavailableError, get_ai_client
+from app.ai.client import AIProviderError, AIUnavailableError, get_ai_client
 from app.ai.context_builder import build_ai_prompt_context
 from app.ai.explanation import build_trade_explanation
 from app.ai.strategy_builder import StrategyBuilderError, build_strategy_from_description
@@ -74,10 +74,13 @@ async def build_strategy_endpoint(
         return await build_strategy_from_description(payload.description, payload.market, payload.timeframe, ai_client)
     except AIUnavailableError as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
-    except ValueError as exc:
-        # The AI responded but its content wasn't usable (bad JSON, or JSON
-        # that fails the Strategy DSL schema) — not our fault, not the
-        # caller's; a bad gateway to the upstream AI provider.
+    except (AIProviderError, ValueError) as exc:
+        # A configured provider's API call itself failing (AIProviderError
+        # -- rate limit, timeout, connection error) or responding with
+        # content that wasn't usable (bad JSON, or JSON that fails the
+        # Strategy DSL schema -- both surface as ValueError) are both
+        # equally "not our fault, not the caller's" -- a bad gateway to
+        # the upstream AI provider.
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
     except StrategyBuilderError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
@@ -180,9 +183,23 @@ async def propose_trade(
 
     try:
         proposal = await ai_client.complete_json(prompt, system=_TRADE_PROPOSAL_SYSTEM_PROMPT)
-    except AIUnavailableError as exc:
+    except (AIUnavailableError, AIProviderError, ValueError) as exc:
         # Blueprint §110 "no AI -> no trade": still recorded, so an
-        # attempted-but-blocked proposal is auditable like any other.
+        # attempted-but-failed proposal is auditable like any other --
+        # whether no provider is configured at all (`AIUnavailableError`),
+        # a configured provider's API call itself failed (`AIProviderError`
+        # -- rate limit, timeout, connection error), or it answered with
+        # content that wasn't usable (`ValueError`/`AIResponseParseError`).
+        # The latter two are the far more likely failure modes in a real
+        # deployment (they only fire once a provider *is* configured), and
+        # before this they propagated straight past this endpoint's own
+        # audit guarantee to a bare 500 with no `AIDecision` row at all.
+        if isinstance(exc, AIUnavailableError):
+            status_code, reason = status.HTTP_503_SERVICE_UNAVAILABLE, "AI unavailable"
+        elif isinstance(exc, AIProviderError):
+            status_code, reason = status.HTTP_502_BAD_GATEWAY, "AI provider error"
+        else:
+            status_code, reason = status.HTTP_502_BAD_GATEWAY, "AI response unusable"
         db.add(
             AIDecision(
                 user_id=user.id,
@@ -190,12 +207,12 @@ async def propose_trade(
                 input_context=input_context,
                 output={"error": str(exc)},
                 validated=False,
-                validation_errors=["AI unavailable"],
+                validation_errors=[reason],
                 model=None,
             )
         )
         await db.commit()
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+        raise HTTPException(status_code, str(exc)) from exc
 
     validation = validate_ai_trade_proposal(
         proposal,
@@ -277,11 +294,23 @@ async def chat(
     try:
         response = await ai_client.complete_json(prompt, system=_CHAT_SYSTEM_PROMPT)
         reply = str(response.get("reply", "")) if isinstance(response, dict) else str(response)
-    except AIUnavailableError as exc:
-        assistant_message = AIMessage(user_id=user.id, role="assistant", content=f"AI unavailable: {exc}")
+    except (AIUnavailableError, AIProviderError, ValueError) as exc:
+        # Same fix as propose_trade above: a configured provider's API
+        # call failing (AIProviderError) or answering with unusable
+        # content (ValueError/AIResponseParseError) used to propagate past
+        # this except clause entirely -- skipping the assistant AIMessage
+        # row below, and since the earlier `db.add(AIMessage(role="user",
+        # ...))` was never committed before the exception, the user's own
+        # message vanished from `GET /ai/chat/history` too, with no
+        # visible reply anywhere.
+        if isinstance(exc, AIUnavailableError):
+            status_code, prefix = status.HTTP_503_SERVICE_UNAVAILABLE, "AI unavailable"
+        else:
+            status_code, prefix = status.HTTP_502_BAD_GATEWAY, "AI error"
+        assistant_message = AIMessage(user_id=user.id, role="assistant", content=f"{prefix}: {exc}")
         db.add(assistant_message)
         await db.commit()
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+        raise HTTPException(status_code, str(exc)) from exc
 
     assistant_message = AIMessage(user_id=user.id, role="assistant", content=reply)
     db.add(assistant_message)

@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.orders import _execution_mode_for, _stack_for
+from app.api.orders import _execution_mode_for, _mark_open_positions_to_market, _stack_for
 from app.auth.dependencies import get_current_user
 from app.database.models.users import User
 from app.database.session import get_db
@@ -30,7 +30,7 @@ class PortfolioResponse(BaseModel):
 async def get_portfolio(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> PortfolioResponse:
     stack = await _stack_for(user, db)
     account = await stack.broker.get_account()
-    positions = stack.position_manager.open_positions(str(user.id))
+    positions = await _mark_open_positions_to_market(stack, str(user.id))
     # Positions are persisted under whichever execution_mode actually
     # produced them (blueprint §101) -- a user with no connected broker
     # trades PAPER against MockBroker, and querying the LIVE default here

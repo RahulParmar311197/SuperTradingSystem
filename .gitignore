@@ -23,3 +23,7 @@ android/.idea/
 
 # OS
 .DS_Store
+
+# Redis snapshot written into the working tree by a locally-run redis-server
+# (the test suite needs Redis; the server persists its RDB to its cwd).
+dump.rdb

@@ -176,7 +176,7 @@ class AutoTradeSupervisor:
                 "target": position_before.target,
             }
 
-        outcome = await engine.on_candle(latest)
+        outcome = await engine.on_candle(latest, db)
 
         # Blueprint §9/§86: mirrors app/api/paper.py's feed_candle fix --
         # this is the same PaperTradingEngine driving blueprint §54's

@@ -1,8 +1,12 @@
 from datetime import timedelta
 
 import pytest
+from sqlalchemy import delete
 
 from app.brokers.mock import MockBroker
+from app.database.models.instruments import Instrument, MarketType
+from app.database.session import async_session_factory
+from app.market.repository import upsert_candles
 from app.paper.engine import PaperTradingEngine
 from app.risk.limits import RiskLimits
 from app.strategy.dsl import Condition, ConditionType, EntryConfig, RiskConfig, StrategyDefinition
@@ -113,6 +117,77 @@ async def test_strategy_allocation_limit_blocks_a_second_position_for_the_same_s
 
     position_b = shared_positions.get("shared-acct", "ALLOCB")
     assert position_b is None or not position_b.is_open
+
+
+@pytest.mark.asyncio
+async def test_correlated_exposure_limit_blocks_a_position_in_a_correlated_instrument(require_infra):
+    # Regression test: `on_candle` never computed `TradeRiskProposal.
+    # correlated_exposure` at all -- app/api/orders.py's live path does
+    # this for real via `compute_correlated_exposure`, but this engine
+    # (the one both app/api/paper.py's feed_candle and
+    # AutoTradeSupervisor drive) left it at the dataclass default of 0.0,
+    # so `correlated_exposure_limit` (blueprint §85) could never fail for
+    # paper or autonomous trading no matter how concentrated the account
+    # actually was in correlated instruments.
+    strategy = _strategy()
+    shared_positions = PositionManager()
+    limits = RiskLimits(max_correlated_exposure_pct=100.0, correlation_threshold=0.5)
+    engine_a = PaperTradingEngine(
+        strategy, symbol="CORRA", account_id="corr-acct", starting_balance=100_000, risk_limits=limits, position_manager=shared_positions
+    )
+    engine_b = PaperTradingEngine(
+        strategy, symbol="CORRB", account_id="corr-acct", starting_balance=100_000, risk_limits=limits, position_manager=shared_positions
+    )
+
+    async with async_session_factory() as db:
+        instrument_a = Instrument(symbol="CORRA", exchange="NSE", market=MarketType.EQUITY, instrument_type="EQ")
+        instrument_b = Instrument(symbol="CORRB", exchange="NSE", market=MarketType.EQUITY, instrument_type="EQ")
+        db.add_all([instrument_a, instrument_b])
+        await db.flush()
+        # Identical close history for both symbols -- perfectly correlated
+        # (correlation == 1.0), comfortably above the 0.5 threshold above.
+        candles = make_candles(SETUP)
+        await upsert_candles(db, instrument_a.id, "15m", candles)
+        await upsert_candles(db, instrument_b.id, "15m", candles)
+        await db.commit()
+        instrument_a_id, instrument_b_id = instrument_a.id, instrument_b.id
+
+    try:
+        order_created = False
+        async with async_session_factory() as db:
+            for candle in make_candles(SETUP)[:9]:  # stops before target -- leaves the position open
+                outcome = await engine_a.on_candle(candle, db)
+                order_created = order_created or outcome.order_created
+        assert order_created is True
+
+        position_a = shared_positions.get("corr-acct", "CORRA")
+        assert position_a is not None and position_a.is_open
+
+        # Tighten to half of engine_a's own notional share -- `correlated_exposure`
+        # alone must already exceed this regardless of engine_b's own position size.
+        first_notional_pct = abs(position_a.quantity) * position_a.average_price / 100_000 * 100
+        limits.max_correlated_exposure_pct = first_notional_pct * 0.5
+
+        outcome_b = None
+        async with async_session_factory() as db:
+            for candle in make_candles(SETUP)[:9]:
+                outcome_b = await engine_b.on_candle(candle, db)
+                if outcome_b.signal is not None and outcome_b.signal.matched:
+                    break
+
+        assert outcome_b is not None
+        assert outcome_b.risk_rejected_reason is not None
+        assert outcome_b.risk_failed_check == "correlated_exposure_limit"
+
+        position_b = shared_positions.get("corr-acct", "CORRB")
+        assert position_b is None or not position_b.is_open
+    finally:
+        async with async_session_factory() as db:
+            from app.database.models.market import Candle as CandleRow
+
+            await db.execute(delete(CandleRow).where(CandleRow.instrument_id.in_([instrument_a_id, instrument_b_id])))
+            await db.execute(delete(Instrument).where(Instrument.id.in_([instrument_a_id, instrument_b_id])))
+            await db.commit()
 
 
 @pytest.mark.asyncio

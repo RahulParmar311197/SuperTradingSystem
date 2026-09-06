@@ -155,7 +155,7 @@ async def feed_candle(
             "target": position_before.target,
         }
 
-    outcome = await engine.on_candle(candle)
+    outcome = await engine.on_candle(candle, db)
 
     # Blueprint §9/§86: `persist_position` is how a live/MockBroker order
     # placed through POST /orders or /options/execute mirrors its position

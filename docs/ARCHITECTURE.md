@@ -2705,6 +2705,75 @@ Verified to fail against the pre-fix code (both endpoints still report
 `0.0` after the price move) via `git stash`, then pass once the fix is
 restored.
 
+## Options execution never enforced the daily/weekly loss halt, position/trade caps, or the repeated-rejection circuit breaker
+
+`evaluate_options_risk` (`app/risk/options_risk.py`) is the risk gate
+`POST /options/execute` runs every strategy through. Before this round it
+only ever checked `kill_switch`, `exposure_limit`, `liquidity_acceptable`,
+`premium_matches_market`, `market_data_fresh`, and `broker_healthy` —
+because `OptionsRiskProposal` had no fields at all for daily/weekly P&L,
+open-position count, trades-today, or repeated-rejection count. Compare
+that to `RiskEngine.evaluate` (`app/risk/engine.py`), the gate `POST
+/orders`, `PaperTradingEngine`, and `AutoTradeSupervisor` all share: it
+additionally enforces `daily_loss_limit`, `weekly_loss_limit`,
+`max_open_positions`, `max_trades_per_day`, `no_repeated_rejections`, and
+`no_abnormal_price_jump`. `execute_options_strategy` already builds
+`stack = await _stack_for(user, db)` — the exact `_UserTradingStack` that
+tracks `trades_today`/`daily_pnl`/`weekly_pnl`/`repeated_rejections`, a
+few lines away from where `POST /orders` reads those same fields off it —
+but never read or forwarded any of them into the proposal, because there
+was nowhere to put them.
+
+Concretely: a user whose equity trading already lost more than
+`RiskLimits.max_daily_loss_pct` today gets correctly blocked from a new
+`POST /orders` call by `daily_loss_limit` — but the exact same account,
+in the exact same halted state, could still freely open multi-leg options
+strategies through `POST /options/execute`, since that path never looked
+at `daily_pnl` at all. The same gap applied to the account-wide
+open-position cap, the per-day trade-count cap, and the "repeated broker
+rejection" circuit breaker (blueprint §57): none of them were ever
+evaluated for options, no matter how many positions were already open or
+how many times the broker had just rejected a leg.
+
+Fixed by adding `open_positions`, `trades_today`, `daily_pnl`,
+`weekly_pnl`, and `repeated_rejections` to `OptionsRiskProposal`, and the
+matching `daily_loss_limit`/`weekly_loss_limit`/`max_open_positions`/
+`max_trades_per_day`/`no_repeated_rejections` checks to
+`evaluate_options_risk`, mirroring `RiskEngine.evaluate`'s existing logic
+exactly. `execute_options_strategy` now calls `stack._roll_risk_window`
+(the same day/week-boundary reset `POST /orders` already does) and passes
+the stack's real counters into the proposal. It also now actually
+*updates* those counters after execution — `stack.trades_today += 1` and
+`stack.repeated_rejections` tracking per leg placed, and
+`stack.daily_pnl`/`weekly_pnl += realized_delta` when closing a leg
+realizes P&L — the same updates `POST /orders`'s `place_order` already
+does, which options execution had never done at all. Without that second
+half, the new checks would exist but a loss or a run of rejections
+produced entirely through options trading would still be invisible to
+them (and to every subsequent equity order, since the counters are
+shared account-wide on the same stack).
+
+`strategy_allocation_pct`, `correlated_exposure_limit`, and
+`no_abnormal_price_jump` were deliberately left out of this pass: the
+first two need a well-defined "target symbol" to compute against, which a
+multi-leg combination spanning several distinct option contracts doesn't
+cleanly have, and the third needs a single underlying's recent price
+history in the same way. Extending those to multi-leg options is a real
+future improvement but a materially different problem from wiring in the
+four account-wide counters this fix addresses, which needed no such
+extra machinery.
+
+New `tests/api/test_options_execute.py::test_execute_respects_the_accounts_daily_loss_limit`
+places one real equity order to build the account's stack, sets
+`stack.daily_pnl` to a 3% loss (past the 2% default
+`max_daily_loss_pct`), then submits a bull call spread through `POST
+/options/execute` and asserts it's rejected with "Daily loss" in the
+response, that neither leg was ever placed as an order, and that the
+persisted `RiskEvent` records `checks["daily_loss_limit"] is False`.
+Verified to fail against the pre-fix code (the strategy executes
+successfully despite the account-wide daily loss halt) via `git stash`,
+then pass once the fix is restored.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

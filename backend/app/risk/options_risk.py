@@ -27,6 +27,21 @@ class OptionsRiskProposal:
     current_exposure: float  # notional already at risk elsewhere, in account currency
     payoff: PayoffResult
     broker_healthy: bool
+    # Blueprint §56/§57: the same account-wide capital-preservation and
+    # circuit-breaker controls `app.risk.engine.TradeRiskProposal` already
+    # enforces for every other order-entry path (POST /orders,
+    # PaperTradingEngine, AutoTradeSupervisor). An options strategy is a
+    # real trade placed through the same broker/persistence pipeline (see
+    # this proposal's only caller, app.api.options.execute_options_strategy)
+    # and must be bound by the same daily/weekly loss halt, open-position
+    # cap, and per-day trade cap -- not exempt from them just because its
+    # risk shape (a payoff curve, not a single entry/stop) doesn't fit
+    # TradeRiskProposal.
+    open_positions: int = 0
+    trades_today: int = 0
+    daily_pnl: float = 0.0  # negative = loss
+    weekly_pnl: float = 0.0
+    repeated_rejections: int = 0
     market_data_age_seconds: float = 0.0
     liquidity_acceptable: bool = True
     # Worst (max) percent gap, across every leg with a real OptionSnapshot
@@ -65,6 +80,43 @@ def evaluate_options_risk(
             "exposure_limit",
             projected_exposure_pct <= limits.max_exposure_pct,
             f"Projected exposure {projected_exposure_pct:.2f}% vs limit {limits.max_exposure_pct}%",
+        )
+    )
+
+    daily_loss_pct = max(-proposal.daily_pnl, 0) / proposal.account_balance * 100 if proposal.account_balance else 0
+    checks.append(
+        RiskCheck(
+            "daily_loss_limit",
+            daily_loss_pct < limits.max_daily_loss_pct,
+            f"Daily loss {daily_loss_pct:.2f}% vs limit {limits.max_daily_loss_pct}%",
+        )
+    )
+    weekly_loss_pct = max(-proposal.weekly_pnl, 0) / proposal.account_balance * 100 if proposal.account_balance else 0
+    checks.append(
+        RiskCheck(
+            "weekly_loss_limit",
+            weekly_loss_pct < limits.max_weekly_loss_pct,
+            f"Weekly loss {weekly_loss_pct:.2f}% vs limit {limits.max_weekly_loss_pct}%",
+        )
+    )
+    checks.append(
+        RiskCheck(
+            "max_open_positions",
+            proposal.open_positions < limits.max_open_positions,
+            f"{proposal.open_positions} open vs limit {limits.max_open_positions}",
+        )
+    )
+    checks.append(
+        RiskCheck(
+            "max_trades_per_day",
+            proposal.trades_today < limits.max_trades_per_day,
+            f"{proposal.trades_today} trades today vs limit {limits.max_trades_per_day}",
+        )
+    )
+    checks.append(
+        RiskCheck(
+            "no_repeated_rejections",
+            proposal.repeated_rejections < limits.max_repeated_rejections,
         )
     )
     checks.append(RiskCheck("liquidity_acceptable", proposal.liquidity_acceptable))

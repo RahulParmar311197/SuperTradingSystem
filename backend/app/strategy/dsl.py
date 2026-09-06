@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class ConditionType(StrEnum):
@@ -52,6 +52,34 @@ class Condition(BaseModel):
     min_value: float | None = None
     max_value: float | None = None
     lookback: int = 5  # how many recent candles/events count as "recent" for event-type conditions
+
+    @field_validator("operator")
+    @classmethod
+    def _reject_unimplemented_boolean_operators(cls, v: ConditionOperator | None) -> ConditionOperator | None:
+        # Blueprint §33 lists AND/OR/NOT among this DSL's operators, and
+        # `ConditionOperator` declares all three -- but `Condition` is a
+        # flat leaf (§34's own example, and `StrategyDefinition.conditions`'
+        # docstring, both only ever show an implicit AND across the list),
+        # and app/strategy/evaluator.py's `_numeric_compare` -- the only
+        # reader of `Condition.operator` -- never implements AND/OR/NOT.
+        # Before this validator, a strategy using one of them (the AI is
+        # explicitly told it may, per app/ai/strategy_builder.py's system
+        # prompt: "Only use ... operators ... the schema defines") passed
+        # schema validation cleanly and was persisted as a normal-looking
+        # strategy, but `evaluate_condition` silently fell through to
+        # `return False` for that condition on every single candle
+        # forever -- a strategy that can structurally never fire, with
+        # nothing anywhere indicating why. Rejecting these three loudly at
+        # validation time, rather than accepting them into a strategy that
+        # can never trigger, is the honest behavior until real boolean
+        # composition is actually implemented.
+        if v in (ConditionOperator.AND, ConditionOperator.OR, ConditionOperator.NOT):
+            raise ValueError(
+                f"operator={v.value!r} is declared in the schema but not yet implemented by the evaluator -- "
+                "a condition using it would silently never match. Use an implicit AND across separate "
+                "conditions in the strategy's `conditions` list instead."
+            )
+        return v
 
 
 class EntryConfig(BaseModel):

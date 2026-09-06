@@ -3349,6 +3349,76 @@ confirms the persisted row is flat with a positive `realized_pnl`, and
 asserts the endpoint reports that same figure. Verified to fail against the
 pre-fix code with `assert 0.0 == 1000.0`.
 
+## A partial close journaled the whole position as the closed quantity
+
+Both `POST /orders` and `POST /options/execute` write a `trades` row
+(blueprint §61's journal) whenever a fill realizes P&L:
+
+```python
+realized_delta = position_after.realized_pnl - realized_pnl_before
+if realized_delta != 0 and position_before is not None:
+    await record_trade(
+        ...
+        quantity=abs(position_before["quantity"]),
+        pnl=realized_delta,
+```
+
+That condition is any non-zero realized delta, which includes a **partial**
+reduce — but the quantity passed is the whole pre-fill position. Closing 40
+of a 100-unit position therefore journaled `quantity=100` alongside a `pnl`
+covering only those 40 units, so the row did not agree with itself:
+
+```
+PARTIAL CLOSE of 40 out of 100 @ 100 -> 120
+  what record_trade is passed: quantity=100.0  entry=100.0  pnl=800.0
+  implied by those numbers:    100 units x (120-100) = 2000
+  actually closed:             40 units x (120-100) = 800   <-- matches pnl
+```
+
+It also double-counts. The later close of the remaining 60 journals another
+row saying 60, so `SUM(trades.quantity)` across the position reaches 160 for
+what was only ever a 100-unit position — any per-instrument volume or
+average-size figure computed off the journal is inflated.
+
+Fixed by passing `min(final_order.filled_quantity, abs(position_before["quantity"]))`
+at both call sites. The `min` is what makes this correct for a flip as well
+as a reduce, which is worth spelling out because the three cases differ:
+
+| case | pre-fill | fill | realized P&L covers | old | new |
+|---|---|---|---|---|---|
+| partial reduce | 100 long | sell 40 | 40 units | 100 ✗ | 40 ✓ |
+| full close | 100 long | sell 100 | 100 units | 100 ✓ | 100 ✓ |
+| flip | 100 long | sell 120 | 100 units | 100 ✓ | 100 ✓ |
+
+On a flip the fill exceeds the position: 100 units close and a fresh 20-unit
+short opens, and the realized P&L covers only the 100 that closed — so
+clamping to the pre-fill size, not taking the fill quantity outright, is
+what keeps that row honest. The old code was right in two of the three
+cases, which is why this went unnoticed.
+
+Nothing reads the `trades` table through the API today — there is no
+`GET /trades` — so this corrupted the journal rather than producing a wrong
+response, which is exactly why it needed catching before anything starts
+reading it.
+
+`tests/api/test_orders.py::test_partial_close_journals_only_the_quantity_actually_closed`
+opens a position, closes part of it, and asserts both that the journaled
+quantity matches the fill and that the row reproduces its own `pnl` from
+`quantity * (exit - entry)` — the internal-consistency check that the
+old row failed. Verified to fail against the pre-fix code with
+`assert 100.0 == 25.0`.
+
+Producing a partial close through the API is less obvious than it looks:
+`PlaceOrderRequest` has **no `quantity` field**. Every order is sized by the
+server as `balance * risk_per_trade_pct / abs(entry - stop)`, so a client
+cannot ask for a specific size, and a `quantity` key in the request body is
+silently ignored. A partial reduce is produced by giving the closing order a
+*wider* stop than the opening one, which buys proportionally fewer units.
+The realized-P&L test added alongside the previous section originally passed
+a `quantity` field for its full close; it happened to work because the
+equal-width stop produced an equal size, but it implied a contract the API
+does not have, and has been rewritten to say what actually drives the sizing.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

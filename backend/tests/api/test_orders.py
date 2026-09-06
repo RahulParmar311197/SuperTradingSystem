@@ -148,6 +148,76 @@ async def test_place_and_close_order_persists_to_database(require_infra):
             await _cleanup(user_id, instrument_id)
 
 
+async def test_partial_close_journals_only_the_quantity_actually_closed(require_infra):
+    # Regression test: the `record_trade` call fires on any non-zero
+    # `realized_delta`, which includes a *partial* reduce, but it passed
+    # `quantity=abs(position_before["quantity"])` -- the whole pre-fill
+    # position. Closing 40 of a 100-unit position therefore journaled
+    # `quantity=100` next to a `pnl` covering only those 40 units, so the
+    # row did not agree with itself: 100 units moving 100 -> 120 is 2000,
+    # not the 800 recorded. Summing `trades.quantity` across the position
+    # also double-counted, reaching 160 units for a 100-unit position.
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        async with async_session_factory() as db:
+            instrument = Instrument(
+                symbol=f"PART{uuid.uuid4().hex[:6].upper()}", exchange="NSE", market=MarketType.EQUITY, instrument_type="EQ"
+            )
+            db.add(instrument)
+            await db.commit()
+            await db.refresh(instrument)
+            instrument_id = instrument.id
+
+        try:
+            r = client.post(
+                "/orders",
+                json={"symbol": instrument.symbol, "direction": "LONG", "entry": 100.0, "stop": 95.0},
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+
+            async with async_session_factory() as db:
+                position_row = (await db.execute(select(Position).where(Position.user_id == user_id))).scalar_one()
+                opened_quantity = float(position_row.quantity)
+            assert opened_quantity > 1
+
+            # Close only part of it, at a profit. POST /orders has no
+            # `quantity` field -- it always sizes the order itself as
+            # `balance * risk_per_trade_pct / abs(entry - stop)` -- so a
+            # partial reduce is produced by giving the closing order a
+            # *wider* stop than the opening one, which buys fewer units.
+            r = client.post(
+                "/orders",
+                json={"symbol": instrument.symbol, "direction": "SHORT", "entry": 110.0, "stop": 130.0},
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+            partial = float(r.json()["quantity"])
+            assert 0 < partial < opened_quantity, "expected the closing order to be smaller than the open position"
+
+            async with async_session_factory() as db:
+                position_row = (await db.execute(select(Position).where(Position.user_id == user_id))).scalar_one()
+                assert position_row.is_open is True, "expected a partial close to leave the position open"
+                assert float(position_row.quantity) == pytest.approx(opened_quantity - partial, rel=1e-6)
+
+                trade_row = (await db.execute(select(Trade).where(Trade.user_id == user_id))).scalar_one()
+                journaled_quantity = float(trade_row.quantity)
+                pnl = float(trade_row.pnl)
+                entry_price = float(trade_row.entry_price)
+                exit_price = float(trade_row.exit_price)
+
+            # The row must describe the fill that actually happened, not the
+            # position that existed before it.
+            assert journaled_quantity == pytest.approx(partial, rel=1e-6)
+            # And it must be internally consistent: quantity * (exit - entry)
+            # has to reproduce the recorded pnl.
+            assert journaled_quantity * (exit_price - entry_price) == pytest.approx(pnl, rel=1e-6)
+        finally:
+            await _cleanup(user_id, instrument_id)
+
+
 async def test_live_order_notifies_on_trade_executed_and_position_closed(require_infra):
     # Regression test: `place_order` only ever called `create_notification`
     # on risk rejection -- a real fill that opens or closes a live

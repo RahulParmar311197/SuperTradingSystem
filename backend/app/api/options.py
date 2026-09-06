@@ -420,7 +420,11 @@ async def execute_options_strategy(
                     # `leg.premium`, which `pnl` above was actually computed
                     # from (via PositionManager.apply_fill).
                     exit_price=final_order.average_fill_price,
-                    quantity=abs(position_before["quantity"]),
+                    # Same fix as app/api/orders.py's record_trade call --
+                    # the quantity this fill actually closed, not the whole
+                    # pre-fill position, which on a partial reduce left the
+                    # journal row disagreeing with its own `pnl`.
+                    quantity=min(final_order.filled_quantity, abs(position_before["quantity"])),
                     pnl=realized_delta,
                     position_id=position_row.id,
                     execution_mode=execution_mode,

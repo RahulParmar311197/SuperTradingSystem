@@ -2527,6 +2527,65 @@ code (the first bucket's derived candle gets silently overwritten with
 `open=104.0` instead of the correct `100.0`, mixing in a base candle from
 the second bucket) and pass once the fix is restored.
 
+## Options execution's "market data fresh" risk check was structurally dead — it could never fail
+
+`app/risk/options_risk.py`'s `evaluate_options_risk` implements a
+`market_data_fresh` `RiskCheck` for the multi-leg options execution path
+(`POST /options/execute`), the direct analogue of the equity order path's
+own freshness guard (`app/api/orders.py` populates
+`TradeRiskProposal.market_data_age_seconds` from
+`app.core.redis.get_price_age_seconds` before calling `RiskEngine`). The
+check itself is correct: `proposal.market_data_age_seconds <=
+limits.market_data_max_staleness_seconds` (10s by default). But
+`OptionsRiskProposal.market_data_age_seconds` defaults to `0.0`, and the
+only place an `OptionsRiskProposal` is ever constructed
+(`app/api/options.py`'s `execute_strategy`) never set it — unlike its two
+sibling fields computed in the very same per-leg snapshot loop
+(`liquidity_acceptable`, `premium_deviation_pct`), which the loop actually
+populates from each leg's `OptionSnapshot`. Since `0.0` is always `<=
+10.0`, `market_data_fresh` could never fail, for any input: it was
+structurally dead code masquerading as a live check.
+
+This mattered for more than "a check that never fires" — the decision's
+outcome, including this specific check's `passed` value, is written
+verbatim into the persisted `RiskEvent.checks` audit row
+(`{c.name: c.passed for c in decision.checks}`). Every approved (and every
+rejected-for-another-reason) options strategy therefore carried a
+`"market_data_fresh": true` in its permanent audit trail, falsely
+attesting that freshness had been verified — even for a leg whose
+`OptionSnapshot` was hours stale, or one with no snapshot at all (the
+`_latest_option_snapshot is None` branch, which the code's own comment
+notes is the common case today: "this environment has no options-chain
+ingestion pipeline yet"). A real order could be placed against arbitrarily
+stale options-chain data with the audit log actively asserting the
+opposite.
+
+Fixed by computing a real per-leg staleness in that same loop —
+`(datetime.now(timezone.utc) - snapshot.snapshot_at).total_seconds()` —
+and taking the worst (max) value across every leg that has a snapshot,
+mirroring `premium_deviation_pct`'s existing "worst case across legs with
+real data" pattern exactly (including its documented "0.0 when no leg has
+snapshot data yet" default, which intentionally avoids permanently
+blocking this endpoint in an environment that has no ingestion pipeline at
+all — the same tradeoff already made explicit for the liquidity check).
+That computed value is now passed into
+`OptionsRiskProposal(market_data_age_seconds=...)`, so a leg with an
+actually-stale snapshot now correctly fails `market_data_fresh` and is
+rejected, with an honest `false` recorded in the audit row — while an
+order with fresh (or entirely absent) snapshot data behaves exactly as
+before.
+
+New `tests/api/test_options_execute.py::test_execute_rejects_when_the_real_quote_is_stale`
+creates an `OptionSnapshot` 15 seconds old — past the 10s risk-engine
+threshold but still under the liquidity filter's own separate 30s
+quote-age threshold, so the failure is isolated to `market_data_fresh`
+specifically — with `premium` set to match the snapshot's mid exactly (so
+`premium_matches_market` also can't be the cause). Asserts a 403 with
+"Data age" in the response, no `Order` row created, and the persisted
+`RiskEvent.checks["market_data_fresh"]` is `False`. Verified to fail
+against the pre-fix code (the same request returns 201 with the order
+actually placed) and pass once the fix is restored, via `git stash`.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

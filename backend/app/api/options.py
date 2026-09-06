@@ -1,5 +1,6 @@
 import dataclasses
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
@@ -251,6 +252,10 @@ async def execute_options_strategy(
     # "entry_matches_market" precedent, extended here to options premiums:
     # see RiskLimits.max_premium_deviation_pct).
     premium_deviation_pct = 0.0
+    # Worst (max) staleness across every leg with a real OptionSnapshot --
+    # 0.0 when no leg has snapshot data yet, matching premium_deviation_pct's
+    # same "nothing to check yet" default just above.
+    market_data_age_seconds = 0.0
     for leg in payload.legs:
         snapshot = await _latest_option_snapshot(db, instruments[leg.symbol].id)
         if snapshot is None:
@@ -272,6 +277,8 @@ async def execute_options_strategy(
             if mid:
                 deviation = abs(leg.premium - mid) / mid * 100
                 premium_deviation_pct = max(premium_deviation_pct, deviation)
+        age = (datetime.now(timezone.utc) - snapshot.snapshot_at).total_seconds()
+        market_data_age_seconds = max(market_data_age_seconds, age)
 
     stack = await _stack_for(user, db)
     open_positions = stack.position_manager.open_positions(str(user.id))
@@ -283,6 +290,7 @@ async def execute_options_strategy(
         current_exposure=current_exposure,
         payoff=payoff,
         broker_healthy=await stack.broker.is_healthy(),
+        market_data_age_seconds=market_data_age_seconds,
         liquidity_acceptable=liquidity_acceptable,
         premium_deviation_pct=premium_deviation_pct,
     )

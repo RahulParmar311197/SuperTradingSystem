@@ -409,6 +409,101 @@ async def test_supervisor_caps_trades_per_day_account_wide_across_instruments(db
             await db.commit()
 
 
+# A DSL that cannot fire on the bullish SETUP data: bearish, and gated on an
+# order-block retest the fixture never produces.
+NEVER_MATCHING_DEFINITION = {
+    **STRATEGY_DEFINITION,
+    "name": "NEVER-MATCH",
+    "direction": "bearish",
+    "conditions": [{"type": "order_block", "direction": "bearish"}],
+    "entry": {"type": "order_block_retest"},
+}
+
+
+async def test_supervisor_journals_a_close_against_the_strategy_that_opened_it(db_instrument):
+    # Regression test: `PositionManager` is shared per *user* and keyed only
+    # by (account_id, symbol), but an engine exists per
+    # (user, strategy, instrument). `PaperTradingEngine.on_candle` runs
+    # `_maybe_exit` on whatever position exists for its (account_id, symbol)
+    # without checking who opened it -- so with two eligible strategies, the
+    # one iterated first reaches the shared position and books the exit for a
+    # position the *other* strategy opened. The trade was then journaled
+    # against the observing engine: wrong `strategy_id`, wrong
+    # `strategy_version`, wrong journal/notification name, and `opened_at`
+    # collapsing to the closing candle because `_opened_at` is keyed by the
+    # opener's triple and the observer's lookup missed.
+    #
+    # Every other test in this file creates exactly one StrategyRow per user,
+    # so `trades[0].strategy_id == strategy_id` held no matter what the code
+    # did -- both sides were the same value. The `strategy` half of the engine
+    # key had no coverage at all, even though `run_once` iterates every
+    # eligible strategy against every active instrument, making multiple
+    # strategies per instrument the normal configuration.
+    start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
+    candles = [Candle(start + timedelta(minutes=i), o, h, l, c, 100) for i, (o, h, l, c) in enumerate(SETUP)]
+
+    async with async_session_factory() as db:
+        user = User(
+            id=uuid.uuid4(),
+            email=f"autotrade-owner-{uuid.uuid4().hex[:8]}@example.com",
+            password_hash=hash_password("irrelevant123"),
+            name="Auto Trade Owner",
+            trading_permissions=[TradingPermission.AUTO_TRADE.value],
+            auto_trading_enabled=True,
+            auto_trading_risk_per_trade_pct=1.0,
+            auto_trading_max_positions=5,
+        )
+        db.add(user)
+        await db.flush()
+        # Inserted first so it is iterated first and reaches the shared
+        # position before the strategy that actually opened it. Distinct
+        # `version` values make a mis-attributed row unambiguous.
+        never = StrategyRow(
+            user_id=user.id,
+            name="NEVER-MATCH",
+            definition=NEVER_MATCHING_DEFINITION,
+            version=7,
+            is_active=True,
+            eligible_for_auto_trading=True,
+        )
+        working = StrategyRow(
+            user_id=user.id,
+            name="WORKING",
+            definition={**STRATEGY_DEFINITION, "market": db_instrument.symbol},
+            version=3,
+            is_active=True,
+            eligible_for_auto_trading=True,
+        )
+        db.add_all([never, working])
+        await db.commit()
+        user_id, never_id, working_id = user.id, never.id, working.id
+
+    try:
+        supervisor = AutoTradeSupervisor(timeframe="15m")
+        for i in range(len(candles)):
+            async with async_session_factory() as db:
+                await upsert_candles(db, db_instrument.id, "15m", [candles[i]])
+            await supervisor.run_once()
+
+        async with async_session_factory() as db:
+            trades = (await db.execute(select(TradeRow).where(TradeRow.user_id == user_id))).scalars().all()
+
+        assert len(trades) == 1, "expected exactly one journaled trade"
+        trade = trades[0]
+        # NEVER-MATCH produced no signal at all; the trade belongs to WORKING.
+        assert trade.strategy_id == working_id
+        assert trade.strategy_id != never_id
+        # Blueprint §91: the version must be the one that created the trade.
+        assert trade.strategy_version == 3
+        assert trade.journal["strategy"] == "WORKING"
+        # `opened_at` must be the entry candle, not the closing one -- a
+        # collapsed holding period is the tell that the observer's
+        # `_opened_at` lookup missed.
+        assert trade.opened_at < trade.closed_at
+    finally:
+        await _cleanup(user_id)
+
+
 async def test_supervisor_writes_risk_event_audit_row_for_the_opened_trade(db_instrument):
     # Regression test: `_process` drives the exact same `PaperTradingEngine`/
     # `RiskEngine` as `POST /orders`/`POST /options/execute`, but never wrote

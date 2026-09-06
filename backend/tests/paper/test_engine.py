@@ -1,3 +1,4 @@
+import uuid
 from datetime import timedelta
 
 import pytest
@@ -75,14 +76,20 @@ async def test_strategy_allocation_limit_blocks_a_second_position_for_the_same_s
     # across multiple instruments.
     strategy = _strategy()
     shared_positions = PositionManager()
+    # Both engines run the *same* strategy row, so they share its
+    # `strategies.id` -- exactly what AutoTradeSupervisor passes when it
+    # builds one engine per (strategy, instrument) pair. Attribution keys
+    # on this id, never on the DSL name, which PUT /strategies/{id} can
+    # rewrite at any time.
+    strategy_id = str(uuid.uuid4())
     # Starts permissive so the first (engine_a) trade is free to open --
     # tightened below once we know that trade's real notional.
     limits = RiskLimits(max_strategy_allocation_pct=100.0)
     engine_a = PaperTradingEngine(
-        strategy, symbol="ALLOCA", account_id="shared-acct", starting_balance=100_000, risk_limits=limits, position_manager=shared_positions
+        strategy, symbol="ALLOCA", account_id="shared-acct", starting_balance=100_000, risk_limits=limits, position_manager=shared_positions, strategy_id=strategy_id
     )
     engine_b = PaperTradingEngine(
-        strategy, symbol="ALLOCB", account_id="shared-acct", starting_balance=100_000, risk_limits=limits, position_manager=shared_positions
+        strategy, symbol="ALLOCB", account_id="shared-acct", starting_balance=100_000, risk_limits=limits, position_manager=shared_positions, strategy_id=strategy_id
     )
 
     order_created = False
@@ -93,7 +100,7 @@ async def test_strategy_allocation_limit_blocks_a_second_position_for_the_same_s
 
     position_a = shared_positions.get("shared-acct", "ALLOCA")
     assert position_a is not None and position_a.is_open
-    assert position_a.strategy_id == strategy.name  # attributed to the strategy that opened it
+    assert position_a.strategy_id == strategy_id  # attributed by strategies.id, not the mutable DSL name
 
     # Tighten the limit to half of what engine_a's own trade alone already
     # used -- `strategy_allocation_pct` can only ever grow from here once
@@ -314,3 +321,54 @@ async def test_paper_engine_enforces_abnormal_price_jump_limit():
             saw_rejection = True
 
     assert saw_rejection is True
+
+
+@pytest.mark.asyncio
+async def test_paper_engine_respects_strategy_level_kill_switch(require_infra):
+    # Regression test: blueprint §58 requires three kill-switch levels
+    # (global, account, strategy). Global and account both worked because
+    # both sides key on `str(user.id)`, but the strategy level was a silent
+    # no-op end to end: `POST /admin/kill-switch/strategy/{strategy_id}`
+    # writes `kill:strategy:<strategies.id UUID>` -- the only strategy
+    # identifier the API ever exposes -- while the engine asked Redis for
+    # `kill:strategy:<StrategyDefinition.name>`, the free-text DSL name.
+    # They never matched, so an admin stopping a runaway strategy watched it
+    # keep placing orders.
+    #
+    # The sibling test above covers the global level, which is why this gap
+    # survived: nothing exercised the one level that was broken.
+    from app.core.redis import clear_strategy_kill, set_strategy_kill
+
+    strategy_id = str(uuid.uuid4())  # a real strategies.id, as both callers now pass
+    engine = PaperTradingEngine(_strategy(), symbol="TESTSYM", strategy_id=strategy_id)
+
+    await set_strategy_kill(strategy_id)
+    try:
+        saw_rejection = False
+        failed_check = None
+        for candle in make_candles(SETUP):
+            outcome = await engine.on_candle(candle)
+            if outcome.risk_rejected_reason is not None:
+                saw_rejection = True
+                failed_check = failed_check or outcome.risk_failed_check
+
+        assert saw_rejection is True
+        assert failed_check == "kill_switch"
+        assert engine.trades_today == 0
+    finally:
+        await clear_strategy_kill(strategy_id)
+
+    # And the kill must be scoped: a different strategy's id must not stop
+    # this one. `strategies.name` has no uniqueness constraint, so a
+    # name-keyed kill would also have crossed between two users'
+    # identically-named strategies.
+    other_engine = PaperTradingEngine(_strategy(), symbol="TESTSYM", strategy_id=str(uuid.uuid4()))
+    await set_strategy_kill(strategy_id)
+    try:
+        opened = False
+        for candle in make_candles(SETUP):
+            outcome = await other_engine.on_candle(candle)
+            opened = opened or outcome.order_created
+        assert opened is True, "a kill on one strategy must not stop a different strategy"
+    finally:
+        await clear_strategy_kill(strategy_id)

@@ -129,6 +129,7 @@ class AutoTradeSupervisor:
                     max_open_positions=user.auto_trading_max_positions,
                 ),
                 position_manager=position_manager,
+                strategy_id=str(strategy_row.id),
             )
             self._engines[key] = engine
             self._engine_strategy_versions[key] = strategy_row.version

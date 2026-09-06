@@ -3202,6 +3202,83 @@ the barely-overlapping case. The pre-existing
 timestamp-keyed input while keeping its original intent (a pair whose
 returns are an exact 2x multiple still correlates 1.0).
 
+## The strategy-level kill switch could never stop a strategy
+
+Blueprint §58 requires three kill-switch levels: global, account, and
+strategy. The global and account levels work — both the admin endpoint and
+the engine key them on `str(user.id)`. The strategy level was a silent
+no-op end to end, because the two sides used different identifiers for
+"which strategy".
+
+`POST /admin/kill-switch/strategy/{strategy_id}` writes
+`kill:strategy:<strategy_id>`, and `strategy_id` there is the
+`strategies.id` UUID — the only strategy identifier the platform exposes
+anywhere. It is what `GET /strategies` returns, and
+`Signal.strategy_id`, `Order.strategy_id` and `Trade.strategy_id` are all
+foreign keys to it. Meanwhile `PaperTradingEngine.on_candle` asked Redis
+for `kill:strategy:<StrategyDefinition.name>` — the free-text DSL name —
+because the engine was only ever handed the parsed `StrategyDefinition`,
+which has no id field at all. The keys never matched.
+
+Reproduced against live Redis, arming the kill before the first candle:
+
+```
+=== admin kills by the real Strategy.id UUID (what the API exposes) ===
+   kill key: kill:strategy:68c111a8-1a4d-424d-b45e-f3140ea1bd19
+   -> order_created=True   rejection=None                                trades_today=1
+=== same kill, but keyed by StrategyDefinition.name ===
+   kill key: kill:strategy:Bullish FVG retest
+   -> order_created=False  rejection=Strategy Bullish FVG retest is stopped  trades_today=0
+```
+
+An admin stopping a runaway strategy the only way the API allows watched
+it keep placing orders. `app/api/orders.py` and `app/api/options.py` both
+pass `strategy_id=None` (a manual order has no strategy), which is
+correct — so `PaperTradingEngine`, driving both manual paper sessions and
+`AutoTradeSupervisor`, was the *only* path where the strategy level
+applied at all, and there it never fired.
+
+The DSL name was never a viable key even for an admin who typed the name
+instead of the id. `strategies.name` has no uniqueness constraint, so two
+users' identically-named strategies would share one kill key — a kill
+crossing account boundaries. And `PUT /strategies/{id}` rewrites
+`row.name`, after which `AutoTradeSupervisor` swaps `engine.strategy` in
+place, so a name-keyed kill would stop applying the moment a strategy was
+renamed.
+
+Fixed by giving `PaperTradingEngine` the real identity instead of deriving
+one from the mutable DSL name: a `strategy_id: str | None = None`
+constructor argument, passed as `str(strategy_row.id)` by both production
+callers (`app/api/paper.py`'s `create_paper_session` and
+`AutoTradeSupervisor._process`), both of which already had the row in
+hand. `load_kill_switch_state` and `KillSwitchState.is_blocked` already
+treat `None` as "no strategy level to check", so a bare engine with no
+database row behind it degrades honestly rather than matching on a name.
+
+The same root cause reached one more place. The per-strategy allocation
+attribution added for `max_strategy_allocation_pct` (see the
+"Maximum strategy allocation" section above) stamped
+`PositionRecord.strategy_id` with `self.strategy.name` and matched on it,
+so renaming a strategy silently orphaned its already-open positions from
+their own allocation limit on the very next candle. Both the stamp and the
+match now use the same stable `strategies.id`, and the match additionally
+requires `self.strategy_id is not None` so two id-less engines are never
+conflated by `None == None`.
+
+Why the existing tests missed it, in all three places that looked like
+coverage: `tests/api/test_admin.py` round-trips an *opaque* string through
+the endpoint and asserts only `is_strategy_killed(that_string)` — any key
+naming passes. `tests/risk/test_engine.py` kills `"strat-1"` and evaluates
+a proposal whose `strategy_id` is also `"strat-1"`, so the substitution
+under test is a no-op. And `tests/paper/test_engine.py`'s kill-switch test
+exercises the real Redis wiring but only via `set_global_kill()` — the one
+level that was never broken. The new
+`test_paper_engine_respects_strategy_level_kill_switch` arms the kill
+through `set_strategy_kill(<the id the engine was given>)`, asserts
+`risk_failed_check == "kill_switch"` with zero trades, and then asserts
+the converse: a kill on one strategy's id must *not* stop an engine
+running a different one.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

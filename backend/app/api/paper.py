@@ -107,7 +107,11 @@ async def create_paper_session(
 
     session_id = uuid.uuid4()
     engine = PaperTradingEngine(
-        strategy, symbol=payload.symbol, account_id=str(user.id), starting_balance=payload.starting_balance
+        strategy,
+        symbol=payload.symbol,
+        account_id=str(user.id),
+        starting_balance=payload.starting_balance,
+        strategy_id=str(strategy_row.id),
     )
     _SESSIONS[session_id] = _PaperSession(
         engine=engine, instrument_id=instrument.id, strategy_id=strategy_row.id, strategy_version=strategy_row.version

@@ -3419,6 +3419,91 @@ a `quantity` field for its full close; it happened to work because the
 equal-width stop produced an equal size, but it implied a contract the API
 does not have, and has been rewritten to say what actually drives the sizing.
 
+## Autonomous trading enforced the daily caps per engine, not per account
+
+Blueprint §57 lists *maximum daily loss*, *maximum weekly loss*, *maximum
+trades per day* and *repeated order rejection* as user-configurable risk
+controls. They are stored on the `User` row by `POST /auto-trading/enable`
+— one set per **account**. `AutoTradeSupervisor` enforced them per
+**engine**, and it runs one `PaperTradingEngine` per
+`(user, strategy, instrument)` triple.
+
+The counters lived on the engine as plain instance attributes:
+
+```python
+self.trades_today = 0
+self.daily_pnl = 0.0
+self.weekly_pnl = 0.0
+self.repeated_rejections = 0
+```
+
+This is the same defect the shared `PositionManager` already fixed for
+`max_open_positions` — and the comment introducing that shared instance
+says so explicitly, that "a user's `max_open_positions`/exposure limits are
+account-wide across every instrument and strategy they're auto-trading."
+The position ledger was shared; these four counters were left behind on the
+engine, so the reasoning was applied to one half of §57 and not the other.
+
+Reproduced with two engines for one account, sharing a `PositionManager`
+exactly as the supervisor wires them, under `max_trades_per_day=1` (with
+`max_open_positions=5` so it could not be the binding constraint):
+
+```
+  entry opened on INSTA
+  entry opened on INSTB
+max_trades_per_day = 1
+entries actually opened same day: 2
+  engine INSTA: trades_today=1
+  engine INSTB: trades_today=1
+```
+
+Two entries under a cap of one, because each engine evaluated its own
+`0 < 1`. Generalised, a user trading N instruments across M strategies gets
+up to **N×M × `max_trades_per_day`** autonomous entries per day, and
+`run_once` iterates every `Instrument.active`, so N is the whole instrument
+universe rather than a hand-picked pair.
+
+The loss limits are the dangerous half. `daily_loss_limit` compares
+`daily_pnl` against the configured percentage, so with the counter split
+per triple the halt only fires once a **single** `(strategy, instrument)`
+pair has lost the entire configured limit by itself. An account can lose a
+multiple of its own daily cap before anything stops it — on the one path
+that runs unattended with no human watching. `repeated_rejections` splits
+the same way, so §57's repeated-rejection breaker needs N×M consecutive
+broker rejections instead of the configured threshold.
+
+Fixed by extracting the four counters, plus the day/week window
+bookkeeping and the roll logic, into a small `RiskWindow` dataclass, and
+giving `PaperTradingEngine` a `risk_window` constructor argument that
+defaults to a private instance — so a standalone engine behaves exactly as
+before. `AutoTradeSupervisor` now keeps `self._risk_windows: dict[str,
+RiskWindow]` alongside `self._position_managers` and passes the same
+instance to every engine for a user. The engine keeps `trades_today`,
+`daily_pnl`, `weekly_pnl` and `repeated_rejections` as properties
+delegating to that window, so existing readers (`app/api/paper.py`'s state
+response, the tests) and the `+=` updates inside `on_candle` are unchanged.
+
+Each engine still has its own `MockBroker` with its own balance, which is
+fine for the percentage limits: the shared `daily_pnl` is now the account's
+true total loss, and every engine's balance is the same configured starting
+balance, so `daily_loss_pct` is computed against the account size the user
+actually configured.
+
+Why the existing tests missed it, in both places that looked like coverage:
+`test_supervisor_caps_open_positions_account_wide_across_instruments`
+builds exactly the two-instrument fixture this needs but varies only
+`max_open_positions` and asserts only on positions.
+`test_supervisor_notifies_daily_loss_limit_distinctly` monkeypatches
+`RiskEngine.evaluate` to return a hard-coded failing `daily_loss_limit`
+check and asserts only the resulting notification type — the real counter
+never participates, so the substitution under test is a no-op for this bug.
+The new `test_supervisor_caps_trades_per_day_account_wide_across_instruments`
+reuses that same fixture with `max_trades_per_day=1` and
+`max_open_positions=5`, and asserts one position account-wide, a rejected
+`RiskEvent` naming `max_trades_per_day`, and that exactly one shared
+`RiskWindow` exists holding `trades_today == 1`. Verified to fail against
+the pre-fix code with `assert 2 == 1`.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

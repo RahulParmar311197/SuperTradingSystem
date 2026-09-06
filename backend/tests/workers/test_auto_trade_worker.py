@@ -318,6 +318,97 @@ async def test_supervisor_caps_open_positions_account_wide_across_instruments(db
             await db.commit()
 
 
+async def test_supervisor_caps_trades_per_day_account_wide_across_instruments(db_instrument):
+    # Regression test: `_process` caches one `PaperTradingEngine` per
+    # (user, strategy, instrument), and blueprint §57's day/week counters
+    # -- trades_today, daily_pnl, weekly_pnl, repeated_rejections -- lived
+    # on the engine, so each was a *per-triple* counter. The sibling test
+    # above shared one `PositionManager` per user so `max_open_positions`
+    # would hold account-wide, but these counters were left behind: with
+    # `auto_trading_max_trades_per_day=1`, the same setup firing on two
+    # instruments in one pass opened two entries, because each engine
+    # evaluated its own `0 < 1`. More dangerously, the same split applied
+    # to the loss limits -- the daily halt only fired once a *single*
+    # (strategy, instrument) pair had lost the whole configured limit by
+    # itself, so an account could lose N*M times the cap before anything
+    # stopped it.
+    #
+    # `max_open_positions` is deliberately set high here so it cannot be
+    # the binding constraint; the only cap under test is trades-per-day.
+    start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
+    candles = [Candle(start + timedelta(minutes=i), o, h, l, c, 100) for i, (o, h, l, c) in enumerate(SETUP)]
+
+    async with async_session_factory() as db:
+        second_instrument = Instrument(
+            symbol=f"TEST{uuid.uuid4().hex[:8].upper()}", exchange="NSE", market=MarketType.EQUITY, instrument_type="EQ"
+        )
+        db.add(second_instrument)
+        await db.commit()
+        await db.refresh(second_instrument)
+        second_instrument_id = second_instrument.id
+
+        user = User(
+            id=uuid.uuid4(),
+            email=f"autotrade-daycap-{uuid.uuid4().hex[:8]}@example.com",
+            password_hash=hash_password("irrelevant123"),
+            name="Auto Trade Day Cap",
+            trading_permissions=[TradingPermission.AUTO_TRADE.value],
+            auto_trading_enabled=True,
+            auto_trading_risk_per_trade_pct=1.0,
+            auto_trading_max_positions=5,
+            auto_trading_max_trades_per_day=1,
+        )
+        db.add(user)
+        await db.flush()
+        strategy = StrategyRow(
+            user_id=user.id,
+            name="Bullish FVG retest",
+            definition={**STRATEGY_DEFINITION, "market": db_instrument.symbol},
+            is_active=True,
+            eligible_for_auto_trading=True,
+        )
+        db.add(strategy)
+        await db.commit()
+        user_id = user.id
+
+    try:
+        supervisor = AutoTradeSupervisor(timeframe="15m")
+        for i in range(9):
+            async with async_session_factory() as db:
+                await upsert_candles(db, db_instrument.id, "15m", [candles[i]])
+                await upsert_candles(db, second_instrument_id, "15m", [candles[i]])
+            await supervisor.run_once()
+
+        async with async_session_factory() as db:
+            positions = (
+                await db.execute(select(Position).where(Position.user_id == user_id))
+            ).scalars().all()
+            risk_events = (
+                await db.execute(select(RiskEvent).where(RiskEvent.user_id == user_id))
+            ).scalars().all()
+
+        # One entry, account-wide, under a cap of one -- not one per
+        # instrument.
+        assert len(positions) == 1
+
+        # And the second instrument's engine must have been stopped by the
+        # cap itself, not by some other check happening to fire.
+        assert any(
+            event.checks is not None and event.checks.get("max_trades_per_day") is False
+            for event in risk_events
+        ), "expected a rejected RiskEvent naming max_trades_per_day"
+
+        # The counter itself is shared, not duplicated per engine.
+        assert len(supervisor._risk_windows) == 1
+        assert next(iter(supervisor._risk_windows.values())).trades_today == 1
+    finally:
+        await _cleanup(user_id)
+        async with async_session_factory() as db:
+            await db.execute(delete(CandleRow).where(CandleRow.instrument_id == second_instrument_id))
+            await db.execute(delete(Instrument).where(Instrument.id == second_instrument_id))
+            await db.commit()
+
+
 async def test_supervisor_writes_risk_event_audit_row_for_the_opened_trade(db_instrument):
     # Regression test: `_process` drives the exact same `PaperTradingEngine`/
     # `RiskEngine` as `POST /orders`/`POST /options/execute`, but never wrote

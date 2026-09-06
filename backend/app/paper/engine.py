@@ -76,6 +76,55 @@ class PaperTradeOutcome:
     exit_price: float | None = None
 
 
+@dataclass
+class RiskWindow:
+    """The rolling day/week risk counters behind blueprint §57's
+    `max_trades_per_day`, `daily_loss_limit`, `weekly_loss_limit` and
+    "Repeated order rejection" checks.
+
+    These are **account-wide** limits: `POST /auto-trading/enable` stores
+    them on the `User` row, one set per account, not one per instrument or
+    per strategy. They live in their own object for the same reason
+    `PositionManager` does -- `AutoTradeSupervisor` runs one
+    `PaperTradingEngine` per `(user, strategy, instrument)` triple, so a
+    counter held on the engine is a per-triple counter, and a user trading
+    N instruments across M strategies gets N*M times the cap they
+    configured. Callers driving several engines for one account must pass
+    the *same* instance to every one of them; a caller with a single engine
+    can let it default and behave exactly as before.
+    """
+
+    trades_today: int = 0
+    daily_pnl: float = 0.0
+    weekly_pnl: float = 0.0
+    repeated_rejections: int = 0
+    # `None` means "no window established yet", so the first candle never
+    # wrongly resets a freshly constructed window.
+    risk_day: object | None = None
+    risk_week: object | None = None
+
+    def roll(self, now: datetime) -> None:
+        """Resets `trades_today`/`daily_pnl` at a day boundary and
+        `weekly_pnl` at an (ISO) week boundary, keyed off `now` (the
+        current candle's timestamp -- the engine's logical clock, the same
+        convention `app.smc.liquidity.detect_session_levels` uses for
+        day/week bucketing). Without this, these counters only ever reset
+        when the worker process restarts, making the daily/weekly checks
+        lifetime-of-process limits rather than the rolling limits they are
+        meant to be -- see docs/ARCHITECTURE.md. Mirrors
+        `_UserTradingStack._roll_risk_window` (app/api/orders.py), which
+        does the same thing keyed off wall clock instead."""
+        today = now.date()
+        this_week = now.isocalendar()[:2]
+        if self.risk_day is not None and today != self.risk_day:
+            self.trades_today = 0
+            self.daily_pnl = 0.0
+        if self.risk_week is not None and this_week != self.risk_week:
+            self.weekly_pnl = 0.0
+        self.risk_day = today
+        self.risk_week = this_week
+
+
 class PaperTradingEngine:
     def __init__(
         self,
@@ -89,6 +138,7 @@ class PaperTradingEngine:
         broker: MockBroker | None = None,
         position_manager: PositionManager | None = None,
         strategy_id: str | None = None,
+        risk_window: RiskWindow | None = None,
     ) -> None:
         self.strategy = strategy
         # The `strategies.id` UUID this engine is running, as a string --
@@ -125,40 +175,52 @@ class PaperTradingEngine:
         self.position_manager = position_manager or PositionManager()
         self.execution_engine = ExecutionEngine(self.broker, self.order_manager, self.position_manager)
 
-        self.trades_today = 0
-        self.daily_pnl = 0.0
-        self.weekly_pnl = 0.0
-        # Blueprint §57 "Repeated order rejection" -- consecutive
-        # broker-level rejections (see the update after each fresh order
-        # attempt in `on_candle` below).
-        self.repeated_rejections = 0
-        # Set on first `_roll_risk_window` call, not here -- `None` means
-        # "no window established yet", so the first candle never wrongly
-        # resets a freshly constructed engine.
-        self._risk_day = None
-        self._risk_week = None
+        # Blueprint §57's day/week counters (trades_today, daily_pnl,
+        # weekly_pnl, repeated_rejections). Account-wide, so callers
+        # driving several engines for one account must share one instance
+        # -- see `RiskWindow` and the `position_manager` note above, which
+        # exists for exactly the same reason.
+        self.risk_window = risk_window or RiskWindow()
+
+    # `trades_today`/`daily_pnl`/`weekly_pnl`/`repeated_rejections` are
+    # read and mutated by callers (app/api/paper.py's state response, the
+    # tests) and throughout `on_candle`; they proxy to the shared
+    # `risk_window` so every engine driving one account sees, and updates,
+    # the same counters.
+    @property
+    def trades_today(self) -> int:
+        return self.risk_window.trades_today
+
+    @trades_today.setter
+    def trades_today(self, value: int) -> None:
+        self.risk_window.trades_today = value
+
+    @property
+    def daily_pnl(self) -> float:
+        return self.risk_window.daily_pnl
+
+    @daily_pnl.setter
+    def daily_pnl(self, value: float) -> None:
+        self.risk_window.daily_pnl = value
+
+    @property
+    def weekly_pnl(self) -> float:
+        return self.risk_window.weekly_pnl
+
+    @weekly_pnl.setter
+    def weekly_pnl(self, value: float) -> None:
+        self.risk_window.weekly_pnl = value
+
+    @property
+    def repeated_rejections(self) -> int:
+        return self.risk_window.repeated_rejections
+
+    @repeated_rejections.setter
+    def repeated_rejections(self, value: int) -> None:
+        self.risk_window.repeated_rejections = value
 
     def _roll_risk_window(self, now: datetime) -> None:
-        """Resets `trades_today`/`daily_pnl` at a day boundary and
-        `weekly_pnl` at an (ISO) week boundary, keyed off `now` (the
-        current candle's timestamp -- this engine's logical clock, the
-        same convention `app.smc.liquidity.detect_session_levels` uses for
-        day/week bucketing). Without this, these counters only ever reset
-        when the worker process restarts, making RiskEngine.evaluate's
-        `max_trades_per_day`/`daily_loss_limit`/`weekly_loss_limit` checks
-        lifetime-of-process limits rather than the rolling daily/weekly
-        limits they're meant to be -- see docs/ARCHITECTURE.md. Mirrors
-        `_UserTradingStack._roll_risk_window` (app/api/orders.py), which
-        does the same thing keyed off wall clock instead."""
-        today = now.date()
-        this_week = now.isocalendar()[:2]
-        if self._risk_day is not None and today != self._risk_day:
-            self.trades_today = 0
-            self.daily_pnl = 0.0
-        if self._risk_week is not None and this_week != self._risk_week:
-            self.weekly_pnl = 0.0
-        self._risk_day = today
-        self._risk_week = this_week
+        self.risk_window.roll(now)
 
     async def on_candle(self, candle: Candle, db: AsyncSession | None = None) -> PaperTradeOutcome:
         self._roll_risk_window(candle.timestamp)

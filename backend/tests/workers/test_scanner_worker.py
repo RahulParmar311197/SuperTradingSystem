@@ -199,3 +199,89 @@ async def test_scanner_persists_setups_and_dedups_across_passes(db_instrument):
     async with async_session_factory() as db:
         setups_after = (await db.execute(select(SetupRow).where(SetupRow.instrument_id == db_instrument.id))).scalars().all()
     assert len(setups_after) == first_pass_count
+
+
+async def test_scanner_uses_each_strategys_own_timeframe(db_instrument):
+    # Regression test: `run_once` loaded a single candle series for the
+    # worker's own `self.timeframe` and evaluated *every* active strategy
+    # against it, ignoring `StrategyDefinition.timeframe` entirely. Every
+    # other consumer of the DSL honours that field (BacktestEngine,
+    # PaperTradingEngine, AutoTradeSupervisor all load candles for
+    # `strategy.timeframe`), so a strategy the user declared on 1h was
+    # matched against 15m structure, its entry/stop were taken off a 15m
+    # dealing range, and the persisted Signal was mislabelled "15m".
+    #
+    # The two candle series here are deliberately different: only the 1h
+    # series contains the bullish FVG the strategy needs. A scanner that
+    # substitutes its own timeframe sees the flat 15m series and produces
+    # nothing; a correct one evaluates the 1h series and signals on it.
+    start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
+    flat = [(100, 100.5, 99.5, 100)] * 9  # no FVG, no structure -- never matches
+    fifteen_min = [
+        Candle(start + timedelta(minutes=15 * i), o, h, l, c, 100) for i, (o, h, l, c) in enumerate(flat)
+    ]
+    hourly = [Candle(start + timedelta(hours=i), o, h, l, c, 100) for i, (o, h, l, c) in enumerate(SETUP)]
+
+    async with async_session_factory() as db:
+        user = User(
+            id=uuid.uuid4(),
+            email=f"scannertf-{uuid.uuid4().hex[:8]}@example.com",
+            password_hash=hash_password("irrelevant123"),
+            name="Scanner Timeframe Test",
+        )
+        db.add(user)
+        await db.flush()
+
+        strategy = StrategyRow(
+            user_id=user.id,
+            name="Hourly FVG retest",
+            definition={
+                "name": "Hourly FVG retest",
+                "market": "TESTSYM",
+                "timeframe": "1h",  # deliberately NOT the worker's timeframe
+                "direction": "bullish",
+                "conditions": [{"type": "fvg", "direction": "bullish"}],
+                "entry": {"type": "fvg_retest"},
+                "risk": {"risk_percent": 1.0, "minimum_rr": 2.0},
+            },
+            is_active=True,
+        )
+        db.add(strategy)
+        await db.commit()
+        strategy_id = strategy.id
+        user_id = user.id
+
+        await upsert_candles(db, db_instrument.id, "15m", fifteen_min)
+
+    try:
+        worker = ScannerWorker(timeframe="15m")
+
+        # With no 1h history at all, the strategy must be skipped outright --
+        # never silently evaluated against the 15m series instead.
+        await worker.run_once()
+        async with async_session_factory() as db:
+            signals = (
+                await db.execute(select(SignalRow).where(SignalRow.strategy_id == strategy_id))
+            ).scalars().all()
+        assert signals == [], "a 1h strategy must not be evaluated against 15m candles"
+
+        # Now give it real 1h history containing the setup it looks for.
+        async with async_session_factory() as db:
+            await upsert_candles(db, db_instrument.id, "1h", hourly)
+
+        await worker.run_once()
+        async with async_session_factory() as db:
+            signals = (
+                await db.execute(select(SignalRow).where(SignalRow.strategy_id == strategy_id))
+            ).scalars().all()
+
+        assert len(signals) == 1, "expected the 1h strategy to signal off its own 1h series"
+        # The signal must be labelled with the strategy's timeframe, not the
+        # scanner's -- this is what `GET /signals` reports to the user.
+        assert signals[0].timeframe == "1h"
+    finally:
+        async with async_session_factory() as db:
+            await db.execute(delete(SignalRow).where(SignalRow.strategy_id == strategy_id))
+            await db.execute(delete(StrategyRow).where(StrategyRow.id == strategy_id))
+            await db.execute(delete(User).where(User.id == user_id))
+            await db.commit()

@@ -9,7 +9,7 @@ from app.database.models.notifications import Notification, NotificationType
 from app.database.models.risk import AuditLog, RiskEvent
 from app.database.models.risk import RiskDecision as RiskEventDecision
 from app.database.models.strategy import Strategy as StrategyRow
-from app.database.models.trading import Trade as TradeRow
+from app.database.models.trading import ExecutionMode, Position, Trade as TradeRow
 from app.database.models.users import TradingPermission, User
 from app.database.session import async_session_factory
 from app.market.repository import upsert_candles
@@ -46,6 +46,7 @@ STRATEGY_DEFINITION = {
 
 async def _cleanup(user_id: uuid.UUID) -> None:
     async with async_session_factory() as db:
+        await db.execute(delete(Position).where(Position.user_id == user_id))
         await db.execute(delete(TradeRow).where(TradeRow.user_id == user_id))
         await db.execute(delete(Notification).where(Notification.user_id == user_id))
         await db.execute(delete(AuditLog).where(AuditLog.user_id == user_id))
@@ -168,6 +169,71 @@ async def test_supervisor_opens_and_journals_a_trade_end_to_end(db_instrument):
         # SETUP), so the close specifically must be TP_HIT, not the generic
         # POSITION_CLOSED every close used to fire regardless of which side
         # of the bracket actually closed it.
+    finally:
+        await _cleanup(user_id)
+
+
+async def test_supervisor_persists_the_open_position_to_the_database(db_instrument):
+    # Regression test: a live/MockBroker order placed through POST /orders
+    # or /options/execute mirrors its position into the `positions` table
+    # via `persist_position` (app/trading/persistence.py) so GET
+    # /portfolio, GET /admin/portfolio-snapshot, and the
+    # correlated-exposure risk check can see it -- this supervisor (driving
+    # blueprint §54's flagship autonomous trading loop) never called
+    # persist_position at all. Every position it ever opened was invisible
+    # to every one of those for its entire open lifetime, only appearing
+    # once it closed and a Trade row appeared.
+    start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
+    candles = [Candle(start + timedelta(minutes=i), o, h, l, c, 100) for i, (o, h, l, c) in enumerate(SETUP)]
+
+    async with async_session_factory() as db:
+        user = User(
+            id=uuid.uuid4(),
+            email=f"autotrade-position-{uuid.uuid4().hex[:8]}@example.com",
+            password_hash=hash_password("irrelevant123"),
+            name="Auto Trade Position",
+            trading_permissions=[TradingPermission.AUTO_TRADE.value],
+            auto_trading_enabled=True,
+            auto_trading_risk_per_trade_pct=1.0,
+        )
+        db.add(user)
+        await db.flush()
+        strategy = StrategyRow(
+            user_id=user.id,
+            name="Bullish FVG retest",
+            definition={**STRATEGY_DEFINITION, "market": db_instrument.symbol},
+            is_active=True,
+            eligible_for_auto_trading=True,
+        )
+        db.add(strategy)
+        await db.commit()
+        user_id = user.id
+
+    try:
+        supervisor = AutoTradeSupervisor(timeframe="15m")
+        # Candles 0-8 only -- per SETUP's comments, the position opens on
+        # candle 8 (the FVG retest) and only runs to target on candle 9, so
+        # this leaves it open.
+        for i in range(9):
+            async with async_session_factory() as db:
+                await upsert_candles(db, db_instrument.id, "15m", [candles[i]])
+            await supervisor.run_once()
+
+        async with async_session_factory() as db:
+            position = (await db.execute(select(Position).where(Position.user_id == user_id))).scalar_one()
+            assert position.execution_mode == ExecutionMode.PAPER
+            assert position.instrument_id == db_instrument.id
+            assert position.is_open is True
+            assert float(position.quantity) > 0
+
+        # The final candle runs hard to target and closes it.
+        async with async_session_factory() as db:
+            await upsert_candles(db, db_instrument.id, "15m", [candles[9]])
+        await supervisor.run_once()
+
+        async with async_session_factory() as db:
+            position = (await db.execute(select(Position).where(Position.user_id == user_id))).scalar_one()
+            assert position.is_open is False
     finally:
         await _cleanup(user_id)
 

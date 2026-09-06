@@ -49,6 +49,7 @@ from app.paper.engine import PaperTradingEngine
 from app.risk.limits import RiskLimits
 from app.strategy.dsl import StrategyDefinition
 from app.trading.persistence import persist_position
+from app.trading.position_manager import PositionManager
 
 logger = logging.getLogger("workers.autotrade")
 
@@ -61,6 +62,15 @@ class AutoTradeSupervisor:
         self._engine_strategy_versions: dict[tuple[str, str, str], int] = {}
         self._opened_at: dict[tuple[str, str, str], datetime] = {}
         self._last_candle_seen: dict[tuple[str, str, str], datetime] = {}
+        # One PositionManager per *user* (not per engine) -- an engine
+        # exists per (strategy, instrument) pair, but a user's
+        # `max_open_positions`/exposure limits are account-wide across
+        # every instrument and strategy they're auto-trading, mirroring
+        # `_UserTradingStack` (app/api/orders.py), which does the same for
+        # the manual/live path. See the comment on `PaperTradingEngine`'s
+        # `position_manager` constructor argument for what breaks without
+        # this shared instance.
+        self._position_managers: dict[str, PositionManager] = {}
 
     async def run_once(self) -> list[dict]:
         results: list[dict] = []
@@ -107,6 +117,7 @@ class AutoTradeSupervisor:
         key = (str(user.id), str(strategy_row.id), str(instrument.id))
         engine = self._engines.get(key)
         if engine is None:
+            position_manager = self._position_managers.setdefault(str(user.id), PositionManager())
             engine = PaperTradingEngine(
                 strategy,
                 symbol=instrument.symbol,
@@ -117,6 +128,7 @@ class AutoTradeSupervisor:
                     max_trades_per_day=user.auto_trading_max_trades_per_day,
                     max_open_positions=user.auto_trading_max_positions,
                 ),
+                position_manager=position_manager,
             )
             self._engines[key] = engine
             self._engine_strategy_versions[key] = strategy_row.version

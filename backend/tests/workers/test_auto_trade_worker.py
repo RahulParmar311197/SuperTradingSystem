@@ -5,6 +5,8 @@ import pytest
 from sqlalchemy import delete, select
 
 from app.auth.security import hash_password
+from app.database.models.instruments import Instrument, MarketType
+from app.database.models.market import Candle as CandleRow
 from app.database.models.notifications import Notification, NotificationType
 from app.database.models.risk import AuditLog, RiskEvent
 from app.database.models.risk import RiskDecision as RiskEventDecision
@@ -236,6 +238,84 @@ async def test_supervisor_persists_the_open_position_to_the_database(db_instrume
             assert position.is_open is False
     finally:
         await _cleanup(user_id)
+
+
+async def test_supervisor_caps_open_positions_account_wide_across_instruments(db_instrument):
+    # Regression test: `_process` caches one `PaperTradingEngine` per
+    # (user, strategy, instrument), and each engine used to build its own
+    # private `PositionManager` -- so the risk proposal's `open_positions`
+    # could only ever see the position for *that one instrument*, never a
+    # position simultaneously opened by another instrument's engine for
+    # the same user. `auto_trading_max_positions` was therefore enforced
+    # per-instrument, not account-wide: with the cap set to 1, the same
+    # bullish setup firing on two different instruments in the same pass
+    # could open two simultaneous positions instead of one. Mirrors
+    # `_UserTradingStack` (app/api/orders.py), which shares one
+    # `PositionManager` per user for exactly this reason.
+    start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
+    candles = [Candle(start + timedelta(minutes=i), o, h, l, c, 100) for i, (o, h, l, c) in enumerate(SETUP)]
+
+    async with async_session_factory() as db:
+        second_instrument = Instrument(
+            symbol=f"TEST{uuid.uuid4().hex[:8].upper()}", exchange="NSE", market=MarketType.EQUITY, instrument_type="EQ"
+        )
+        db.add(second_instrument)
+        await db.commit()
+        await db.refresh(second_instrument)
+        second_instrument_id = second_instrument.id
+
+        user = User(
+            id=uuid.uuid4(),
+            email=f"autotrade-cap-{uuid.uuid4().hex[:8]}@example.com",
+            password_hash=hash_password("irrelevant123"),
+            name="Auto Trade Position Cap",
+            trading_permissions=[TradingPermission.AUTO_TRADE.value],
+            auto_trading_enabled=True,
+            auto_trading_risk_per_trade_pct=1.0,
+            auto_trading_max_positions=1,
+        )
+        db.add(user)
+        await db.flush()
+        strategy = StrategyRow(
+            user_id=user.id,
+            name="Bullish FVG retest",
+            definition={**STRATEGY_DEFINITION, "market": db_instrument.symbol},
+            is_active=True,
+            eligible_for_auto_trading=True,
+        )
+        db.add(strategy)
+        await db.commit()
+        user_id = user.id
+
+    try:
+        supervisor = AutoTradeSupervisor(timeframe="15m")
+        # Candle 8 is the entry signal (see SETUP's comment) -- feed both
+        # instruments the identical setup in lockstep so both engines
+        # would independently match and try to open on the exact same
+        # `run_once()` pass.
+        for i in range(9):
+            async with async_session_factory() as db:
+                await upsert_candles(db, db_instrument.id, "15m", [candles[i]])
+                await upsert_candles(db, second_instrument_id, "15m", [candles[i]])
+            await supervisor.run_once()
+
+        async with async_session_factory() as db:
+            open_positions = (
+                await db.execute(
+                    select(Position).where(Position.user_id == user_id, Position.is_open.is_(True))
+                )
+            ).scalars().all()
+
+        # Exactly one position, account-wide -- the cap of 1 must hold
+        # across both instruments, not one independently satisfied slot
+        # per instrument.
+        assert len(open_positions) == 1
+    finally:
+        await _cleanup(user_id)
+        async with async_session_factory() as db:
+            await db.execute(delete(CandleRow).where(CandleRow.instrument_id == second_instrument_id))
+            await db.execute(delete(Instrument).where(Instrument.id == second_instrument_id))
+            await db.commit()
 
 
 async def test_supervisor_writes_risk_event_audit_row_for_the_opened_trade(db_instrument):

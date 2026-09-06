@@ -45,7 +45,7 @@ from app.database.models.users import TradingPermission, User
 from app.database.session import async_session_factory
 from app.market.repository import get_candles
 from app.notifications.service import create_notification
-from app.paper.engine import PaperTradingEngine
+from app.paper.engine import PaperTradingEngine, RiskWindow
 from app.risk.limits import RiskLimits
 from app.strategy.dsl import StrategyDefinition
 from app.trading.persistence import persist_position
@@ -71,6 +71,15 @@ class AutoTradeSupervisor:
         # `position_manager` constructor argument for what breaks without
         # this shared instance.
         self._position_managers: dict[str, PositionManager] = {}
+        # One RiskWindow per *user*, for exactly the same reason as the
+        # PositionManager above: blueprint §57's max_trades_per_day,
+        # daily/weekly loss limits and repeated-rejection breaker are
+        # account-wide, but an engine exists per (strategy, instrument)
+        # pair. Held on the engine, each of those counters was per-triple,
+        # so a user trading N instruments across M strategies got N*M times
+        # the cap they configured -- and the daily-loss halt only fired
+        # once a *single* pair had lost the whole limit by itself.
+        self._risk_windows: dict[str, RiskWindow] = {}
 
     async def run_once(self) -> list[dict]:
         results: list[dict] = []
@@ -118,6 +127,7 @@ class AutoTradeSupervisor:
         engine = self._engines.get(key)
         if engine is None:
             position_manager = self._position_managers.setdefault(str(user.id), PositionManager())
+            risk_window = self._risk_windows.setdefault(str(user.id), RiskWindow())
             engine = PaperTradingEngine(
                 strategy,
                 symbol=instrument.symbol,
@@ -130,6 +140,7 @@ class AutoTradeSupervisor:
                 ),
                 position_manager=position_manager,
                 strategy_id=str(strategy_row.id),
+                risk_window=risk_window,
             )
             self._engines[key] = engine
             self._engine_strategy_versions[key] = strategy_row.version

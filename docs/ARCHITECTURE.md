@@ -2978,6 +2978,86 @@ pins the ordinary case — price above the range low still produces a
 well-formed `stop < entry < target` signal — so the guard cannot silently
 over-block legitimate setups.
 
+## Equal-highs/lows liquidity pools were swept by their own constituent swings
+
+Blueprint §22's Liquidity Engine specifies a strict ordering — liquidity
+pool forms, *then* price sweeps it, *then* rejection, *then* structure
+confirmation. `detect_equal_levels` broke the first link:
+
+```python
+avg_price = sum(s.price for s in group) / len(group)
+first = min(group, key=lambda s: s.index)
+pools.append(LiquidityPool(..., price=avg_price, formed_index=first.index, ...))
+```
+
+An equal-highs pool does not exist until the swing that makes the level
+"equal" has printed — that is, until its **last** member. Anchoring
+`formed_index` at the **first** member left `detect_sweeps` scanning from
+`formed_index + 1`, a window that still contained the pool's own later
+members. Since `price` is the group *average*, any member priced beyond
+that average trips the sweep test on its own candle. And because a swing
+high by construction closes below its own high, `rejected` (set from
+`candle.close < pool.price`) is almost always true too — so the phantom
+event is reported as a rejection, the highest-conviction variant of the
+pattern.
+
+The engine therefore announced "buy-side liquidity at X was swept, with
+rejection" at the exact moment a double top completed, when price had
+never traded through the level at all. Reproduced on a NIFTY-scale double
+top (swing highs 22,000 and 22,008, pool price 22,004): the pool is
+reported `swept=True, swept_index=40, rejected=True` while the highest
+high in the entire series is 22,008 — the equal high itself, never
+exceeded.
+
+The same line causes a second, opposite failure. `detect_sweeps` `break`s
+on its first hit, so the phantom sweep permanently pins `swept_index` and
+the *genuine* sweep, when it eventually arrives, is never recorded. The
+detector thus both invents a sweep that did not happen and goes blind to
+the one that did.
+
+Nothing downstream filters this. `SMCContext.recent_sweeps` simply returns
+pools with `p.swept`, and `app/strategy/evaluator.py`'s
+`ConditionType.LIQUIDITY_SWEEP` only checks `current_index -
+p.swept_index < condition.lookback`. The blueprint's own shipped example
+strategy ("Bullish Liquidity Sweep", §34) is built on precisely this
+condition, so a phantom sweep flows straight through `StrategyEngine` into
+`PaperTradingEngine`/`AutoTradeSupervisor` and becomes a real order.
+
+The repository's own test fixture had been documenting the bug without
+catching it. `tests/smc/test_liquidity.py`'s `EQUAL_HIGHS` fixture
+comments index 8 as "sweeps above both highs, closes back below ->
+rejection", but the engine was actually recording `swept_index=5` — the
+pool's own second equal high. `test_sweep_and_rejection_detected`
+asserted only the booleans `swept is True` / `rejected is True`, so it
+passed green against the wrong candle.
+
+Fixed by anchoring each pool at its last member (`max(group, key=index)`)
+rather than its first, so `detect_sweeps` structurally cannot see any
+member candle and the first genuine post-formation penetration is what
+gets recorded. `member_indices` is now sorted for stable ordering.
+`detect_session_levels` already got this right — its docstring is explicit
+that a level is anchored at the first candle of the *following* period,
+"since that is when the level becomes a resting liquidity target rather
+than an in-progress extreme" — so this change brings equal-level pools in
+line with the convention the module already documented.
+
+`test_sweep_and_rejection_detected` is tightened to assert
+`swept_index == 8` and that the sweep index is not one of the pool's own
+members, so it can no longer pass on a self-sweep. Two new tests cover the
+invariants directly:
+`test_pool_is_not_swept_by_its_own_member_swing` builds a double top where
+price never takes out either high and asserts no sweep is reported at all,
+and `test_pool_is_anchored_at_its_last_member` pins the anchoring rule.
+All three were verified to fail against the pre-fix code via `git stash`
+and pass once the fix is restored.
+
+One related question is deliberately left alone here: `price` is the
+*average* of the group's members, so even with correct anchoring a candle
+that trades above the average but below the highest equal high counts as a
+sweep, where SMC convention places resting liquidity above the highest of
+the equal highs. That is a behavioural change to the detector rather than
+a fix to this defect, and is better evaluated on its own.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

@@ -39,15 +39,27 @@ def detect_equal_levels(swings: list[Swing], tolerance_pct: float = 0.05) -> lis
             for s in group:
                 used.add(s.index)
             avg_price = sum(s.price for s in group) / len(group)
-            first = min(group, key=lambda s: s.index)
+            # Anchor the pool at its *last* member: an equal-highs/lows pool
+            # does not exist until the swing that makes the level "equal" has
+            # printed. Anchoring at the first member left `detect_sweeps`
+            # scanning a window that still contained the pool's own later
+            # members, and since `price` is the group average, any member
+            # priced beyond that average swept the pool on its own candle --
+            # reporting a liquidity grab at (or before) the moment the pool
+            # formed, when price had never traded through the level. Because
+            # `detect_sweeps` breaks on the first hit, that phantom sweep also
+            # pinned `swept_index` and hid the genuine sweep that came later.
+            # `detect_session_levels` below already gets this right, anchoring
+            # each level at the first candle of the *following* period.
+            last = max(group, key=lambda s: s.index)
             pools.append(
                 LiquidityPool(
                     side=side,
                     source_type=source,
                     price=avg_price,
-                    formed_index=first.index,
-                    formed_timestamp=first.timestamp,
-                    member_indices=[s.index for s in group],
+                    formed_index=last.index,
+                    formed_timestamp=last.timestamp,
+                    member_indices=sorted(s.index for s in group),
                 )
             )
 

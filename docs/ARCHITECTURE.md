@@ -2652,6 +2652,59 @@ row ends up open, account-wide. Verified to fail against the pre-fix code
 `open_positions` count never saw the other) via `git stash`, then pass
 once the fix is restored.
 
+## Live/manual positions never got marked to market, so unrealized P&L was a permanent lie
+
+`PositionManager.mark_to_market` (`app/trading/position_manager.py`,
+blueprint §60's Position Manager) correctly computes `unrealized_pnl =
+(price - average_price) * quantity` — it just needs someone to call it
+with a current price. `apply_fill`, called on every order fill by
+`ExecutionEngine.submit`, only ever touches `quantity`/`average_price`/
+`realized_pnl`; it has no reason to know the current market price, and
+nothing calls `mark_to_market` for the live/manual order path either.
+`PaperTradingEngine.on_candle` (`app/paper/engine.py`) is the *only*
+caller anywhere in the codebase — it marks its own account's position to
+market every candle. `POST /orders`/`POST /options/execute`'s
+`_UserTradingStack`, which every real (or `MockBroker`-backed manual)
+order goes through, never did the equivalent.
+
+`GET /positions` (`app/api/positions.py`) and `GET /portfolio`
+(`app/api/portfolio.py`) both read `unrealized_pnl` straight off that same
+`PositionManager`, and `app.trading.persistence.persist_position` writes
+it verbatim into the `positions` table. So a user who places a live
+`LONG` order at ₹100, watches the market run to ₹120 (a real, sizeable
+gain) or drop to ₹80 (a real, sizeable loss), gets back `unrealized_pnl:
+0.0` from both endpoints indefinitely — not stale, not approximate, a
+constant lie — until the position is closed and `realized_pnl` finally
+picks up the true number via `apply_fill`'s closing-branch math. Every
+consumer of these two endpoints (a dashboard, a risk summary, a
+mobile client) was reading a number that looked authoritative but had no
+relationship to the real market whatsoever.
+
+Fixed by adding `_mark_open_positions_to_market` (`app/api/orders.py`,
+alongside `_stack_for`/`_execution_mode_for`, the same file's existing
+per-user-stack helpers): for every open position on a user's stack, it
+looks up the last price `MarketDataWorker.process_tick` cached in Redis
+(`app.core.redis.get_latest_price` — already populated in production,
+just never consulted here) and calls `mark_to_market` with it before the
+caller reads `unrealized_pnl`. A symbol with no cached tick yet is left
+alone rather than guessed at, the same "nothing to trust yet" convention
+already used by `get_price_age_seconds`/`get_price_jump_pct`. `GET
+/positions` and `GET /portfolio` now both call this instead of reading
+`open_positions` directly, so both compute against the freshest available
+price on every read — no continuous background sync required, matching
+the codebase's existing preference for computing derived values at
+request time from live data.
+
+New `tests/api/test_positions.py::test_positions_and_portfolio_reflect_live_unrealized_pnl`
+places a live order at 100.0, confirms `GET /positions` reports
+`unrealized_pnl: 0.0` immediately after entry, then simulates a tick
+arriving at 120.0 via `set_latest_price` (exactly what `MarketDataWorker`
+does in production) and confirms both `GET /positions` and `GET
+/portfolio` now report the correct nonzero, positive unrealized P&L.
+Verified to fail against the pre-fix code (both endpoints still report
+`0.0` after the price move) via `git stash`, then pass once the fix is
+restored.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

@@ -12,7 +12,7 @@ from app.brokers.base import BrokerError
 from app.brokers.mock import MockBroker
 from app.core.audit import record_audit
 from app.core.metrics import ORDER_COUNT, RISK_REJECTION_COUNT
-from app.core.redis import account_halt_reason, channel_name, get_price_age_seconds, get_price_jump_pct, publish
+from app.core.redis import account_halt_reason, channel_name, get_latest_price, get_price_age_seconds, get_price_jump_pct, publish
 from app.database.models.instruments import Instrument
 from app.database.models.notifications import NotificationType
 from app.database.models.risk import RiskDecision as RiskEventDecision
@@ -30,7 +30,7 @@ from app.trading.broker_resolver import resolve_broker
 from app.trading.execution import ExecutionEngine
 from app.trading.order_manager import OrderManager
 from app.trading.persistence import persist_order, persist_position, record_trade
-from app.trading.position_manager import PositionManager
+from app.trading.position_manager import PositionManager, PositionRecord
 
 router = APIRouter(tags=["trading"])
 
@@ -140,6 +140,29 @@ def all_stacks() -> dict[uuid.UUID, _UserTradingStack]:
     connected accounts have actually placed an order this process
     lifetime. Not for mutation; callers get a shallow copy."""
     return dict(_STACKS)
+
+
+async def _mark_open_positions_to_market(stack: "_UserTradingStack", user_id: str) -> list[PositionRecord]:
+    """Blueprint §60: `PositionManager` tracks `unrealized_pnl`, and
+    `mark_to_market` computes it correctly -- but on this (live/manual)
+    path nothing ever called it. `apply_fill` (on every order fill) only
+    ever sets `quantity`/`average_price`/`realized_pnl`; it has no reason
+    to know the current market price, and nothing else in this path calls
+    `mark_to_market` either, unlike `PaperTradingEngine.on_candle`, which
+    does so every candle. Without this, every live/manual position's
+    `unrealized_pnl` -- read here by `GET /positions` and `GET
+    /portfolio`, and persisted verbatim into the `positions` table by
+    `app.trading.persistence.persist_position` -- stayed frozen at its
+    dataclass default of 0.0 forever, no matter how far price moved,
+    silently misreporting real P&L on the one path that risks real money.
+    Uses whatever price `MarketDataWorker` last cached in Redis; a symbol
+    with no cached tick yet is left as-is rather than guessed at."""
+    positions = stack.position_manager.open_positions(user_id)
+    for position in positions:
+        price = await get_latest_price(position.symbol)
+        if price is not None:
+            stack.position_manager.mark_to_market(user_id, position.symbol, price)
+    return positions
 
 
 def _execution_mode_for(stack: "_UserTradingStack") -> ExecutionMode:

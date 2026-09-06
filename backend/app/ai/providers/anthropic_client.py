@@ -11,9 +11,10 @@ from __future__ import annotations
 import json
 import re
 
+import anthropic
 from anthropic import AsyncAnthropic
 
-from app.ai.client import AIClient
+from app.ai.client import AIClient, AIProviderError
 
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 
@@ -37,11 +38,27 @@ class AnthropicAIClient(AIClient):
         self.model = model
 
     async def complete_json(self, prompt: str, system: str | None = None) -> dict:
-        response = await self._client.messages.create(
-            model=self.model,
-            max_tokens=4096,
-            system=system or "Respond with JSON only, no prose, no markdown fences.",
-            messages=[{"role": "user", "content": prompt}],
-        )
+        # Regression fix: a rate limit, timeout, connection error, or any
+        # other non-2xx response from the Anthropic API used to propagate
+        # as a raw `anthropic.APIError` -- a real-deployment failure mode
+        # (this fires whenever a provider *is* configured) that callers in
+        # app/api/ai.py only ever handled for the rarer "no provider
+        # configured at all" case (`AIUnavailableError`), so it fell
+        # through to the generic 500 handler with no `AIDecision`/`AIMessage`
+        # audit row ever written. `anthropic.APIError` is the base class
+        # for every exception this SDK raises (rate limits, timeouts,
+        # connection errors, and non-2xx statuses all subclass it), so
+        # catching it here and re-raising the shared `AIProviderError`
+        # gives every caller exactly one type to handle regardless of
+        # which specific SDK failure occurred.
+        try:
+            response = await self._client.messages.create(
+                model=self.model,
+                max_tokens=4096,
+                system=system or "Respond with JSON only, no prose, no markdown fences.",
+                messages=[{"role": "user", "content": prompt}],
+            )
+        except anthropic.APIError as exc:
+            raise AIProviderError(f"Anthropic API call failed: {exc}") from exc
         text_parts = [block.text for block in response.content if getattr(block, "type", None) == "text"]
         return _extract_json("".join(text_parts))

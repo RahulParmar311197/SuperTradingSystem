@@ -2418,6 +2418,63 @@ still construct normally. Verified to fail against the pre-fix code (no
 `ValidationError` raised at all for `AND`/`OR`/`NOT`) and pass once the
 fix is restored.
 
+## AI endpoints only handled "no provider configured," not "provider configured but the call failed"
+
+`app/ai/providers/anthropic_client.py`'s `complete_json` can fail in two
+ways beyond simply not being configured: `_extract_json` raises
+`AIResponseParseError` (a `ValueError` subclass) whenever Claude's text
+isn't valid JSON — an ordinary LLM failure mode (extra prose, a
+truncated completion, a refusal sentence), not a hypothetical — and the
+underlying `AsyncAnthropic.messages.create` call can itself raise any
+`anthropic` SDK exception (`RateLimitError`, `APITimeoutError`,
+`APIConnectionError`, ...) with nothing anywhere normalizing those into a
+catchable, domain-specific type.
+
+`POST /ai/propose-trade` and `POST /ai/chat` (`app/api/ai.py`) only ever
+caught `AIUnavailableError` — raised solely by `NullAIClient` when no
+provider is configured at all. In a real deployment (`AI_PROVIDER=anthropic`
+with a key set), that's the *rare* failure mode; a rate limit or a
+malformed completion is the realistic one, and neither was caught. Both
+fell through to `main.py`'s app-wide generic exception handler, returning
+a bare 500 — and because the exception propagated before either
+endpoint's own audit-write code ran, no `AIDecision` row (`propose_trade`)
+or assistant `AIMessage` row (`chat`) was ever written. This directly
+contradicts `propose_trade`'s own docstring: "the outcome is persisted as
+an `AIDecision` row (blueprint §71 audit logging, §79 'AI Model
+Evaluation' — you can't evaluate AI behavior over time without a record
+of what it actually said)" — a promise kept only for the least likely
+failure mode. For `chat` specifically, the earlier `db.add(AIMessage(role=
+"user", ...))` was also never committed before the uncaught exception, so
+the user's own message vanished from `GET /ai/chat/history` too, with no
+visible reply anywhere.
+
+Fixed by adding `AIProviderError` (`app/ai/client.py`) — a shared
+exception any `AIClient` implementation should raise for "the call to the
+provider itself failed," distinct from `AIUnavailableError` (no provider
+configured) and from a `ValueError`/`AIResponseParseError` (the provider
+answered, but its content wasn't usable). `AnthropicAIClient.complete_json`
+now wraps the `messages.create` call in `try`/`except anthropic.APIError`
+(the base class every SDK exception — rate limits, timeouts, connection
+errors, non-2xx statuses — subclasses) and re-raises as `AIProviderError`.
+`propose_trade`, `chat`, and `build_strategy_endpoint` (which had the
+identical gap: it already caught `ValueError` for parse failures but not
+`AIProviderError` for API failures) now catch `(AIUnavailableError,
+AIProviderError, ValueError)` together, writing the same audit row the
+`AIUnavailableError` branch already did and returning a clean `502 Bad
+Gateway` (`503` stays reserved for the true "no provider configured"
+case) instead of an opaque 500.
+
+New `tests/ai/test_anthropic_client.py::test_complete_json_wraps_api_errors_as_ai_provider_error`
+monkeypatches `messages.create` to raise `anthropic.APIConnectionError`
+and asserts `complete_json` raises `AIProviderError` instead. New
+`tests/api/test_ai_propose_trade.py::test_propose_trade_returns_502_and_records_a_decision_when_ai_provider_call_fails`
+and `tests/api/test_ai_chat.py::test_chat_returns_502_and_persists_both_messages_when_ai_provider_call_fails`
+exercise both endpoints end-to-end with a fake `AIClient` that raises
+`AIProviderError`, asserting a 502 and that the audit row (`AIDecision`/
+both `AIMessage` rows) is actually written. All three verified to fail
+against the pre-fix code (a collection-time `ImportError` for the
+not-yet-existing `AIProviderError`) and pass once the fix is restored.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

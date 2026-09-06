@@ -6,8 +6,11 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import anthropic
+import httpx
 import pytest
 
+from app.ai.client import AIProviderError
 from app.ai.providers.anthropic_client import AIResponseParseError, AnthropicAIClient, _extract_json
 
 
@@ -42,3 +45,22 @@ async def test_complete_json_extracts_text_blocks_and_parses(monkeypatch):
 
     result = await client.complete_json("hello")
     assert result == {"name": "Test Strategy"}
+
+
+@pytest.mark.asyncio
+async def test_complete_json_wraps_api_errors_as_ai_provider_error(monkeypatch):
+    # Regression test: a rate limit, timeout, connection error, or any
+    # other non-2xx response from the Anthropic API used to propagate as a
+    # raw `anthropic.APIError` -- callers in app/api/ai.py only handled
+    # `AIUnavailableError` (raised solely when no provider is configured
+    # at all), so this, the far more likely failure mode in a real
+    # deployment, fell through to a bare 500 with no audit row written.
+    client = AnthropicAIClient(api_key="sk-fake-key-for-testing")
+
+    async def fake_create_raises(**kwargs):
+        raise anthropic.APIConnectionError(request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"))
+
+    monkeypatch.setattr(client._client.messages, "create", fake_create_raises)
+
+    with pytest.raises(AIProviderError):
+        await client.complete_json("hello")

@@ -5,7 +5,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import delete, select
 
-from app.ai.client import AIClient
+from app.ai.client import AIClient, AIProviderError
 from app.database.models.ai import AIDecision
 from app.database.models.instruments import Instrument, MarketType
 from app.database.models.risk import AuditLog
@@ -40,6 +40,15 @@ class _FakeAIClient(AIClient):
 
     async def complete_json(self, prompt: str, system: str | None = None) -> dict:
         return self.response
+
+
+class _FailingAIClient(AIClient):
+    """Stands in for a configured provider whose API call itself fails
+    (rate limit, timeout, connection error) -- as opposed to `NullAIClient`
+    (no provider configured at all, raises AIUnavailableError)."""
+
+    async def complete_json(self, prompt: str, system: str | None = None) -> dict:
+        raise AIProviderError("simulated rate limit")
 
 
 async def _cleanup(user_id: uuid.UUID, instrument_id: uuid.UUID, strategy_id: uuid.UUID) -> None:
@@ -109,6 +118,36 @@ async def test_propose_trade_returns_503_and_records_a_decision_when_ai_unavaila
             headers=headers,
         )
         assert r.status_code == 503, r.text
+
+        async with async_session_factory() as db:
+            decision = (await db.execute(select(AIDecision).where(AIDecision.user_id == user_id))).scalar_one()
+            assert decision.validated is False
+            assert decision.model is None
+            assert "error" in decision.output
+    finally:
+        client.__exit__(None, None, None)
+        await _cleanup(user_id, instrument_id, strategy_id)
+
+
+async def test_propose_trade_returns_502_and_records_a_decision_when_ai_provider_call_fails(require_infra, monkeypatch):
+    # Regression test: a configured provider's API call itself failing
+    # (rate limit, timeout, connection error -- AIProviderError) used to
+    # propagate straight past this endpoint's `except AIUnavailableError`
+    # clause to a bare 500, with no AIDecision audit row written at all --
+    # the exact guarantee this endpoint's own docstring promises. This is
+    # the far more realistic failure mode in a real deployment (it only
+    # fires once a provider *is* configured), unlike AIUnavailableError.
+    client, token, user_id, instrument_id, strategy_id = await _setup()
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        monkeypatch.setattr("app.api.ai.get_ai_client", lambda settings: _FailingAIClient())
+
+        r = client.post(
+            "/ai/propose-trade",
+            json={"strategy_id": str(strategy_id), "instrument_id": str(instrument_id), "timeframe": "15m"},
+            headers=headers,
+        )
+        assert r.status_code == 502, r.text
 
         async with async_session_factory() as db:
             decision = (await db.execute(select(AIDecision).where(AIDecision.user_id == user_id))).scalar_one()

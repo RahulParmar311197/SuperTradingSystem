@@ -41,6 +41,7 @@ async def _build_context(db: AsyncSession, instrument_id: uuid.UUID, timeframe: 
         current_price=candles[-1].close,
         smc=SMCEngine(SMCConfig()).analyze(candles),
         ict=ICTEngine(ICTConfig()).analyze(candles),
+        current_index=len(candles) - 1,
     )
 
 

@@ -2300,6 +2300,71 @@ does the same through `AutoTradeSupervisor.run_once()`. Both verified to
 fail against the pre-fix code (`scalar_one()` on an empty result — no
 `Position` row exists at all) and pass once the fix is restored.
 
+## Strategy DSL's `Condition.lookback` was fully documented and completely ignored
+
+`Condition` (`app/strategy/dsl.py`) carries a `lookback: int = 5` field
+with an inline comment describing exactly what it's for: "how many recent
+candles/events count as recent for event-type conditions." The class
+docstring backs this up — "the remaining fields are interpreted by that
+evaluator." A grep of the whole `app/` tree for `lookback` outside that
+one file and unrelated helpers (`order_blocks.py`'s internal averaging
+window, `portfolio.py`'s correlation window) turned up nothing:
+`app/strategy/evaluator.py`, the only consumer of `Condition`, never once
+read `condition.lookback`.
+
+This matters specifically for the "event-type" conditions the field's own
+comment calls out: `BOS`/`CHOCH`/`MSS` (`evaluate_condition` matched
+against `smc.structure_events`/`smc.mss_events` — the full list
+`SMCEngine.analyze` ever detected across the entire visible candle
+history) and `LIQUIDITY_SWEEP` (matched against `smc.recent_sweeps()`,
+whose name implies recency but which returns every swept
+`LiquidityPool` ever, unfiltered). Unlike `FVG`/`ORDER_BLOCK`, whose
+"unmitigated"/"active" checks are genuine persistent *states* that
+legitimately stay true until something invalidates them, a BOS/CHoCH/MSS
+break or a liquidity sweep is a one-time historical *event* — it has no
+other expiry mechanism. A strategy with `Condition(type=BOS,
+direction="bullish")` would keep matching on every single future candle,
+forever, the instant any bullish break of structure ever appeared in the
+candle history handed to the SMC engine — for live scanning/auto-trading,
+whose candle history only grows, this meant a structurally stale setup
+from days or weeks earlier could still fire an entry today, with the
+`lookback=5` a strategy author configured (or the blueprint §33-34 AI
+strategy generator produced) having zero effect on when it stopped
+counting as "recent."
+
+Fixed by adding `EvaluationContext.current_index` — the index of the
+current (most recent) candle within the exact same candle list `smc`/`ict`
+were computed from, matching the indexing convention `StructureEvent.index`
+and `LiquidityPool.swept_index` (`app/smc/types.py`) already use, since
+every SMC detector only ever looks inside the single candle list it's
+given (`app/smc/engine.py`'s own docstring: "every detector below only
+ever looks inside the list it is given"). `evaluate_condition`'s
+BOS/CHoCH/MSS and `LIQUIDITY_SWEEP` branches now filter their matches to
+`context.current_index - event.index < condition.lookback` before
+checking anything else. All five `EvaluationContext` construction sites
+(`app/paper/engine.py`, `app/backtest/engine.py`, `app/api/ai.py`,
+`app/api/scanner.py`, `app/workers/scanner_worker.py`) now pass
+`current_index=len(candles) - 1`. The field defaults to `0` for
+any caller that doesn't set it (there shouldn't be one left), which fails
+open to the old, always-matches behavior rather than silently rejecting a
+genuinely recent event should some caller be missed.
+
+New `tests/strategy/test_evaluator.py` (previously no dedicated test
+module for `app.strategy.evaluator` existed at all) covers both fixed
+branches directly: `test_bos_condition_expires_after_its_lookback_window`
+reuses the exact bullish-BOS-at-index-7 fixture already pinned by
+`tests/smc/test_structure.py`, asserting the same `Condition` matches when
+evaluated shortly after the break (`current_index = bos.index + 4`,
+within the default `lookback=5`) but not many candles later
+(`current_index = bos.index + 20`).
+`test_liquidity_sweep_condition_expires_after_its_lookback_window` does
+the equivalent for a swept buy-side liquidity pool, reusing
+`tests/smc/test_liquidity.py`'s `EQUAL_HIGHS` fixture. Both verified to
+fail against the pre-fix code (`EvaluationContext.__init__()` rejecting
+the then-nonexistent `current_index` keyword — the test file could not
+even be written against the old signature) and pass once the fix is
+restored.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

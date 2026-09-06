@@ -79,6 +79,7 @@ class BacktestEngine:
                     current_price=candle.close,
                     smc=smc_context,
                     ict=ict_context,
+                    current_index=len(visible) - 1,
                 )
                 result = self.strategy_engine.evaluate(self.strategy, context)
                 # A "retest" entry (fvg_retest/order_block_retest) names a

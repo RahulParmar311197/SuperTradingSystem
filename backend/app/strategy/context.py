@@ -20,5 +20,16 @@ class EvaluationContext:
     current_price: float
     smc: SMCContext
     ict: ICTContext
+    # Index of the current (most recent) candle within the same candle list
+    # `smc`/`ict` were computed from -- `StructureEvent.index` and
+    # `LiquidityPool.swept_index` (app.smc.types) are indices into that
+    # identical list, so `current_index - event.index` is how
+    # `app.strategy.evaluator` measures "how many candles ago" an
+    # event-type condition's match actually happened, against
+    # `Condition.lookback`. Defaults to 0 so a caller that never sets it
+    # (there shouldn't be one among real strategy-evaluation call sites)
+    # falls back to the pre-lookback-filtering behavior rather than
+    # wrongly rejecting a genuinely recent event.
+    current_index: int = 0
     indicators: dict[str, float] = field(default_factory=dict)
     session_tags: set[str] = field(default_factory=set)

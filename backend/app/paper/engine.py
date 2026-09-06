@@ -156,6 +156,7 @@ class PaperTradingEngine:
             current_price=candle.close,
             smc=self.smc_engine.analyze(self.candles),
             ict=self.ict_engine.analyze(self.candles),
+            current_index=len(self.candles) - 1,
         )
         result = self.strategy_engine.evaluate(self.strategy, context)
         if not result.matched:

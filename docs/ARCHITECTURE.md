@@ -2586,6 +2586,72 @@ specifically — with `premium` set to match the snapshot's mid exactly (so
 against the pre-fix code (the same request returns 201 with the order
 actually placed) and pass once the fix is restored, via `git stash`.
 
+## AutoTradeSupervisor's per-instrument engines silently defeated account-wide position/exposure caps
+
+`AutoTradeSupervisor` (`app/workers/auto_trade_worker.py`, blueprint §54's
+flagship autonomous trading loop) evaluates every `(user, active strategy)`
+pair against every active instrument, and `_process` lazily builds and
+caches one `PaperTradingEngine` per `(user, strategy, instrument)` key.
+Each `PaperTradingEngine` constructed its own private `PositionManager()`
+(`app/paper/engine.py`) — so a user auto-trading one strategy across, say,
+50 instruments ended up with 50 completely isolated position ledgers for
+the same account, each of which could only ever know about the one
+position for its own instrument.
+
+`on_candle`'s risk proposal fed that isolation straight into the risk
+engine: `open_positions=len(self.position_manager.open_positions(self.account_id))`
+could only ever be 0 or 1 (this method already returns early above if
+`self.symbol` itself has an open position, so it can never see more than
+that), and `current_exposure` was hardcoded to `0.0` — not "computed from
+whatever's available," never fed anything at all. `RiskLimits.max_open_positions`
+and `max_exposure_pct` (the exact fields `POST /auto-trading/enable`
+exposes to let a user cap how much unattended risk they're taking) were
+checked every single time against this fictional, always-near-zero view.
+Contrast with `_UserTradingStack` (`app/api/orders.py`), the equivalent
+stack for the manual/live path, which already gets this right — it caches
+exactly *one* `PositionManager` per user, shared across every symbol they
+trade, so `open_positions()` genuinely aggregates.
+
+Concretely: a user enables auto-trading with `auto_trading_max_positions =
+5` and one strategy eligible for auto-trading, against 50 active
+instruments. If that strategy's entry condition fires on many of them in
+the same pass, every one of those engines independently evaluates
+`open_positions (0 or 1) < 5` and `current_exposure (always 0.0) + this
+trade's notional ≤ max_exposure_pct * balance` — both trivially true no
+matter how many other positions this same user already has open elsewhere
+— so most or all of them can open simultaneously. The account can end up
+with far more concurrent (paper, for now) positions and aggregate notional
+than the user configured, with the two caps meant to bound that silently
+inert.
+
+Fixed by giving `PaperTradingEngine.__init__` an optional
+`position_manager` constructor argument (defaulting to a fresh private one
+when not given, so every other caller — `app/api/paper.py`'s manual
+sessions, which are deliberately isolated per session since each carries
+its own `starting_balance` — is unaffected) and having
+`AutoTradeSupervisor` maintain one shared `PositionManager` per user
+(`self._position_managers`, keyed by `user.id`, mirroring
+`_UserTradingStack`'s pattern exactly), passed into every engine built for
+that user regardless of which instrument or strategy it drives.
+`PositionManager` already keys its internal state by `(account_id,
+symbol)`, so sharing one instance across many symbols for the same account
+was already its intended use — nothing about `PositionManager` itself
+needed to change. `on_candle`'s `current_exposure` is now actually
+computed (`sum(abs(p.quantity) * p.average_price for p in
+self.position_manager.open_positions(self.account_id))`) instead of a
+hardcoded `0.0`, so it reflects every other currently-open position for
+that account the moment the manager is shared.
+
+New `tests/workers/test_auto_trade_worker.py::test_supervisor_caps_open_positions_account_wide_across_instruments`
+sets `auto_trading_max_positions=1` for a user with one strategy, creates
+a second instrument, and feeds the identical bullish setup to both
+instruments in lockstep so both engines would independently match and try
+to open on the exact same `run_once()` pass. Asserts exactly one `Position`
+row ends up open, account-wide. Verified to fail against the pre-fix code
+(two positions open simultaneously, since each engine's own
+`open_positions` count never saw the other) via `git stash`, then pass
+once the fix is restored.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

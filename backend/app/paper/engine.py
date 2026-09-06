@@ -84,6 +84,7 @@ class PaperTradingEngine:
         smc_config: SMCConfig | None = None,
         ict_config: ICTConfig | None = None,
         broker: MockBroker | None = None,
+        position_manager: PositionManager | None = None,
     ) -> None:
         self.strategy = strategy
         self.symbol = symbol
@@ -97,7 +98,14 @@ class PaperTradingEngine:
 
         self.broker = broker or MockBroker(starting_balance=starting_balance)
         self.order_manager = OrderManager()
-        self.position_manager = PositionManager()
+        # Callers driving several engines for the same account_id across
+        # different symbols (AutoTradeSupervisor, one engine per
+        # (strategy, instrument) pair) must pass the *same*
+        # PositionManager instance to every one of them -- see the
+        # `current_exposure`/`open_positions` comment in `on_candle`
+        # below for why a private, per-engine one silently defeats
+        # account-wide risk limits.
+        self.position_manager = position_manager or PositionManager()
         self.execution_engine = ExecutionEngine(self.broker, self.order_manager, self.position_manager)
 
         self.trades_today = 0
@@ -163,17 +171,30 @@ class PaperTradingEngine:
             return PaperTradeOutcome(signal=result)
 
         account = await self.broker.get_account()
+        # `self.position_manager` is shared across every engine driving
+        # this same account_id (see AutoTradeSupervisor, which runs one
+        # PaperTradingEngine per (strategy, instrument) pair) precisely so
+        # that this aggregates *all* of the account's open positions, not
+        # just the one for `self.symbol` -- a private, per-engine
+        # PositionManager can never see more than one position at a time
+        # (this method already returned early above if `self.symbol`
+        # itself has one open), which silently made `open_positions` cap
+        # at 1 and `current_exposure` a permanent 0.0 for every engine,
+        # defeating RiskLimits.max_open_positions/max_exposure_pct as
+        # account-wide caps on unattended autonomous trading.
+        open_positions = self.position_manager.open_positions(self.account_id)
+        current_exposure = sum(abs(p.quantity) * p.average_price for p in open_positions)
         proposal = TradeRiskProposal(
             account_id=self.account_id,
             strategy_id=self.strategy.name,
             entry=result.entry,
             stop=result.stop,
             account_balance=account.balance,
-            open_positions=len(self.position_manager.open_positions(self.account_id)),
+            open_positions=len(open_positions),
             trades_today=self.trades_today,
             daily_pnl=self.daily_pnl,
             weekly_pnl=self.weekly_pnl,
-            current_exposure=0.0,
+            current_exposure=current_exposure,
             strategy_allocation=0.0,
             market_data_age_seconds=0.0,
             broker_healthy=await self.broker.is_healthy(),

@@ -280,6 +280,77 @@ async def test_execute_respects_account_kill_switch(require_infra):
             await _cleanup(user_id, [long_leg.id, short_leg.id])
 
 
+async def test_execute_respects_the_accounts_daily_loss_limit(require_infra):
+    # Regression test: `evaluate_options_risk` (app/risk/options_risk.py)
+    # never checked daily/weekly loss, open-position count, trades-per-day,
+    # or repeated broker rejections at all -- unlike `RiskEngine.evaluate`
+    # (app/risk/engine.py), which POST /orders, PaperTradingEngine, and
+    # AutoTradeSupervisor all go through. A user whose equity trading had
+    # already blown through RiskLimits.max_daily_loss_pct today could still
+    # freely open options strategies through this endpoint, since
+    # OptionsRiskProposal didn't even have fields to carry daily_pnl/
+    # trades_today/open_positions/repeated_rejections into the decision.
+    from app.api import orders as orders_module
+
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+        long_leg, short_leg = await _make_two_leg_instruments(f"DLOSS{uuid.uuid4().hex[:5].upper()}")
+
+        async with async_session_factory() as db:
+            equity_instrument = Instrument(
+                symbol=f"DLOSSEQ{uuid.uuid4().hex[:5].upper()}", exchange="NSE", market=MarketType.EQUITY, instrument_type="EQ"
+            )
+            db.add(equity_instrument)
+            await db.commit()
+            await db.refresh(equity_instrument)
+            equity_instrument_id = equity_instrument.id
+
+        try:
+            # A real equity order builds this user's stack (see
+            # app.api.orders._stack_for) -- fetch it and simulate a day
+            # that already lost 3% of the account (default
+            # RiskLimits.max_daily_loss_pct is 2.0%), the same way
+            # test_orders.py's daily-loss-limit tests do.
+            r = client.post(
+                "/orders",
+                json={"symbol": equity_instrument.symbol, "direction": "LONG", "entry": 100.0, "stop": 95.0},
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+
+            stack = orders_module._STACKS[user_id]
+            stack.daily_pnl = -3000.0  # 3% of the 100k default MockBroker balance
+
+            r = client.post(
+                "/options/execute",
+                json={
+                    "strategy_name": "bull_call_spread",
+                    "legs": [
+                        {"symbol": long_leg.symbol, "direction": "LONG", "quantity": 1, "premium": 5.0},
+                        {"symbol": short_leg.symbol, "direction": "SHORT", "quantity": 1, "premium": 2.0},
+                    ],
+                },
+                headers=headers,
+            )
+            assert r.status_code == 403, r.text
+            assert "Daily loss" in r.text
+
+            async with async_session_factory() as db:
+                # Only the earlier equity order -- neither options leg was placed.
+                orders = (await db.execute(select(Order).where(Order.user_id == user_id))).scalars().all()
+                assert len(orders) == 1
+                assert orders[0].instrument_id == equity_instrument_id
+
+                risk_events = (
+                    await db.execute(select(RiskEvent).where(RiskEvent.user_id == user_id))
+                ).scalars().all()
+                rejected = [e for e in risk_events if e.checks.get("daily_loss_limit") is False]
+                assert len(rejected) == 1
+        finally:
+            await _cleanup(user_id, [long_leg.id, short_leg.id, equity_instrument_id])
+
+
 async def test_execute_risk_rejection_writes_audit_row_and_notifies(require_infra):
     # Regression test: unlike POST /orders (app/api/orders.py's
     # place_order), which always writes a RiskEvent audit row and fires an

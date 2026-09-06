@@ -281,6 +281,12 @@ async def execute_options_strategy(
         market_data_age_seconds = max(market_data_age_seconds, age)
 
     stack = await _stack_for(user, db)
+    # Blueprint §56/§57: rolls stack.trades_today/daily_pnl/weekly_pnl at a
+    # day/week boundary -- see _UserTradingStack._roll_risk_window. Without
+    # this, an options strategy submitted right after midnight would still
+    # be evaluated against yesterday's counters, the same bug this call
+    # already prevents for POST /orders.
+    stack._roll_risk_window(datetime.now(timezone.utc))
     open_positions = stack.position_manager.open_positions(str(user.id))
     current_exposure = sum(abs(p.quantity) * p.average_price for p in open_positions)
 
@@ -290,6 +296,11 @@ async def execute_options_strategy(
         current_exposure=current_exposure,
         payoff=payoff,
         broker_healthy=await stack.broker.is_healthy(),
+        open_positions=len(open_positions),
+        trades_today=stack.trades_today,
+        daily_pnl=stack.daily_pnl,
+        weekly_pnl=stack.weekly_pnl,
+        repeated_rejections=stack.repeated_rejections,
         market_data_age_seconds=market_data_age_seconds,
         liquidity_acceptable=liquidity_acceptable,
         premium_deviation_pct=premium_deviation_pct,
@@ -359,8 +370,16 @@ async def execute_options_strategy(
             stack.order_manager.transition(order.id, OrderStatus.VALIDATING)
             stack.order_manager.transition(order.id, OrderStatus.RISK_APPROVED, f"options strategy batch {batch_id}")
             await stack.execution_engine.submit(order.id)
+            stack.trades_today += 1
 
         final_order = stack.order_manager.get(order.id)
+        if created:
+            # Same "Repeated order rejection" tracking as app/api/orders.py's
+            # place_order -- each leg is its own real order submitted to the
+            # broker, so a run of consecutive broker-level rejections across
+            # legs/strategies must trip `no_repeated_rejections` here too,
+            # not just on the single-order path.
+            stack.repeated_rejections = stack.repeated_rejections + 1 if final_order.status == OrderStatus.REJECTED else 0
         await persist_order(
             db, final_order, user.id, instrument.id, execution_mode=execution_mode, broker_account_id=stack.broker_account_id
         )
@@ -382,6 +401,14 @@ async def execute_options_strategy(
             position_row = await persist_position(db, user.id, instrument.id, position_after, execution_mode=execution_mode)
             realized_delta = position_after.realized_pnl - realized_pnl_before
             if realized_delta != 0 and position_before is not None:
+                # Same fix as app/api/orders.py's place_order -- without
+                # this, stack.daily_pnl/weekly_pnl never reflect a loss
+                # realized by closing an options leg, so the
+                # daily_loss_limit/weekly_loss_limit checks (both wired
+                # into evaluate_options_risk above) could never fail no
+                # matter how much this specific path lost.
+                stack.daily_pnl += realized_delta
+                stack.weekly_pnl += realized_delta
                 await record_trade(
                     db,
                     user_id=user.id,

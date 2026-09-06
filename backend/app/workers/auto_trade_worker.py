@@ -48,6 +48,7 @@ from app.notifications.service import create_notification
 from app.paper.engine import PaperTradingEngine
 from app.risk.limits import RiskLimits
 from app.strategy.dsl import StrategyDefinition
+from app.trading.persistence import persist_position
 
 logger = logging.getLogger("workers.autotrade")
 
@@ -164,6 +165,20 @@ class AutoTradeSupervisor:
             }
 
         outcome = await engine.on_candle(latest)
+
+        # Blueprint §9/§86: mirrors app/api/paper.py's feed_candle fix --
+        # this is the same PaperTradingEngine driving blueprint §54's
+        # flagship autonomous trading loop, and it never persisted a
+        # `positions` row either. Every position this supervisor ever
+        # opened was invisible to GET /portfolio, GET /admin/
+        # portfolio-snapshot, and the correlated-exposure risk check for
+        # its entire open lifetime -- those only ever saw it once it
+        # closed and a Trade row appeared, understating a user's real
+        # (simulated) exposure by however much autonomous trading itself
+        # was holding, for as long as it stayed open.
+        position_after = engine.position_manager.get(engine.account_id, engine.symbol)
+        if position_after is not None:
+            await persist_position(db, user.id, instrument.id, position_after, execution_mode=ExecutionMode.PAPER)
 
         if outcome.risk_checks is not None:
             # Same audit gap and fix as app/api/paper.py's feed_candle -- this

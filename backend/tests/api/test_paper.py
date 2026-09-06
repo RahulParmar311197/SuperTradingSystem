@@ -11,7 +11,7 @@ from app.database.models.risk import AuditLog, RiskEvent
 from app.database.models.risk import RiskDecision as RiskEventDecision
 from app.database.models.strategy import Strategy as StrategyRow
 from app.database.models.strategy import StrategyVersion as StrategyVersionRow
-from app.database.models.trading import ExecutionMode, Trade
+from app.database.models.trading import ExecutionMode, Position, Trade
 from app.database.models.users import User, UserSession
 from app.database.session import async_session_factory
 from app.main import app
@@ -78,6 +78,7 @@ async def _create_strategy(client: TestClient, headers: dict, symbol: str) -> uu
 async def _cleanup(user_ids: list[uuid.UUID], strategy_ids: list[uuid.UUID], instrument_id: uuid.UUID | None = None) -> None:
     async with async_session_factory() as db:
         for user_id in user_ids:
+            await db.execute(delete(Position).where(Position.user_id == user_id))
             await db.execute(delete(Trade).where(Trade.user_id == user_id))
             await db.execute(delete(Notification).where(Notification.user_id == user_id))
             await db.execute(delete(AuditLog).where(AuditLog.user_id == user_id))
@@ -222,6 +223,67 @@ async def test_paper_trading_persists_trade_and_notification_on_close(require_in
                 # comment on _SETUP), so this must be TP_HIT specifically,
                 # not the generic POSITION_CLOSED every close used to fire
                 # regardless of which side of the bracket actually closed it.
+        finally:
+            await _cleanup([user_id], [strategy_id], instrument.id)
+
+
+async def test_paper_trading_persists_the_open_position_to_the_database(require_infra):
+    # Regression test: a live/MockBroker order placed through POST /orders
+    # or /options/execute mirrors its position into the `positions` table
+    # via `persist_position` (app/trading/persistence.py) so GET
+    # /portfolio, GET /admin/portfolio-snapshot, and the
+    # correlated-exposure risk check can see it -- this engine (the same
+    # PaperTradingEngine AutoTradeSupervisor drives) never called
+    # persist_position at all. A manual paper session's open position,
+    # however large, was invisible to every one of those for its entire
+    # open lifetime, only appearing once it closed and a Trade row
+    # appeared (see the sibling test above).
+    with TestClient(app) as client:
+        token, user_id = await _register(client, "paperposition")
+        headers = {"Authorization": f"Bearer {token}"}
+        instrument = await _make_instrument()
+        strategy_id = await _create_strategy(client, headers, instrument.symbol)
+
+        try:
+            r = client.post("/paper", json={"strategy_id": str(strategy_id), "symbol": instrument.symbol}, headers=headers)
+            assert r.status_code == 200, r.text
+            session_id = r.json()["session_id"]
+
+            start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
+            # Feed candles 0-8 only -- per _SETUP's comments, the position
+            # opens on candle 8 (the FVG retest) and only runs to target on
+            # candle 9, so this leaves it open.
+            for i, (o, h, low, c) in enumerate(_SETUP[:9]):
+                ts = (start + timedelta(minutes=i)).isoformat()
+                r = client.post(
+                    f"/paper/{session_id}/candle",
+                    json={"timestamp": ts, "open": o, "high": h, "low": low, "close": c, "volume": 10},
+                    headers=headers,
+                )
+                assert r.status_code == 200, r.text
+
+            assert r.json()["open_position"] is not None
+
+            async with async_session_factory() as db:
+                position = (await db.execute(select(Position).where(Position.user_id == user_id))).scalar_one()
+                assert position.execution_mode == ExecutionMode.PAPER
+                assert position.instrument_id == instrument.id
+                assert position.is_open is True
+                assert float(position.quantity) > 0
+
+            # Feed the final candle -- runs hard to target and closes it.
+            ts = (start + timedelta(minutes=9)).isoformat()
+            o, h, low, c = _SETUP[9]
+            r = client.post(
+                f"/paper/{session_id}/candle",
+                json={"timestamp": ts, "open": o, "high": h, "low": low, "close": c, "volume": 10},
+                headers=headers,
+            )
+            assert r.status_code == 200, r.text
+
+            async with async_session_factory() as db:
+                position = (await db.execute(select(Position).where(Position.user_id == user_id))).scalar_one()
+                assert position.is_open is False
         finally:
             await _cleanup([user_id], [strategy_id], instrument.id)
 

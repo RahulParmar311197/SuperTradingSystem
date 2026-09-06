@@ -22,6 +22,7 @@ from app.notifications.service import create_notification
 from app.paper.engine import PaperTradingEngine
 from app.smc.types import Candle
 from app.strategy.dsl import StrategyDefinition
+from app.trading.persistence import persist_position
 
 router = APIRouter(prefix="/paper", tags=["paper"])
 
@@ -155,6 +156,21 @@ async def feed_candle(
         }
 
     outcome = await engine.on_candle(candle)
+
+    # Blueprint §9/§86: `persist_position` is how a live/MockBroker order
+    # placed through POST /orders or /options/execute mirrors its position
+    # into the `positions` table so GET /portfolio, GET /admin/
+    # portfolio-snapshot, and the correlated-exposure risk check can see
+    # it -- this engine (the same PaperTradingEngine AutoTradeSupervisor
+    # drives) never called it at all, so a manual paper session's open
+    # position, however large, was invisible to every one of those until
+    # the moment it closed and a Trade row appeared. Persisted on every
+    # candle (not just open/close) so mark-to-market unrealized_pnl stays
+    # current too, and `is_open` flips to false the instant a position
+    # actually closes.
+    position_after = engine.position_manager.get(engine.account_id, engine.symbol)
+    if position_after is not None:
+        await persist_position(db, user.id, session.instrument_id, position_after, execution_mode=ExecutionMode.PAPER)
 
     if outcome.risk_checks is not None:
         # Blueprint's `risk_events` table (see AI_TRADING_PLATFORM_BLUEPRINT.md)

@@ -2236,6 +2236,70 @@ zero callers anywhere in this codebase, so it isn't a live bug — left
 unchanged rather than fixed speculatively; whoever wires it up should
 apply the same pattern.
 
+## Paper trading and the autonomous trading loop never persisted an open Position row
+
+`app/trading/persistence.py`'s `persist_position` is how an order placed
+through `POST /orders` or `POST /options/execute` mirrors its position
+into the `positions` table — the shared source of truth `GET /portfolio`
+(blueprint §9), `POST /admin/portfolio-snapshot`, and the
+correlated-exposure risk check (`app.risk.portfolio.compute_correlated_exposure`,
+blueprint §85-86) all read from. A grep across the whole `app/` tree for
+`persist_position(` turned up exactly two call sites — `app/api/orders.py`
+and `app/api/options.py` — and nothing else, ever. `app/api/paper.py`
+(manual paper trading sessions, blueprint §49) and
+`app/workers/auto_trade_worker.py`'s `AutoTradeSupervisor` (blueprint §54's
+flagship fully-autonomous trading loop) both drive the exact same
+`PaperTradingEngine`/`PositionManager`, and both already mirror *closed*
+trades into the `trades` table (an earlier round's fix), but neither one
+ever mirrored an *open* position into `positions` at all. A position this
+engine opened was completely invisible outside its own in-memory
+`PositionManager` for its entire open lifetime — `GET /portfolio` and
+`POST /admin/portfolio-snapshot` reported the same exposure as if no
+autonomous or paper trade were open, no matter how large one actually
+was, until the moment it closed and a `Trade` row finally appeared.
+
+This is worse than an isolated blind spot for blueprint §54's headline
+feature specifically: `AutoTradeSupervisor` builds one independent
+`PaperTradingEngine` (with its own `MockBroker` balance and its own fresh
+`PositionManager()`) per `(user, strategy, instrument)` key, so a user
+running several auto-trading strategies concurrently has several
+completely isolated in-memory position registries with no cross-engine
+visibility into each other even in principle — the `current_exposure`/
+`strategy_allocation` fields `PaperTradingEngine.on_candle` builds into
+its `TradeRiskProposal` are hardcoded to `0.0`, and `correlated_exposure`
+is left at its unset default, unlike `app/api/orders.py`'s live path,
+which correctly sums real open-position notionals and calls
+`compute_correlated_exposure`. Persisting every engine's position to the
+same `positions` table (keyed by `user_id`/`instrument_id`/
+`execution_mode`, not by which in-memory engine wrote it) is the
+prerequisite for ever closing that gap — with nothing in the database,
+there was no shared surface even a future fix to those hardcoded zeros
+could read from. Actually wiring real cross-engine exposure computation
+into `PaperTradingEngine.on_candle` remains open (would need those three
+proposal fields computed from a DB query across the user's other open
+`PAPER` positions, the same way `app/api/orders.py` already does it for
+`LIVE` — a larger change deliberately left for a future round); this
+round's fix makes the underlying data exist at all.
+
+Fixed by calling `persist_position(db, user_id, instrument_id,
+position_after, execution_mode=ExecutionMode.PAPER)` right after
+`engine.on_candle(...)` returns, in both `app/api/paper.py`'s
+`feed_candle` and `app/workers/auto_trade_worker.py`'s `_process` — on
+every candle, not only when a position opens or closes, so mark-to-market
+`unrealized_pnl` stays current the same way it would for a real broker
+position, and `is_open` flips to `false` in the database the instant the
+in-memory position actually closes.
+
+New `tests/api/test_paper.py::test_paper_trading_persists_the_open_position_to_the_database`
+feeds a manual paper session candles up to (but not through) its entry
+signal, asserts a `Position` row exists with `execution_mode=PAPER`,
+`is_open=True`, and the right instrument, then feeds the closing candle
+and asserts `is_open` flips to `False`. New
+`tests/workers/test_auto_trade_worker.py::test_supervisor_persists_the_open_position_to_the_database`
+does the same through `AutoTradeSupervisor.run_once()`. Both verified to
+fail against the pre-fix code (`scalar_one()` on an empty result — no
+`Position` row exists at all) and pass once the fix is restored.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

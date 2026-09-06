@@ -390,6 +390,80 @@ async def test_execute_rejects_when_premium_deviates_from_real_quote(require_inf
             await _cleanup(user_id, [long_leg.id, short_leg.id])
 
 
+async def test_execute_rejects_when_the_real_quote_is_stale(require_infra):
+    # Regression test: `market_data_age_seconds` on `OptionsRiskProposal`
+    # defaults to 0.0 and the only call site (this endpoint) never set it,
+    # so `evaluate_options_risk`'s "market_data_fresh" check (age <= 10s)
+    # could never fail -- it was structurally dead, and the persisted
+    # RiskEvent audit row falsely recorded that freshness had been
+    # verified for every approved strategy, stale snapshot or not.
+    from datetime import datetime, timedelta, timezone
+
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+        long_leg, short_leg = await _make_two_leg_instruments(f"STALE{uuid.uuid4().hex[:5].upper()}")
+
+        async with async_session_factory() as db:
+            chain = OptionChainSnapshot(
+                underlying="NIFTY", expiry=long_leg.expiry, spot_price=25000.0, fetched_at=datetime.now(timezone.utc)
+            )
+            db.add(chain)
+            await db.flush()
+            contract = OptionContract(instrument_id=long_leg.id, chain_id=chain.id, strike=25000.0, option_type="CALL")
+            db.add(contract)
+            await db.flush()
+            db.add(
+                OptionSnapshot(
+                    option_contract_id=contract.id,
+                    bid=100.0,
+                    ask=102.0,
+                    ltp=101.0,
+                    volume=1000,
+                    open_interest=1000,
+                    # Past RiskLimits.market_data_max_staleness_seconds (10s
+                    # default) but still under the liquidity filter's own,
+                    # separate max_quote_age_seconds (30s default) -- this
+                    # must fail on staleness specifically, not incidentally
+                    # trip the (already-covered) liquidity check too.
+                    snapshot_at=datetime.now(timezone.utc) - timedelta(seconds=15),
+                )
+            )
+            await db.commit()
+            contract_id = contract.id
+            chain_id = chain.id
+
+        try:
+            # premium=101.0 matches the mid exactly, so this can only fail
+            # on staleness, not on the (already-covered) premium-deviation check.
+            r = client.post(
+                "/options/execute",
+                json={
+                    "strategy_name": "long_call",
+                    "legs": [
+                        {"symbol": long_leg.symbol, "direction": "LONG", "quantity": 1, "premium": 101.0},
+                    ],
+                },
+                headers=headers,
+            )
+            assert r.status_code == 403, r.text
+            assert "Data age" in r.text
+
+            async with async_session_factory() as db:
+                orders = (await db.execute(select(Order).where(Order.user_id == user_id))).scalars().all()
+                assert orders == []  # nothing should have been placed
+
+                event = (await db.execute(select(RiskEvent).where(RiskEvent.user_id == user_id))).scalar_one()
+                assert event.checks["market_data_fresh"] is False
+        finally:
+            async with async_session_factory() as db:
+                await db.execute(delete(OptionSnapshot).where(OptionSnapshot.option_contract_id == contract_id))
+                await db.execute(delete(OptionContract).where(OptionContract.id == contract_id))
+                await db.execute(delete(OptionChainSnapshot).where(OptionChainSnapshot.id == chain_id))
+                await db.commit()
+            await _cleanup(user_id, [long_leg.id, short_leg.id])
+
+
 async def test_execute_records_which_broker_account_executed_it(require_infra):
     # Regression test: `Order.broker_account_id` exists to trace a placed
     # order back to whichever connected BrokerAccount executed it (see

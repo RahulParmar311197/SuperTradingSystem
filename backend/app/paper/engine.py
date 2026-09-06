@@ -184,6 +184,15 @@ class PaperTradingEngine:
         # account-wide caps on unattended autonomous trading.
         open_positions = self.position_manager.open_positions(self.account_id)
         current_exposure = sum(abs(p.quantity) * p.average_price for p in open_positions)
+        # Notional this specific strategy already has open, across every
+        # symbol it trades -- not just `self.symbol` (this method already
+        # returned early above if that one has an open position). Only
+        # `PaperTradingEngine`'s own post-fill code ever stamps
+        # `PositionRecord.strategy_id` (see below), so this is 0.0 exactly
+        # when it should be: a strategy with nothing open yet.
+        strategy_allocation = sum(
+            abs(p.quantity) * p.average_price for p in open_positions if p.strategy_id == self.strategy.name
+        )
         proposal = TradeRiskProposal(
             account_id=self.account_id,
             strategy_id=self.strategy.name,
@@ -195,7 +204,7 @@ class PaperTradingEngine:
             daily_pnl=self.daily_pnl,
             weekly_pnl=self.weekly_pnl,
             current_exposure=current_exposure,
-            strategy_allocation=0.0,
+            strategy_allocation=strategy_allocation,
             market_data_age_seconds=0.0,
             broker_healthy=await self.broker.is_healthy(),
             repeated_rejections=self.repeated_rejections,
@@ -247,6 +256,12 @@ class PaperTradingEngine:
             if new_position is not None:
                 new_position.stop = result.stop
                 new_position.target = result.target
+                # Blueprint §57 "Maximum strategy allocation" -- attribute
+                # this fresh entry to the strategy that opened it, so a
+                # later candle's `strategy_allocation` computation above
+                # (for this engine or a sibling one sharing the same
+                # PositionManager) can actually see it.
+                new_position.strategy_id = self.strategy.name
 
         return PaperTradeOutcome(signal=result, order_created=created, risk_checks=risk_checks)
 

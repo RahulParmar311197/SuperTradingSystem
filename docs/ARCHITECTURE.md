@@ -2774,6 +2774,61 @@ Verified to fail against the pre-fix code (the strategy executes
 successfully despite the account-wide daily loss halt) via `git stash`,
 then pass once the fix is restored.
 
+## Maximum strategy allocation was structurally dead for paper and autonomous trading
+
+`RiskLimits.max_strategy_allocation_pct` (blueprint §57's "Maximum strategy
+allocation" — a per-strategy circuit breaker distinct from the
+account-wide exposure cap) and `RiskEngine.evaluate`'s
+`strategy_allocation_limit` check are both correctly implemented. But
+`PaperTradingEngine.on_candle` — the single code path that builds a
+`TradeRiskProposal` for both manual paper trading (`app/api/paper.py`)
+and fully autonomous trading (`AutoTradeSupervisor` /
+`app/workers/auto_trade_worker.py`, which drives this same engine) —
+hardcoded `strategy_allocation=0.0` on every call. Since
+`strategy_allocation_pct` is computed as `(proposal.strategy_allocation +
+this_trade's_notional) / account_balance * 100`, a permanent `0.0` input
+meant the check only ever measured *this one new trade* against the
+limit, never what the strategy already had open — so a user who
+tightened `max_strategy_allocation_pct` specifically to cap a single
+strategy's total footprint got no protection at all: that strategy could
+keep sizing up across every instrument it trades with the check silently
+never firing.
+
+This wasn't simply an unpopulated field, either. `PositionRecord`
+(`app/trading/position_manager.py`) had no way to attribute an open
+position back to the strategy that opened it — only `(account_id,
+symbol)`. `PositionManager` is deliberately *shared* across every engine
+driving the same account (see the earlier "AutoTradeSupervisor" fix in
+this document, which fixed account-wide `open_positions`/`current_exposure`
+by sharing one instance per user) — but that same sharing is exactly what
+made per-strategy attribution impossible without a real field for it:
+summing "every open position for this account" can't distinguish one
+strategy's notional from another's.
+
+Fixed by adding `PositionRecord.strategy_id: str | None`, stamped by
+`PaperTradingEngine.on_candle` right when a fresh entry fills (the same
+place `stop`/`target` are already attached to a new position) using
+`self.strategy.name` — the same identity `TradeRiskProposal.strategy_id`
+already carries. `on_candle` now computes `strategy_allocation` as the
+sum of notional across every open position (any symbol, any engine)
+whose `strategy_id` matches this engine's own strategy, instead of a
+hardcoded `0.0`. `app/api/orders.py`'s manual/live path is intentionally
+unaffected — it has no strategy concept at all (`strategy_id=None`), so
+`strategy_allocation=0.0` there remains correct, not a bug.
+
+New `tests/paper/test_engine.py::test_strategy_allocation_limit_blocks_a_second_position_for_the_same_strategy`
+runs two `PaperTradingEngine`s for the *same* strategy against two
+different symbols, sharing one `PositionManager` (mirroring how
+`AutoTradeSupervisor` actually drives them). The first opens a position
+normally; `max_strategy_allocation_pct` is then tightened to half of that
+position's own notional share, so a second position for the same
+strategy must fail regardless of how its own size is computed. Asserts
+the position is correctly attributed (`strategy_id` matches) and that the
+second entry is rejected specifically on `strategy_allocation_limit`.
+Verified to fail against the pre-fix code (`PositionRecord` has no
+`strategy_id` attribute at all) via `git stash`, then pass once the fix
+is restored.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

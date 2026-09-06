@@ -2475,6 +2475,58 @@ both `AIMessage` rows) is actually written. All three verified to fail
 against the pre-fix code (a collection-time `ImportError` for the
 not-yet-existing `AIProviderError`) and pass once the fix is restored.
 
+## Higher-timeframe candle derivation corrupted an already-closed bucket on a base-timeframe gap
+
+`app/workers/candle_worker.py`'s `CandleWorker` closes base-timeframe (1m)
+candles as ticks arrive and, once a base candle completes a higher
+timeframe's bucket boundary (`_completes_bucket`, purely wall-clock
+arithmetic on the closing candle's timestamp — it has no notion of whether
+every base candle inside that bucket actually exists), calls
+`_derive_timeframe` to aggregate that bucket's base candles into one
+derived candle (e.g. five 1m candles into one 5m candle).
+
+`_derive_timeframe` picked which base candles to aggregate by fetching a
+lookback window of recent base candles and slicing the last `window =
+target_minutes // base_minutes` rows *positionally* (`recent[-window:]`),
+then deriving the bucket's timestamp from `recent[0].timestamp`. This
+assumed the base timeframe has no gaps. In practice, a single dropped
+tick, a worker restart, or a feed hiccup during one bucket leaves that
+bucket with fewer base candles than `window` — but the *next* bucket's
+closing candle still satisfies `_completes_bucket` by wall-clock
+arithmetic and still triggers derivation. When that happens, the
+positional slice pads the missing count out with base candles from the
+*previous*, already-derived bucket. `recent[0]` then belongs to that
+previous bucket, so the derived timestamp computed from it collides with
+the previous bucket's already-persisted row (`upsert_candles` upserts on
+`(instrument_id, timeframe, timestamp)`) — silently overwriting an
+already-correct derived candle with data spanning two different periods,
+while the true current (incomplete) bucket is never derived at all. A
+naive `len(recent) < window` guard did not catch this, since the total
+row count across both buckets combined still reached `window`.
+
+Fixed by computing the target bucket's timestamp directly from `as_of`
+(`target_bucket_ts = compute_bucket_start(as_of, target_minutes)`, no
+longer inferred from whichever row happens to land first in a positional
+slice) and filtering the fetched base candles to bucket *membership*
+rather than position: `[c for c in recent if compute_bucket_start(c.timestamp,
+target_minutes) == target_bucket_ts]`. This is the same approach
+`app/market/aggregation.py`'s `resample_candles` already uses correctly —
+bucketing each candle by its own timestamp rather than assuming a gap-free
+run of rows. If the filtered set doesn't contain exactly `window` candles,
+the bucket is genuinely incomplete and derivation is skipped, leaving the
+previous bucket's derived candle untouched.
+
+New `tests/workers/test_candle_worker.py::test_derive_timeframe_skips_an_incomplete_bucket_instead_of_corrupting_the_prior_one`
+derives a first 5m bucket normally from five 1m candles, then feeds a
+second 5m bucket's worth of ticks with one minute deliberately missing.
+It asserts the first bucket's derived candle (`open`/`close`) is still
+exactly what it was before the second bucket's (still-firing, per
+wall-clock boundary) derivation attempt — i.e. no second 5m row appears
+and the first one isn't corrupted. Verified to fail against the pre-fix
+code (the first bucket's derived candle gets silently overwritten with
+`open=104.0` instead of the correct `100.0`, mixing in a base candle from
+the second bucket) and pass once the fix is restored.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

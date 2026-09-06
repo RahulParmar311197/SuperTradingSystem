@@ -41,7 +41,15 @@ async def get_portfolio(user: User = Depends(get_current_user), db: AsyncSession
         equity=account.equity,
         open_position_count=len(positions),
         total_unrealized_pnl=sum(p.unrealized_pnl for p in positions),
-        total_realized_pnl=sum(p.realized_pnl for p in positions),
+        # Realized P&L comes from the persisted `positions` rows, not from
+        # `positions` above -- that list is `open_positions()`, and realized
+        # P&L only exists because a position *closed*. Summing it over open
+        # positions reported 0.0 for every fully closed trade, and for a
+        # partial close reported only what had been realized so far, so
+        # closing the remainder drove the figure back down to zero. The DB
+        # is also the same source `total_exposure` below already uses, and
+        # unlike the in-memory manager it survives a process restart.
+        total_realized_pnl=exposure.total_realized_pnl,
         total_exposure=exposure.total_exposure,
         exposure_by_market=exposure.exposure_by_market,
     )

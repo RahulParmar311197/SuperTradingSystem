@@ -3279,6 +3279,76 @@ through `set_strategy_kill(<the id the engine was given>)`, asserts
 the converse: a kill on one strategy's id must *not* stop an engine
 running a different one.
 
+## GET /portfolio reported zero realized P&L for every closed trade
+
+`GET /portfolio` built its response from two different sources, and they
+disagreed about what "the portfolio" is:
+
+```python
+positions = await _mark_open_positions_to_market(stack, str(user.id))
+...
+total_unrealized_pnl=sum(p.unrealized_pnl for p in positions),
+total_realized_pnl=sum(p.realized_pnl for p in positions),
+total_exposure=exposure.total_exposure,
+```
+
+`total_exposure` came from the persisted `positions` table via
+`compute_portfolio_exposure`, but `total_realized_pnl` was summed over
+`positions` — which is `PositionManager.open_positions()`, filtered to
+records where `is_open` (`quantity != 0`). Realized P&L exists precisely
+*because* a position closed, so restricting it to open positions is a
+contradiction in terms.
+
+Reproduced directly against `PositionManager`, opening 50 @ 100 and
+closing at 120 in two steps:
+
+```
+after OPEN 50 @100                          -> total_realized_pnl=0.0    (truth 0.0)
+after PARTIAL close 20 @120 (realized 400)  -> total_realized_pnl=400.0  (truth 400.0)
+after FULL close (realized 1000 total)      -> total_realized_pnl=0      (truth 1000.0)
+```
+
+The number is non-zero only during the transient window where a position
+is *partially* closed — the one state where it is least meaningful — and
+realizing **more** profit drives the reported figure back down to zero. End
+to end through the API, a user who opened 100 shares at 100 and closed them
+at 110 sees `total_realized_pnl: 0.0` while the `trades` journal row and
+the persisted `positions` row both record a ₹1000 gain.
+
+Nothing evicts the closed record either: `PositionManager.close()` has no
+call sites anywhere in the codebase, so the in-memory `PositionRecord`
+retains its correct `realized_pnl` indefinitely — it is simply filtered out
+by `is_open` before the sum. The data was right; the query over it was
+wrong.
+
+Fixed by sourcing realized P&L from the same place `total_exposure` in the
+same response already comes from. `compute_portfolio_exposure` now also
+returns `total_realized_pnl`, summed with `func.coalesce(func.sum(...), 0)`
+over every `positions` row for that `(user_id, execution_mode)` **without**
+the `is_open` filter, and `GET /portfolio` reads that. Besides being
+correct, the persisted rows survive a process restart, which the in-memory
+manager does not — `_STACKS` is process-local.
+
+`total_unrealized_pnl` deliberately stays restricted to open positions: a
+closed position has nothing left to mark, and `mark_to_market` returns
+early on a flat position, so a closed record's `unrealized_pnl` is stale
+rather than zero. Including closed records there would reintroduce the
+mirror-image bug.
+
+Blueprint §60 lists realized P&L as a Position Manager responsibility and
+§86 treats it as a portfolio-level figure; §93/§104's dashboard reads it.
+
+Both pre-existing tests in `tests/api/test_portfolio.py` and
+`tests/api/test_positions.py` call `GET /portfolio` and both pass, but
+neither ever closes a position and neither asserts anything about
+`total_realized_pnl` — the closest is an assertion on
+`total_unrealized_pnl` for a still-open position. The new
+`test_portfolio_reports_realized_pnl_after_a_position_closes` opens a
+position through `POST /orders`, closes the full quantity at a profit,
+confirms the persisted row is flat with a positive `realized_pnl`, and
+asserts the endpoint reports that same figure. Verified to fail against the
+pre-fix code with `assert 0.0 == 1000.0`.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

@@ -15,7 +15,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models.instruments import Instrument
@@ -29,13 +29,28 @@ from app.risk.correlation import correlated_exposure as _correlated_exposure
 class PortfolioExposure:
     total_exposure: float
     exposure_by_market: dict[str, float] = field(default_factory=dict)
+    # Summed over EVERY position row for this account, open or closed.
+    # Realized P&L by definition belongs to a position that is no longer
+    # open, so anything that restricts it to open positions reports 0.0 for
+    # a fully closed one -- see the note in `compute_portfolio_exposure`.
+    total_realized_pnl: float = 0.0
 
 
 async def compute_portfolio_exposure(
     db: AsyncSession, user_id: uuid.UUID, execution_mode: ExecutionMode = ExecutionMode.LIVE
 ) -> PortfolioExposure:
     """Total notional and per-market-type breakdown across a user's open
-    positions, read from the real `positions` table."""
+    positions, read from the real `positions` table, plus realized P&L
+    across every position the account has ever held in this execution mode.
+
+    Exposure is an open-positions figure -- a closed position has no
+    notional at risk. Realized P&L is the opposite: it only exists *because*
+    a position closed, so it is deliberately summed without the `is_open`
+    filter. `GET /portfolio` previously derived it from the in-memory
+    manager's `open_positions()`, which meant a fully closed trade reported
+    0.0 and a partially closed one reported only the part realized so far --
+    closing the rest drove the number back down to zero.
+    """
     positions = (
         await db.execute(
             select(Position).where(
@@ -45,6 +60,17 @@ async def compute_portfolio_exposure(
             )
         )
     ).scalars().all()
+
+    total_realized_pnl = float(
+        (
+            await db.execute(
+                select(func.coalesce(func.sum(Position.realized_pnl), 0)).where(
+                    Position.user_id == user_id,
+                    Position.execution_mode == execution_mode,
+                )
+            )
+        ).scalar_one()
+    )
 
     total = 0.0
     by_market: dict[str, float] = {}
@@ -56,7 +82,9 @@ async def compute_portfolio_exposure(
         total += notional
         by_market[instrument.market.value] = by_market.get(instrument.market.value, 0.0) + notional
 
-    return PortfolioExposure(total_exposure=total, exposure_by_market=by_market)
+    return PortfolioExposure(
+        total_exposure=total, exposure_by_market=by_market, total_realized_pnl=total_realized_pnl
+    )
 
 
 async def compute_correlated_exposure(

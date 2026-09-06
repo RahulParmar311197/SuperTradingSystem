@@ -49,6 +49,30 @@ class StrategyEngine:
                 matched=False, satisfied=satisfied, missing=missing + ["no_valid_entry_zone"]
             )
 
+        # Blueprint §27: a signal's stop must sit on the *losing* side of its
+        # entry -- below for a long, above for a short. The default market
+        # entry type anchors the stop at a dealing-range edge, and that range
+        # is just the most recent confirmed swing high/low
+        # (app.smc.premium_discount), which is not guaranteed to bracket the
+        # current price: once price drifts through the range low, a bullish
+        # setup resolves to `entry=current_price, stop=range_low` with the
+        # stop *above* entry. Nothing downstream can catch that -- `RiskEngine`
+        # measures the stop with `abs(entry - stop)` and `TradeRiskProposal`
+        # carries no direction, so the bracket passes every risk check, and
+        # the exit logic in both `app/backtest/engine.py` and
+        # `app/paper/engine.py` then reads `candle.low <= stop` as a stop-loss
+        # hit on the very next candle -- filling *above* the entry and booking
+        # a guaranteed profit labelled `stop_loss`. That fake profit is real
+        # enough to inflate `daily_pnl`, which feeds the `daily_loss_limit`
+        # check and pushes the loss halt further out on exactly the day it is
+        # needed most. An inverted bracket means the setup's own premise no
+        # longer holds, so the correct answer is no signal at all.
+        is_bullish = direction.lower() == "bullish"
+        if (stop > entry) if is_bullish else (stop < entry):
+            return StrategyEvaluationResult(
+                matched=False, satisfied=satisfied, missing=missing + ["stop_on_wrong_side_of_entry"]
+            )
+
         risk_per_unit = abs(entry - stop)
         minimum_rr = strategy.risk.minimum_rr
         if direction.lower() == "bullish":

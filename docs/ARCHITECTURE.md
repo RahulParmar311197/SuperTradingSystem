@@ -2895,6 +2895,89 @@ new test calls `on_candle(candle, db)`, which raises against the
 one-argument pre-fix signature) via `git stash`, then pass once the fix
 is restored.
 
+## Market-entry signals could emit a long whose stop sat above the entry
+
+`StrategyEngine._resolve_entry_and_stop` handles three entry types. The two
+retest branches (`fvg_retest`, `order_block_retest`) are structurally safe:
+they anchor the stop *beyond* the far edge of the zone they enter from, so
+the stop is always on the losing side of the entry by construction. The
+default `market` entry type — which is `EntryConfig`'s default, so it is
+what any strategy that doesn't name an entry type gets — is not:
+
+```python
+entry = context.current_price
+stop = smc.dealing_range.range_low if is_bullish else smc.dealing_range.range_high
+```
+
+`dealing_range` comes from `app/smc/premium_discount.py`, and it is simply
+*the most recent confirmed swing high and the most recent confirmed swing
+low*. Neither is guaranteed to bracket the current price. Once price drifts
+below the last confirmed swing low, a bullish strategy resolves to
+`entry=current_price, stop=range_low` with the **stop above the entry** —
+an inverted bracket. The mirror case applies to a short once price rises
+above the last swing high.
+
+Nothing downstream could catch this. `StrategyEngine.evaluate`'s only guard
+on the resolved pair rejected `entry == stop` but never checked which
+*side* the stop was on. `RiskEngine.evaluate` is equally blind: it measures
+the stop as `risk_per_unit = abs(proposal.entry - proposal.stop)`, and
+`abs()` erases the sign — `TradeRiskProposal` carries no `direction` field
+to compare against in the first place, so an inverted bracket passes
+`valid_stop_distance` and every other risk check cleanly.
+
+The consequence is not merely a malformed signal. Both exit paths —
+`BacktestEngine._check_exit` and `PaperTradingEngine._maybe_exit` — test
+`candle.low <= position.stop` for a long. With the stop above the entry
+that is *trivially true on the very next candle*, so the position closes
+immediately, filled at the stop, i.e. **above** where it was entered. The
+trade is booked as a guaranteed profit whose `exit_reason` is
+`stop_loss`. Reproduced against the real engine on a gentle decline (each
+step well inside `RiskLimits.max_price_jump_pct`, so the abnormal-jump
+check does not intervene — a violent crash actually *is* caught by that
+check, which is why this surfaces during ordinary drift rather than a
+crash):
+
+```
+[23] OPEN entry= 96.00 stop= 97.46  <-- stop ABOVE entry
+[24] CLOSE reason=stop_loss price= 97.46 pnl=+1000.00
+[25] OPEN entry= 94.00 stop= 97.46
+[26] CLOSE reason=stop_loss price= 97.46 pnl=+1000.00
+```
+
+Four fabricated +1R "stop losses" in a row, turning a steady losing drift
+into `daily_pnl +4000`. That fake profit is not inert: it feeds
+`TradeRiskProposal.daily_pnl` and therefore *relaxes* the
+`daily_loss_limit` check, pushing the loss halt further out on precisely
+the day it is needed most. The same fiction reaches `Trade` rows,
+persisted positions, the SL_HIT notification (blueprint §63) reporting a
+stop loss that made money, `Signal` rows from the scanner (blueprint §27
+defines the signal contract as a `LONG` with `stop` strictly below
+`entry`), and backtest reports — where a long-only strategy measured
+across a sustained decline is scored with an inflated win rate and profit
+factor, i.e. the metrics flatter the strategy exactly where it is worst.
+
+Fixed with a direction-aware invariant in `StrategyEngine.evaluate`,
+placed immediately after the existing degenerate-stop guard so it covers
+every entry type and every consumer at once: if the stop is not on the
+losing side of the entry, the evaluation returns `matched=False` with
+`stop_on_wrong_side_of_entry` in `missing`, and no `entry`/`stop` is
+emitted at all. Suppressing the signal (rather than clamping the stop) is
+the correct answer here because an inverted bracket means the setup's own
+premise no longer holds — a bullish market entry below the dealing range
+is not a discounted long, it is a strategy whose range has been broken.
+
+`tests/strategy/test_engine.py::test_market_entry_below_the_dealing_range_low_does_not_emit_an_inverted_long`
+builds a zigzag that establishes a confirmed swing high and low, then
+drifts price steadily below that swing low, and asserts the evaluation is
+rejected with `stop_on_wrong_side_of_entry` and emits no bracket. Verified
+to fail against the pre-fix code (which returned `matched=True,
+entry=85, stop=97.857`) via `git stash`, then pass once the fix is
+restored. A companion test,
+`test_market_entry_inside_the_dealing_range_still_emits_a_valid_long`,
+pins the ordinary case — price above the range low still produces a
+well-formed `stop < entry < target` signal — so the guard cannot silently
+over-block legitimate setups.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

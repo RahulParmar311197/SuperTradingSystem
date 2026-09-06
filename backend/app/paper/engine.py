@@ -88,8 +88,22 @@ class PaperTradingEngine:
         ict_config: ICTConfig | None = None,
         broker: MockBroker | None = None,
         position_manager: PositionManager | None = None,
+        strategy_id: str | None = None,
     ) -> None:
         self.strategy = strategy
+        # The `strategies.id` UUID this engine is running, as a string --
+        # the identity the rest of the platform uses for a strategy
+        # (`Signal.strategy_id`, `Order.strategy_id`, `Trade.strategy_id`
+        # are all FKs to it, and it is what `GET /strategies` returns and
+        # what `POST /admin/kill-switch/strategy/{strategy_id}` keys on).
+        # This used to be derived from `strategy.name`, which is neither
+        # stable (PUT /strategies/{id} rewrites it) nor unique (no
+        # constraint on `strategies.name`, so two users' identically-named
+        # strategies would collide). `None` is honest for a bare engine
+        # with no database row behind it: the kill switch treats it as
+        # "no strategy level to check", and allocation attribution below
+        # skips rather than guessing.
+        self.strategy_id = strategy_id
         self.symbol = symbol
         self.account_id = account_id
         self.candles: list[Candle] = []
@@ -194,7 +208,9 @@ class PaperTradingEngine:
         # `PositionRecord.strategy_id` (see below), so this is 0.0 exactly
         # when it should be: a strategy with nothing open yet.
         strategy_allocation = sum(
-            abs(p.quantity) * p.average_price for p in open_positions if p.strategy_id == self.strategy.name
+            abs(p.quantity) * p.average_price
+            for p in open_positions
+            if self.strategy_id is not None and p.strategy_id == self.strategy_id
         )
         # Blueprint §85: mirrors app/api/orders.py's identical computation
         # for the live path. `db` is optional here (unlike orders.py, which
@@ -219,7 +235,7 @@ class PaperTradingEngine:
         )
         proposal = TradeRiskProposal(
             account_id=self.account_id,
-            strategy_id=self.strategy.name,
+            strategy_id=self.strategy_id,
             entry=result.entry,
             stop=result.stop,
             account_balance=account.balance,
@@ -250,7 +266,7 @@ class PaperTradingEngine:
         # AutoTradeSupervisor that drives it in app.workers.auto_trade_worker
         # both reuse this method) takes effect on the very next evaluation.
         # See app.risk.kill_switch.load_kill_switch_state.
-        self.risk_engine.kill_switch = await load_kill_switch_state(self.account_id, self.strategy.name)
+        self.risk_engine.kill_switch = await load_kill_switch_state(self.account_id, self.strategy_id)
         decision = self.risk_engine.evaluate(proposal)
         risk_checks = {c.name: c.passed for c in decision.checks}
         if not decision.approved:
@@ -286,7 +302,7 @@ class PaperTradingEngine:
                 # later candle's `strategy_allocation` computation above
                 # (for this engine or a sibling one sharing the same
                 # PositionManager) can actually see it.
-                new_position.strategy_id = self.strategy.name
+                new_position.strategy_id = self.strategy_id
 
         return PaperTradeOutcome(signal=result, order_created=created, risk_checks=risk_checks)
 

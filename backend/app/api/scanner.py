@@ -65,6 +65,7 @@ async def run_scanner(
             current_price=candles[-1].close,
             smc=smc_engine.analyze(candles),
             ict=ict_engine.analyze(candles),
+            current_index=len(candles) - 1,
         )
         outcome = strategy_engine.evaluate(strategy, context)
         results.append(

@@ -74,6 +74,7 @@ class ScannerWorker:
                     current_price=candles[-1].close,
                     smc=smc_context,
                     ict=ict_context,
+                    current_index=len(candles) - 1,
                 )
 
                 for strategy_id, strategy in strategies:

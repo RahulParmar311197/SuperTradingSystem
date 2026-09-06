@@ -53,12 +53,23 @@ def evaluate_condition(condition: Condition, context: EvaluationContext) -> bool
                 for e in events
                 if e.event_type.value == event_name
                 and (condition.direction is None or e.direction.value.lower() == condition.direction.lower())
+                # BOS/CHoCH/MSS are one-time historical events, not a
+                # persistent state like an unmitigated FVG -- without this,
+                # a structure break that happened once, arbitrarily far in
+                # the past, would keep matching on every future candle
+                # forever (see `condition.lookback`'s docstring in
+                # app/strategy/dsl.py).
+                and context.current_index - e.index < condition.lookback
             ]
             return len(matches) > 0
 
         case ConditionType.LIQUIDITY_SWEEP:
             side = f"{condition.side.upper()}_SIDE" if condition.side else None
-            sweeps = smc.recent_sweeps(side=side)
+            sweeps = [
+                p
+                for p in smc.recent_sweeps(side=side)
+                if p.swept_index is not None and context.current_index - p.swept_index < condition.lookback
+            ]
             return len(sweeps) > 0
 
         case ConditionType.FVG:

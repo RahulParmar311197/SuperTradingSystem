@@ -119,15 +119,26 @@ class CandleWorker:
         self, instrument_id: uuid.UUID, target_timeframe: str, target_minutes: int, as_of: datetime
     ) -> None:
         window = target_minutes // self.base_minutes
+        target_bucket_ts = compute_bucket_start(as_of, target_minutes)
         async with async_session_factory() as db:
             lookback_start = as_of - timedelta(minutes=target_minutes * 2)
             recent = await get_candles(db, instrument_id, self.base_timeframe, start=lookback_start, end=as_of)
-            recent = recent[-window:]
-            if len(recent) < window:
+            # Filter to exactly the base candles that fall inside *this*
+            # target bucket, rather than slicing the last `window` rows by
+            # position -- the positional slice assumed the base timeframe
+            # has no gaps. If a tick-feed hiccup or worker restart dropped
+            # one or more base candles inside this bucket, `recent[-window:]`
+            # padded the count with candles from the *previous* bucket,
+            # deriving the wrong bucket timestamp from `recent[0]` and
+            # silently overwriting that already-correct, already-persisted
+            # candle with data actually spanning two different periods,
+            # while the true current bucket was never written at all.
+            bucket_candles = [c for c in recent if compute_bucket_start(c.timestamp, target_minutes) == target_bucket_ts]
+            if len(bucket_candles) != window:
                 return
-            derived = aggregate_candles(recent)
+            derived = aggregate_candles(bucket_candles)
             derived = Candle(
-                timestamp=compute_bucket_start(recent[0].timestamp, target_minutes),
+                timestamp=target_bucket_ts,
                 open=derived.open,
                 high=derived.high,
                 low=derived.low,

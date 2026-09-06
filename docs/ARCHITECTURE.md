@@ -3132,6 +3132,76 @@ Separately, `compute_correlated_exposure` correlates return series by list
 position rather than by timestamp, so two instruments with different candle
 coverage produce a meaningless correlation — worth its own investigation.
 
+## Correlation was computed by list position instead of by timestamp
+
+Blueprint §85's correlated-exposure check exists to notice when an account
+that looks diversified is really one concentrated bet. The engine
+(`app/risk/correlation.py`) computed each instrument's close-to-close
+returns independently and then correlated them with:
+
+```python
+n = min(len(a), len(b))
+a, b = a[-n:], b[-n:]
+```
+
+That aligns two series by *list position from the tail*, which silently
+assumes both instruments printed the same number of bars over the same
+wall-clock span. They routinely do not. An illiquid instrument prints fewer
+bars over the same period; an instrument listed later simply starts later;
+ingestion gaps drop bars. In every such case the last N returns of one
+symbol cover a different time range than the last N of the other, and the
+two get correlated as though they were contemporaneous.
+
+Demonstrated against the real functions with two symbols following the
+**identical price path at identical timestamps** — genuinely correlated
+1.0 — differing only in that the second is illiquid and prints every other
+bar:
+
+```
+A: 119 returns spanning 09:15-15:00
+B:  59 returns spanning 09:15-14:45
+pearson uses n=min=59: A[-59:] vs B[-59:]
+  A[-59:] actually covers 00:30-15:00
+  B[-59:] actually covers 09:45-14:45
+correlation reported:                    -0.789
+correlation on timestamp-aligned bars:    1.0
+```
+
+A perfect positive correlation is reported as strongly *negative*, because
+the choppy first half of one series is being lined up against the trending
+second half of the other. The check uses `abs(corr) >= threshold`
+(default 0.7), so the error runs in both directions: genuinely correlated
+positions can fall below the threshold and escape the limit, while
+genuinely unrelated instruments can be flagged and block a legitimate
+trade. The number simply carries no information about the instruments'
+actual relationship.
+
+Fixed by making alignment structural rather than incidental.
+`build_correlation_matrix` now takes closes keyed by timestamp
+(`dict[str, dict[datetime, float]]`) instead of bare return lists, and for
+each pair intersects on the timestamps both symbols actually have, sorts
+them, and computes returns over that shared series — so every pair of
+points being correlated spans the same interval. A pair with fewer than
+three shared bars yields no correlation at all rather than a fabricated
+one, which `correlated_exposure` already treats as "uncorrelated, no
+evidence". `closes_by_timestamp` is the small helper that builds that
+input, and `compute_correlated_exposure` in `app/risk/portfolio.py` now
+feeds it. `pearson_correlation` keeps its list API and its tail-truncation
+as a defensive fallback, with its docstring now stating plainly that
+aligning the series is the caller's job.
+
+`tests/risk/test_correlation.py::test_correlation_aligns_series_on_shared_timestamps`
+builds exactly the liquid/illiquid pair above and asserts the matrix
+reports 1.0. It also pins the *old* behaviour's harm directly — computing
+the two return series and correlating them by position must give a
+strongly negative number — so the test cannot later degrade into merely
+passing because the API changed shape.
+`test_build_correlation_matrix_skips_pairs_with_too_little_overlap` covers
+the barely-overlapping case. The pre-existing
+`test_build_correlation_matrix_covers_every_pair` was migrated to the new
+timestamp-keyed input while keeping its original intent (a pair whose
+returns are an exact 2x multiple still correlates 1.0).
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

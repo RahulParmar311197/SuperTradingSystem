@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database.models.instruments import Instrument
 from app.database.models.trading import ExecutionMode, Position
 from app.market.repository import get_candles
-from app.risk.correlation import build_correlation_matrix, close_returns
+from app.risk.correlation import build_correlation_matrix, closes_by_timestamp
 from app.risk.correlation import correlated_exposure as _correlated_exposure
 
 
@@ -75,7 +76,7 @@ async def compute_correlated_exposure(
     correlation is a refinement on top of the exposure check, not a
     replacement for it."""
     symbols = {target_symbol, *open_position_notionals}
-    returns_by_symbol: dict[str, list[float]] = {}
+    closes_by_symbol: dict[str, dict[datetime, float]] = {}
     for symbol in symbols:
         instrument = (
             await db.execute(select(Instrument).where(Instrument.symbol == symbol))
@@ -84,7 +85,12 @@ async def compute_correlated_exposure(
             continue
         candles = await get_candles(db, instrument.id, timeframe)
         if len(candles) >= 3:
-            returns_by_symbol[symbol] = close_returns(candles[-lookback:])
+            # Keyed by timestamp, not flattened to a bare return list:
+            # `build_correlation_matrix` intersects each pair on the bars
+            # they genuinely share before computing returns, so two
+            # instruments with different candle coverage are never
+            # correlated position-by-position across mismatched periods.
+            closes_by_symbol[symbol] = closes_by_timestamp(candles[-lookback:])
 
-    matrix = build_correlation_matrix(returns_by_symbol)
+    matrix = build_correlation_matrix(closes_by_symbol)
     return _correlated_exposure(target_symbol, target_notional, open_position_notionals, matrix, threshold)

@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.dependencies import get_current_user, require_permission
+from app.brokers.base import BrokerError
 from app.brokers.mock import MockBroker
 from app.core.audit import record_audit
 from app.core.metrics import ORDER_COUNT, RISK_REJECTION_COUNT
@@ -487,7 +488,21 @@ async def cancel_order(
         raise HTTPException(status.HTTP_409_CONFLICT, f"Cannot cancel an order in status {order.status.value}")
 
     if order.broker_order_id:
-        await stack.broker.cancel_order(order.broker_order_id)
+        # A broker-level cancel failure (e.g. the order already filled or
+        # was already cancelled in the meantime -- an ordinary race, not a
+        # bug) must never look like a successful cancel, and must never be
+        # allowed to propagate as a raw exception either: that would 500
+        # the request *and* leave the order's true broker-side status
+        # unreconciled with its still-SUBMITTED/ACKNOWLEDGED local status,
+        # since none of the transition/persist/audit lines below would run.
+        # Surfacing it as a clean error and leaving local state untouched
+        # is safer than guessing at a new status -- the existing
+        # reconciliation worker is what should ultimately correct it if the
+        # broker's real status has actually moved on.
+        try:
+            await stack.broker.cancel_order(order.broker_order_id)
+        except BrokerError as exc:
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"Broker failed to cancel this order: {exc}") from exc
     stack.order_manager.transition(order_id, OrderStatus.CANCELLED, "cancelled by user")
     final_order = stack.order_manager.get(order_id)
     ORDER_COUNT.labels(final_order.status.value).inc()

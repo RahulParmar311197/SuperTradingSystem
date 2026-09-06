@@ -2167,6 +2167,75 @@ collection-time `ImportError` for the not-yet-existing Redis functions,
 the fourth — the rewritten paper-engine test — the same way) and pass
 once the fix is restored.
 
+## Cancelling a live order could 500 the request and permanently wedge the order
+
+`UpstoxBroker.place_order` was hardened in an earlier round to catch both
+`httpx.HTTPStatusError` (a 4xx/5xx) and `BrokerError` (Upstox's own
+HTTP-200-with-`{"status":"error"}` envelope, raised by this adapter's
+`_unwrap` helper) and turn either into a normal `OrderResult(status=
+REJECTED, ...)` instead of letting them propagate. `cancel_order` in the
+same file (`app/brokers/upstox/adapter.py`) was never given the same
+treatment: it called `response.raise_for_status()` and `_unwrap()` with no
+`try`/`except` at all, so `httpx.HTTPStatusError` propagated straight out
+uncaught (the 200-error-envelope shape already came out as `BrokerError`
+via `_unwrap`, so that half was accidentally fine — only the 4xx/5xx half
+was actually broken). The only caller, `POST /orders/{id}/cancel`
+(`app/api/orders.py`), had no `try`/`except` around `stack.broker.
+cancel_order(...)` either, and that call sat *before*
+`order_manager.transition(order_id, OrderStatus.CANCELLED, ...)`.
+
+The concrete failure: a user cancels an order that Upstox, in the
+meantime, has already filled or already cancelled — an entirely ordinary
+race between the client seeing a stale order state and clicking cancel.
+Upstox reports that as an ordinary rejection (e.g. "Order already
+complete"), most often as a 4xx. That exception used to propagate
+uncaught past the `order_manager.transition` line, get caught only by
+`main.py`'s generic `Exception` handler, and return a bare 500 — and
+because the transition line never ran, the order stayed at its prior
+`SUBMITTED`/`ACKNOWLEDGED` status in both the in-memory `OrderManager` and
+the database forever, with no indication of what went wrong or what state
+the order was really in. Every retry of the cancel endpoint hit the same
+500 indefinitely.
+
+Fixed by wrapping `UpstoxBroker.cancel_order` in the equivalent
+`try`/`except`, normalizing an `httpx.HTTPStatusError` into a `BrokerError`
+(so the 4xx/5xx and 200-error-envelope cases now surface identically) and
+re-raising it rather than swallowing it into a synthetic `OrderResult`:
+unlike `place_order`, there's no `OrderStatus` value that cleanly
+represents "failed to cancel" from *both* the `SUBMITTED` and
+`ACKNOWLEDGED` source states the endpoint accepts (`app/trading/
+order_manager.py`'s transition table allows `SUBMITTED -> FAILED` but not
+`ACKNOWLEDGED -> FAILED`), so forcing a status here risked trading one
+crash for an `IllegalTransitionError` on exactly the case that matters.
+Instead, `POST /orders/{id}/cancel` now catches `BrokerError` around the
+broker call and returns a clean `502 Bad Gateway` with the broker's reason,
+skipping the transition/persist/audit lines entirely — the order is left
+exactly as it was, which is the truth (the broker never actually cancelled
+it), and existing reconciliation is what should correct the local state if
+the broker's own status has genuinely moved on.
+
+New `tests/brokers/test_upstox_adapter.py::test_cancel_order_4xx_raises_broker_error_not_http_status_error`
+(the one that actually needed the fix) and
+`::test_cancel_order_200_error_envelope_raises_broker_error` (already
+correct pre-fix, kept as a regression guard on that path too) cover the
+adapter directly. New `tests/api/test_orders.py::
+test_cancel_order_broker_failure_is_surfaced_cleanly_and_leaves_status_unchanged`
+exercises the full endpoint with a broker double whose orders never fill
+(`MockBroker`'s always do, immediately, so there'd be no way to reach a
+still-cancelable order otherwise) and whose `cancel_order` always fails,
+asserting a 502 (not 500) and that the order's status is still
+`ACKNOWLEDGED` afterward via `GET /orders`, never silently marked
+`CANCELLED` or lost. All three new/relevant assertions were verified to
+fail against the pre-fix code (a bare 500 for the endpoint test, an
+uncaught `httpx.HTTPStatusError` for the 4xx adapter test) and pass once
+the fix is restored.
+
+`modify_order` in the same adapter file has the identical shape (no
+`try`/`except` around `raise_for_status()`/`_unwrap()`) but currently has
+zero callers anywhere in this codebase, so it isn't a live bug — left
+unchanged rather than fixed speculatively; whoever wires it up should
+apply the same pattern.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

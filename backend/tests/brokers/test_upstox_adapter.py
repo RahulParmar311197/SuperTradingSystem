@@ -227,6 +227,34 @@ async def test_cancel_order():
 
 
 @pytest.mark.asyncio
+async def test_cancel_order_4xx_raises_broker_error_not_http_status_error():
+    # Regression test: cancel_order used to let httpx.HTTPStatusError
+    # propagate straight from `response.raise_for_status()` with no
+    # try/except at all -- unlike place_order, which was already hardened
+    # to normalize broker-level failures into a single exception type. The
+    # only caller (POST /orders/{id}/cancel) has no way to catch an
+    # exception type it doesn't know about, so this used to 500 the
+    # request with the order left dangling at SUBMITTED/ACKNOWLEDGED
+    # forever (order_manager.transition never got a chance to run).
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response(400, {"status": "error", "errors": [{"message": "Order already complete"}]})
+
+    broker = _broker_with_transport(handler)
+    with pytest.raises(BrokerError, match="Order already complete"):
+        await broker.cancel_order("o1")
+
+
+@pytest.mark.asyncio
+async def test_cancel_order_200_error_envelope_raises_broker_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response(200, {"status": "error", "errors": [{"message": "Order already complete"}]})
+
+    broker = _broker_with_transport(handler)
+    with pytest.raises(BrokerError, match="Order already complete"):
+        await broker.cancel_order("o1")
+
+
+@pytest.mark.asyncio
 async def test_error_envelope_raises_broker_error():
     def handler(request: httpx.Request) -> httpx.Response:
         return _json_response(200, {"status": "error", "errors": [{"message": "Token expired"}]})

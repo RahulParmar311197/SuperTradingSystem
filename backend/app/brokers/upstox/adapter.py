@@ -221,12 +221,27 @@ class UpstoxBroker(Broker):
         return OrderResult(broker_order_id=data.get("order_id", broker_order_id), status=OrderStatus.ACKNOWLEDGED)
 
     async def cancel_order(self, broker_order_id: str) -> OrderResult:
-        response = await self._http.delete(
-            f"{UPSTOX_API_BASE_URL}/order/cancel", headers=self._headers(), params={"order_id": broker_order_id}
-        )
-        response.raise_for_status()
-        data = _unwrap(response.json())
-        return OrderResult(broker_order_id=data.get("order_id", broker_order_id), status=OrderStatus.CANCELLED)
+        try:
+            response = await self._http.delete(
+                f"{UPSTOX_API_BASE_URL}/order/cancel", headers=self._headers(), params={"order_id": broker_order_id}
+            )
+            response.raise_for_status()
+            data = _unwrap(response.json())
+            return OrderResult(broker_order_id=data.get("order_id", broker_order_id), status=OrderStatus.CANCELLED)
+        except httpx.HTTPStatusError as exc:
+            raise BrokerError(_extract_error_message(exc.response)) from exc
+        # BrokerError (Upstox's HTTP-200-with-error-envelope shape, e.g.
+        # "Order already complete" for an order that filled in the
+        # in-between since the client last saw it) already propagates as
+        # BrokerError from `_unwrap` above -- no separate except needed,
+        # unlike place_order which had to normalize two different exception
+        # types into one OrderResult shape. Here both shapes normalize to
+        # the same BrokerError so the caller (POST /orders/{id}/cancel) has
+        # exactly one exception type to handle: never let this cancel
+        # request's failure silently masquerade as a successful CANCELLED
+        # transition, and never let it propagate as a raw, unhandled
+        # exception that 500s the request without the caller getting a
+        # chance to leave the order's already-correct local status alone.
 
     async def is_healthy(self) -> bool:
         try:

@@ -440,7 +440,19 @@ async def place_order(
                 # `stack.broker.set_quote(payload.symbol, ltp=payload.entry)`
                 # above pins the simulated fill to that same value.
                 exit_price=final_order.average_fill_price,
-                quantity=abs(position_before["quantity"]),
+                # The quantity this fill actually closed, not the whole
+                # pre-fill position. This block runs on any `realized_delta
+                # != 0`, which includes a *partial* reduce -- closing 40 of
+                # a 100-unit position recorded `quantity=100` alongside a
+                # `pnl` covering only those 40 units, so the row did not
+                # agree with itself (100 units moving 100 -> 120 is 2000,
+                # not the 800 recorded). It also double-counted: the later
+                # close of the remaining 60 journals another row, summing to
+                # 160 units for a 100-unit position. `min` is what makes
+                # this right for a flip too -- selling 120 against a 100-unit
+                # long closes 100 and opens a fresh 20 short, and the
+                # realized P&L covers only the 100 that closed.
+                quantity=min(final_order.filled_quantity, abs(position_before["quantity"])),
                 pnl=realized_delta,
                 stop=position_before["stop"],
                 target=position_before["target"],

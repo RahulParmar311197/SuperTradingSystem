@@ -138,17 +138,14 @@ async def test_portfolio_reports_realized_pnl_after_a_position_closes(require_in
 
             assert client.get("/portfolio", headers=headers).json()["total_realized_pnl"] == pytest.approx(0.0)
 
-            # Close the whole position at a profit. Same sizing formula, so
-            # ask for the exact quantity that is open.
+            # Close the whole position at a profit. POST /orders has no
+            # `quantity` field -- it sizes every order as
+            # `balance * risk_per_trade_pct / abs(entry - stop)` -- so an
+            # equal-width stop (5, matching the opening order's 100/95)
+            # produces an equal quantity and closes the position fully.
             r = client.post(
                 "/orders",
-                json={
-                    "symbol": instrument.symbol,
-                    "direction": "SHORT",
-                    "entry": 110.0,
-                    "stop": 115.0,
-                    "quantity": opened_quantity,
-                },
+                json={"symbol": instrument.symbol, "direction": "SHORT", "entry": 110.0, "stop": 115.0},
                 headers=headers,
             )
             assert r.status_code == 201, r.text

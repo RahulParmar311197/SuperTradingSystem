@@ -18,6 +18,14 @@ class PositionRecord:
     unrealized_pnl: float = 0.0
     stop: float | None = None
     target: float | None = None
+    # Which strategy's entry opened this position -- `None` for a manual/
+    # live order (POST /orders has no strategy concept at all) or for a
+    # position not yet attributed. `PositionManager` is shared across every
+    # engine driving the same account_id (see AutoTradeSupervisor, one
+    # PaperTradingEngine per (strategy, instrument) pair), so this is the
+    # only way to answer "how much notional does *this* strategy already
+    # have open" -- see RiskLimits.max_strategy_allocation_pct.
+    strategy_id: str | None = None
 
     @property
     def is_open(self) -> bool:

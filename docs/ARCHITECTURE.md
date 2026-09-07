@@ -3654,6 +3654,88 @@ sets `max_exposure_pct` between the real and the over-estimated notional
 and asserts the trade is approved (pre-fix: "Projected exposure 15.61% vs
 limit 3.5%"). Both verified to fail against the pre-fix engine.
 
+## Realized P&L double-counted on every re-entry (§86)
+
+`GET /portfolio`'s `total_realized_pnl` summed `Position.realized_pnl`
+across every row for the account. That column is not an increment, and
+summing it counts earlier round trips again.
+
+`PositionManager.apply_fill` (`app/trading/position_manager.py`) keeps one
+`PositionRecord` per `(account_id, symbol)` in `_positions` and does
+`position.realized_pnl += realized` on it. Nothing ever removes or resets
+that record when the position goes flat — `PositionManager.close()` is the
+only thing that would, and no application code calls it. So the value is a
+**lifetime running total** for the instrument, not the P&L of one position.
+
+`persist_position` (`app/trading/persistence.py`) looks up only the row with
+`is_open=True`. Once a position closes, that row is flipped to
+`is_open=False`; the next entry in the same instrument therefore finds no
+open row and **inserts a new one**, seeded with `realized_pnl=position.
+realized_pnl` — the cumulative total the *previous* position earned.
+
+Two closed round trips of +500 and +300 leave rows carrying 500 and 800.
+The true total is 800; the sum is 1300. After N round trips on one
+instrument the endpoint reports `N(N+1)/2 x p` instead of `N x p`, and it
+inflates losses identically. Reproduced end to end through the real writers
+(`PositionManager` -> `persist_position` -> `compute_portfolio_exposure`):
+
+```
+positions rows: [(500.0, False), (800.0, False)]
+GET /portfolio total_realized_pnl : 1300.0
+truth                             : 800.0
+```
+
+Separate instruments are unaffected — each keeps its own row chain — so
+this is specifically re-entry on one instrument, which is the normal case
+for a strategy that trades a symbol repeatedly, and the constant case for
+`AutoTradeSupervisor`.
+
+The fix reads the number from `trades` instead. Every realizing fill
+already writes exactly one `Trade` row carrying the **delta**:
+`pnl=realized_delta` in `app/api/orders.py` and `app/api/options.py`,
+`pnl=outcome.closed_position_pnl` in `app/api/paper.py` and
+`app/workers/auto_trade_worker.py`, each with an `execution_mode` matching
+the position's. Those four are the only callers of `persist_position`, so
+the journal covers every path that can realize anything, and it is correct
+for partial closes and flips (which is what the earlier `min(filled,
+abs(position_before))` work made true of the `quantity` on those same
+rows). It also survives an API restart, which resets the in-memory counter
+to zero and starts a fresh row chain — under the old aggregation the rows
+written before and after a restart would both be summed.
+
+The writer side is deliberately untouched. `Position.realized_pnl` still
+holds the lifetime total, which is what the in-memory record means and what
+the existing single-round-trip test compares against; the bug was reading it
+as though it were per-row.
+
+This is a defect in the earlier fix that made `total_realized_pnl` sum over
+closed rows at all. That change was right that realized P&L cannot be read
+from open positions only, and wrong about what the rows contain.
+
+`tests/api/test_portfolio.py`'s existing
+`test_portfolio_reports_realized_pnl_after_a_position_closes` cannot catch
+it: it does exactly one round trip, so there is one row, and it reads that
+row with `.scalar_one()` — which structurally asserts a single row ever
+exists — then asserts the endpoint equals that same row's value, so
+`SUM(realized_pnl) == row.realized_pnl` held no matter what the aggregation
+did. The same `.scalar_one()` on `Position` appears throughout
+`tests/api/test_orders.py`, so no test in the suite ever produced the
+two-row state. `tests/risk/test_portfolio.py` does insert several rows
+including a closed one, but leaves every `realized_pnl` at 0 and never
+asserts `total_realized_pnl`.
+
+The new `test_portfolio_realized_pnl_is_not_double_counted_across_re_entries`
+runs two full round trips on one instrument through `POST /orders`, computes
+the expected total from the quantity actually opened and the prices it
+chose (never from the aggregation under test), asserts the row sum is
+strictly greater than that expectation — pinning the overlap that makes the
+rows unsummable — and asserts the endpoint reports the true figure. Pre-fix
+it reports 2600 against a true 1600. The second round trip uses different
+prices deliberately: `POST /orders` keys idempotency on
+`{user}:{symbol}:{direction}:{entry}:{stop}`, so re-entering at the same
+entry and stop is deduped into the first order and no second position is
+opened at all.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

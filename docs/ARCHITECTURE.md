@@ -3802,6 +3802,89 @@ by the ~648 points the old sizing produced); and a bounded spread must
 still be sized by its real `max_loss`, pinned at exactly 3.5%. The first
 two fail against the pre-fix code with APPROVE where REJECT is required.
 
+## Paper/auto retest entries filled at the candle close, not at the level (§49, §54)
+
+`PaperTradingEngine.on_candle` -- behind `POST /paper/{id}/candle` and every
+autonomous trade -- submitted a MARKET order the instant a signal matched.
+`set_quote(ltp=candle.close)` at the top of the method means the MockBroker
+fills a MARKET order at that close. But a retest entry does not mean "buy
+now": `fvg_retest` sets `entry` to the midpoint of an *unmitigated* fair
+value gap, which by definition is a level price has not traded back into,
+and `order_block_retest` does the same for an order block. Stop, target and
+R are all derived from that `entry`.
+
+So the trade was sized on `|signal.entry - signal.stop|`, bracketed around
+`signal.entry`, and then opened at an entirely different price. On the
+`SETUP` fixture in `tests/paper/test_engine.py`:
+
+```
+candle 7 = (o107, h110, l106, c109)
+signal:   entry=103.0  stop=99.7  target=109.6
+filled:   average_price=109.0  quantity=151.5152  stop=99.7  target=109.6
+```
+
+103 is not a price candle 7 ever traded at -- its low is 106. Three
+consequences:
+
+- **The risk cap is silently blown.** Sized on a 3.30 stop distance, the
+  real distance from the fill to the stop is 9.30, so the trade risks
+  **1.41%** of the account against a configured `risk_per_trade_pct` of
+  0.5%. 2.8x, on the path that runs unattended.
+- **Exposure checks understate the position**, since the notional the risk
+  engine evaluated used the signal's entry rather than the fill price.
+- **The bracket can be breached at entry.** Nudge that candle to
+  `(107, 112, 106, 111)` -- same FVG, same signal -- and the position opens
+  at 111 against a target of 109.6. The next candle takes the
+  `take_profit` branch and closes at 109.6 for a **loss**, journaled as a
+  `Trade` and pushed to the user as a TP_HIT notification reading
+  "Realized P&L: -212.12".
+
+And backtest and paper disagreed on the same strategy over the same
+candles: the backtester opens at candle 8 at 103.0 and books +1000.00 at
+R=2.0, while paper opened at candle 7 at 109.0 and booked +90.91 -- 11x
+smaller for an identical setup, against a blueprint that requires the two
+to share one evaluation and agree.
+
+`app/backtest/engine.py` already has exactly the right gate --
+`if result.matched and candle.low <= result.entry <= candle.high` -- added
+when the same phantom-fill problem was fixed there. It was never carried
+across to the paper engine, which is the sibling-state pattern again: a fix
+applied to one of two engines that run the same strategies.
+
+The fix mirrors it. `on_candle` returns early when the candle's own range
+does not contain `result.entry`, and pins the quote to `result.entry`
+before submitting -- the same thing `_maybe_exit` already does with the
+stop/target level it closes at. Both halves are no-ops for
+`entry.type == "market"`, where `result.entry` is `candle.close` and so
+always inside `[low, high]`. The early return happens before the risk
+evaluation, leaving `risk_checks` as None, so neither caller writes a
+spurious `RiskEvent` row for a trade that never happened.
+
+Three existing tests broke on the change and were corrected rather than
+worked around: each drove candles until `signal.matched` and then stopped,
+which is now the candle *before* the fill. They break on the risk decision
+instead.
+
+Worth recording plainly: the two tests added when paper sizing was last
+fixed measured risk as
+`quantity * abs(signal.entry - signal.stop) / balance`, and `quantity` was
+itself `risk_amount / |signal.entry - signal.stop|`. Both sides came from
+the same two numbers, so the assertion re-derived the percent that went in
+and held for **any** fill price. It did catch which percent fed the sizing
+-- that was the bug it was written for -- but it could never see that the
+fill happened somewhere else. Both now measure from
+`position.average_price`, the price the broker really filled at, and both
+fail against the pre-fix engine at 1.4091% and 0.2818% against limits of
+0.5% and 0.1%.
+
+Two new tests: one asserts the filling candle actually traded at the level,
+that the fill price equals the level and *not* that candle's close (they
+differ, 103.0 vs 104, so it is not a tautology), and that a long never
+opens at or above its own target; the other runs `BacktestEngine` and
+`PaperTradingEngine` over the same candles with the same sizing percent and
+asserts the realized P&L match exactly, both cost models being
+frictionless. Pre-fix they fail at `106 <= 103.0` and 181.82 vs 2000.00.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

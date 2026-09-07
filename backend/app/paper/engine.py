@@ -249,6 +249,32 @@ class PaperTradingEngine:
         if not result.matched:
             return PaperTradeOutcome(signal=result)
 
+        # A retest entry (`fvg_retest`, `order_block_retest`) names a *level*
+        # price has to come back to -- an unmitigated FVG is by definition one
+        # price has not traded into yet, so `result.entry` sits below (long) or
+        # above (short) this candle. The order submitted below is a MARKET
+        # order, and `set_quote(ltp=candle.close)` above means the broker fills
+        # it at the close, not at that level: the trade was sized on
+        # `|result.entry - result.stop|` and bracketed around `result.entry`,
+        # then opened somewhere else entirely. On the SETUP fixture in
+        # tests/paper/test_engine.py that is a fill at 109 against a signal
+        # entry of 103, on a candle whose low is 106 -- a price this candle
+        # never traded at -- leaving 1.41% of the account at risk against a
+        # configured `risk_per_trade_pct` of 0.5%, and a position whose target
+        # of 109.6 is already all but breached at entry (nudge the candle and
+        # it opens *past* its own target, then closes immediately at a loss
+        # journaled and notified as a take-profit).
+        #
+        # A real retest order only fills once price trades through its level,
+        # and it fills *at* that level. app/backtest/engine.py already gates
+        # exactly this way, which is why backtest and paper otherwise report
+        # wildly different P&L for the same strategy over the same candles --
+        # the blueprint requires they agree. Both parts of this are no-ops for
+        # `entry.type == "market"`, where `result.entry` is `candle.close` and
+        # so always inside `[low, high]`.
+        if not candle.low <= result.entry <= candle.high:
+            return PaperTradeOutcome(signal=result)
+
         account = await self.broker.get_account()
         # `self.position_manager` is shared across every engine driving
         # this same account_id (see AutoTradeSupervisor, which runs one
@@ -365,6 +391,9 @@ class PaperTradingEngine:
             )
 
         direction = Direction.LONG if result.direction.lower() == "bullish" else Direction.SHORT
+        # Fill at the level the trade was sized and bracketed around, the same
+        # way `_maybe_exit` pins the quote to the stop/target it is closing at.
+        self.broker.set_quote(self.symbol, ltp=result.entry)
         idempotency_key = f"{self.account_id}:{self.strategy.name}:{candle.timestamp.isoformat()}"
 
         order, created = self.order_manager.create_order(

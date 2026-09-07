@@ -3934,6 +3934,74 @@ set at all, so R was `None` there regardless. Three tests now cover it: a
 trailed stop that exits at 2R, a breakeven-managed winner that must still
 count as 3R, and an unmanaged trade whose R must be unchanged.
 
+## A winning replay session wedged itself on `Infinity` (§44)
+
+`compute_statistics` returned `float("inf")` for `profit_factor` when a
+session had winners and no losers, and went out of its way to preserve it
+(`... if isinstance(profit_factor, float) and profit_factor != float("inf")
+else profit_factor`). Its sibling `app/backtest/metrics.py` has always
+returned `None` in the same situation. Replay is the one that diverged, and
+unlike the backtester its statistics get **persisted**.
+
+`sync_replay_session` writes the whole statistics dataclass into
+`ReplaySession.stats`, which is a Postgres `json` column. SQLAlchemy's JSON
+bind processor is plain `json.dumps` with `allow_nan=True`, so an infinity
+is emitted as the bare token `Infinity` -- which Postgres rejects:
+
+```
+json.dumps({"profit_factor": float("inf")})  ->  {"profit_factor": Infinity}
+SELECT CAST('{"a": Infinity}' AS json)
+  -> asyncpg.exceptions.InvalidTextRepresentationError:
+     invalid input syntax for type json.  DETAIL: Token "Infinity" is invalid.
+```
+
+So the commit raised, and `get_db` has no handler for it. Driven through
+the real API against the existing replay fixture -- buy 10 at candle 0's
+close of 100, set a target of 102, step onto candle 1 whose high is 102:
+
+```
+create: 200   buy: 200   set_target: 200   step: 500
+```
+
+One winning trade with no losing trade wedges the session. Every
+subsequent `/step` and `/order` returns 500, for exactly as long as every
+closed trade is a winner -- that is, for a user who is doing well. It
+cannot clear itself either: the only thing that would make `gross_loss > 0`
+is recording a losing trade, and `/order` 500s too. Only `POST /reset`,
+which throws the session's whole history away, gets out.
+
+There is durable damage as well. `_upsert_replay_order` sets
+`exit_price`/`pnl`/`closed_at` in the same aborted transaction, so the
+`replay_orders` row for the winning trade stays at its last committed state
+-- `closed_at IS NULL`, `pnl IS NULL` -- permanently contradicting the
+in-memory engine, which is precisely what `sync_replay_session`'s docstring
+("the persisted row never drifts from the live in-memory state") promises
+cannot happen.
+
+The fix makes replay agree with the backtester: `None` when there are no
+losses to divide by. Nothing is lost by dropping the sentinel -- pydantic's
+default `ser_json_inf_nan` already serialized it as `null` on
+`GET /replay/{id}`, so no client ever saw an infinity; it existed only long
+enough to break the write path.
+
+Neither existing persistence test could reach the state. The first buys at
+candle 0's close of 100 and closes at candle 3's close of 98 -- a loss, so
+`gross_loss > 0` and `profit_factor` is a finite 0.0 -- and its only P&L
+assertion is `balance != starting_balance`, which asserts that the balance
+moved but never which way; making that fixture profitable would have kept
+the assertion true while 500ing. The second opens and closes on the same
+candle for a P&L of exactly 0, taking the `gross_profit == 0` branch
+instead. The in-memory engine tests do build all-winner sessions and even
+call `.statistics`, but with no database and no HTTP serialization an
+infinity is an ordinary float there and nothing notices.
+
+The new `test_a_winning_only_session_still_steps_and_persists` drives a
+winner-only session through the API, asserts the step returns 200, and
+asserts the persisted row caught up: `stats["trades"] == 1`,
+`profit_factor is None`, balance above starting balance, and the
+`replay_orders` row carrying a non-null `closed_at` and a positive `pnl`.
+Pre-fix it fails with `Token "Infinity" is invalid`.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

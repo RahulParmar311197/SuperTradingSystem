@@ -190,3 +190,67 @@ async def test_user_cannot_access_another_users_replay_session(require_infra):
             assert r.status_code == 404, r.text
         finally:
             await _cleanup([owner_id, other_id], instrument.id)
+
+
+async def test_a_winning_only_session_still_steps_and_persists(require_infra):
+    # Regression test: `compute_statistics` returned `float("inf")` for
+    # `profit_factor` when a session had winners and no losers, and
+    # `sync_replay_session` writes the whole statistics dataclass into
+    # `ReplaySession.stats`, a Postgres `json` column. SQLAlchemy's JSON
+    # bind processor is `json.dumps` with allow_nan=True, which emits the
+    # bare token `Infinity`; Postgres rejects that, so the commit raised
+    # InvalidTextRepresentationError and *every* subsequent /step and
+    # /order on the session returned 500. The session was wedged for
+    # exactly as long as every closed trade was a winner -- and a losing
+    # trade could not be recorded to clear it, because /order 500s too.
+    #
+    # Neither existing test here can reach that state: the one above
+    # closes at 98 against an entry of 100 (a loss, so `gross_loss > 0`
+    # and profit_factor is finite), and its only P&L assertion is that
+    # the balance *moved*, never which way; the reset test opens and
+    # closes on the same candle for a pnl of exactly 0, taking the
+    # `gross_profit == 0` branch instead.
+    with TestClient(app) as client:
+        token, user_id = await _register(client, "replaywinner")
+        headers = {"Authorization": f"Bearer {token}"}
+        instrument = await _make_instrument()
+
+        try:
+            r = client.post("/replay", json={"instrument_id": str(instrument.id), "timeframe": "15m"}, headers=headers)
+            assert r.status_code == 200, r.text
+            session_id = uuid.UUID(r.json()["session_id"])
+
+            # Enter at candle 0's close of 100 and take profit at 102,
+            # which candle 1's high of 102 reaches -- one closed trade,
+            # a winner, and no losers at all.
+            assert client.post(
+                f"/replay/{session_id}/order", json={"action": "buy", "quantity": 10}, headers=headers
+            ).status_code == 200
+            assert client.post(
+                f"/replay/{session_id}/order", json={"action": "set_target", "price": 102}, headers=headers
+            ).status_code == 200
+
+            r = client.post(f"/replay/{session_id}/step", params={"steps": 2}, headers=headers)
+            assert r.status_code == 200, r.text  # 500 before the fix
+
+            body = r.json()
+            assert body["statistics"]["trades"] == 1
+            assert body["statistics"]["net_pnl"] > 0
+            assert body["statistics"]["win_rate"] == 1.0
+
+            async with async_session_factory() as db:
+                session_row = await db.get(ReplaySession, session_id)
+                # The aborted commit left `stats` at its last good value
+                # and the order row mid-flight; both must now reflect the
+                # closed winner.
+                assert session_row.stats["trades"] == 1
+                assert session_row.stats["profit_factor"] is None  # undefined, not infinite
+                assert float(session_row.balance) > float(session_row.starting_balance)
+
+                order_row = (
+                    await db.execute(select(ReplayOrder).where(ReplayOrder.replay_session_id == session_id))
+                ).scalar_one()
+                assert order_row.closed_at is not None
+                assert float(order_row.pnl) > 0
+        finally:
+            await _cleanup([user_id], instrument.id)

@@ -4,6 +4,7 @@ from datetime import timedelta
 import pytest
 from sqlalchemy import delete
 
+from app.backtest.engine import BacktestEngine
 from app.brokers.mock import MockBroker
 from app.database.models.instruments import Instrument, MarketType
 from app.database.session import async_session_factory
@@ -115,7 +116,10 @@ async def test_strategy_allocation_limit_blocks_a_second_position_for_the_same_s
     outcome_b = None
     for candle in make_candles(SETUP)[:9]:
         outcome_b = await engine_b.on_candle(candle)
-        if outcome_b.signal is not None and outcome_b.signal.matched:
+        # A retest signal matches on one candle and fills on a later one
+        # (the one that trades back to the level), so stop at the risk
+        # decision rather than at the match.
+        if outcome_b.risk_rejected_reason is not None or outcome_b.order_created:
             break
 
     assert outcome_b is not None
@@ -179,7 +183,7 @@ async def test_correlated_exposure_limit_blocks_a_position_in_a_correlated_instr
         async with async_session_factory() as db:
             for candle in make_candles(SETUP)[:9]:
                 outcome_b = await engine_b.on_candle(candle, db)
-                if outcome_b.signal is not None and outcome_b.signal.matched:
+                if outcome_b.risk_rejected_reason is not None or outcome_b.order_created:
                     break
 
         assert outcome_b is not None
@@ -406,7 +410,17 @@ async def test_position_is_sized_by_the_account_risk_limit_not_the_strategy_dsl(
     # balance -- the quantity itself is the thing under test, so assert on
     # that value rather than on any pass/fail flag. Must respect the 0.5%
     # account limit, not the strategy's 5.0%.
-    risk_at_stop_pct = abs(position.quantity) * abs(outcome.signal.entry - outcome.signal.stop) / balance * 100
+    #
+    # Measured from `position.average_price`, the price the broker really
+    # filled at, never from `outcome.signal.entry`. The quantity was itself
+    # sized as `risk_amount / |signal.entry - signal.stop|`, so measuring
+    # against those same two numbers just re-derives the percent that went
+    # in and holds for any fill price at all -- which is exactly how this
+    # engine came to size a trade on a retest level while filling it at the
+    # candle close, 2.8x over the configured limit, with this assertion
+    # green. `position.stop` is the signal's stop, the level the position
+    # will actually exit at.
+    risk_at_stop_pct = abs(position.quantity) * abs(position.average_price - position.stop) / balance * 100
     assert risk_at_stop_pct == pytest.approx(limits.risk_per_trade_pct, rel=1e-6)
 
 
@@ -432,7 +446,7 @@ async def test_exposure_checks_see_the_quantity_that_will_actually_be_filled():
     outcome = None
     for candle in make_candles(SETUP)[:9]:
         outcome = await engine.on_candle(candle)
-        if outcome.signal is not None and outcome.signal.matched:
+        if outcome.risk_rejected_reason is not None or outcome.order_created:
             break
 
     assert outcome is not None
@@ -440,5 +454,89 @@ async def test_exposure_checks_see_the_quantity_that_will_actually_be_filled():
     assert outcome.order_created is True
     position = engine.position_manager.get("small-acct", "SMALL")
     assert position is not None and position.is_open
-    risk_at_stop_pct = abs(position.quantity) * abs(outcome.signal.entry - outcome.signal.stop) / balance * 100
+    # Measured from the real fill price, for the reason given above.
+    risk_at_stop_pct = abs(position.quantity) * abs(position.average_price - position.stop) / balance * 100
     assert risk_at_stop_pct == pytest.approx(0.1, rel=1e-6)
+
+
+@pytest.mark.asyncio
+async def test_a_retest_entry_fills_at_its_level_not_at_the_candle_close():
+    # Regression test: `on_candle` submitted a MARKET order the moment a
+    # signal matched, and `set_quote(ltp=candle.close)` at the top of the
+    # method meant the broker filled it at the close. A `fvg_retest` entry
+    # names a *level* price has to come back to -- an unmitigated FVG is by
+    # definition one price has not traded into -- so the trade was sized on
+    # `|signal.entry - signal.stop|` and bracketed around `signal.entry`,
+    # then opened somewhere else entirely: on this fixture, filled at 109
+    # against an entry of 103, on candle 7 whose low is 106. A real retest
+    # order only fills once price trades through its level, and at that
+    # level. app/backtest/engine.py already gates exactly this way.
+    balance = 100_000
+    limits = RiskLimits(risk_per_trade_pct=0.5)
+    engine = PaperTradingEngine(
+        _strategy(), symbol="RETEST", account_id="retest-acct", starting_balance=balance, risk_limits=limits
+    )
+
+    candles = make_candles(SETUP)
+    fill_candle = None
+    outcome = None
+    for candle in candles[:9]:
+        outcome = await engine.on_candle(candle)
+        if outcome.order_created:
+            fill_candle = candle
+            break
+
+    assert outcome is not None and outcome.order_created is True
+    assert fill_candle is not None
+    signal = outcome.signal
+    position = engine.position_manager.get("retest-acct", "RETEST")
+    assert position is not None and position.is_open
+
+    # The candle that filled must be one that actually traded at the level.
+    assert fill_candle.low <= signal.entry <= fill_candle.high
+    # And the fill must be *at* the level, not at that candle's close --
+    # the two differ here (103.0 vs 104), so this is not a tautology.
+    assert position.average_price == pytest.approx(signal.entry, rel=1e-9)
+    assert position.average_price != pytest.approx(fill_candle.close, rel=1e-9)
+
+    # The bracket was computed around `signal.entry`, so a fill anywhere
+    # else silently changes what the trade risks. This is the number the
+    # user configured, measured against the price actually paid.
+    risk_at_stop_pct = abs(position.quantity) * abs(position.average_price - position.stop) / balance * 100
+    assert risk_at_stop_pct == pytest.approx(limits.risk_per_trade_pct, rel=1e-6)
+    # A long must never open at or above its own target.
+    assert position.average_price < position.target
+
+
+@pytest.mark.asyncio
+async def test_paper_trading_matches_the_backtester_on_the_same_candles():
+    # The blueprint requires backtest, replay and paper trading to share
+    # one strategy evaluation and agree. They did not: the backtester fills
+    # a retest at its level (app/backtest/engine.py) while the paper engine
+    # filled at the candle close, so the same strategy over the same
+    # candles booked +1000.00 in a backtest and +90.91 in paper -- an 11x
+    # divergence on an identical setup.
+    candles = make_candles(SETUP)
+    balance = 100_000.0
+    strategy = _strategy()
+    # Both engines size from the same percent so the comparison is of the
+    # execution path, not of two different sizing configs: the backtester
+    # has no RiskLimits and uses the DSL's own `risk_percent`.
+    limits = RiskLimits(risk_per_trade_pct=strategy.risk.risk_percent)
+
+    backtest_trades = BacktestEngine(strategy, starting_capital=balance).run(candles, symbol="PARITY")
+    assert len(backtest_trades) == 1
+
+    engine = PaperTradingEngine(
+        strategy, symbol="PARITY", account_id="parity-acct", starting_balance=balance, risk_limits=limits
+    )
+    paper_pnl = None
+    for candle in candles:
+        outcome = await engine.on_candle(candle)
+        if outcome.closed_position_pnl is not None:
+            paper_pnl = outcome.closed_position_pnl
+
+    assert paper_pnl is not None
+    # Default CostModel and MockBroker are both frictionless, so with the
+    # same entry, quantity and exit these must agree exactly.
+    assert paper_pnl == pytest.approx(backtest_trades[0].pnl, rel=1e-6)

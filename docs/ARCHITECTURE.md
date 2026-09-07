@@ -3885,6 +3885,55 @@ opens at or above its own target; the other runs `BacktestEngine` and
 asserts the realized P&L match exactly, both cost models being
 frictionless. Pre-fix they fail at `106 <= 103.0` and 181.82 vs 2000.00.
 
+## Replay "Average R" was measured against the moved stop (§43-44)
+
+Blueprint §43 makes MOVE SL a first-class replay action, and §44 asks for
+"Average R" in the statistics panel. The two did not coexist correctly.
+
+`ReplayEngine.close` computed `r_multiple` as the profit per unit divided
+by `abs(entry_price - trade.stop)`. `set_stop` (aliased as `move_stop`, and
+reachable as the `set_stop` action on `POST /replay/{id}/action`)
+overwrites `trade.stop` every time it is called, so the denominator was
+wherever the stop had been moved to by the time the trade closed -- not the
+risk the trade actually took.
+
+R is reward expressed in units of the risk accepted at entry. That number
+is fixed the moment the stop is first placed; a stop moved afterwards
+changes the trade's *outcome*, never its unit of measure. Measuring against
+the current stop makes R mean something different for every trade and
+destroys the one property that makes it worth reporting -- comparability.
+
+Entry at 100 with a stop at 90 is 10 per unit of risk. Both harms
+reproduced against the engine:
+
+```
+initial risk 10/unit                 pre-fix              true
+stop left at 90    exit 130, +30     r=3.0  avg_r=3.0     3.0   (unaffected)
+stop trailed to 120  exit 120, +20   r=1.0  avg_r=1.0     2.0
+stop at breakeven  exit 130, +30     r=None avg_r=None    3.0
+```
+
+The breakeven row is the sharper one. Moving the stop to entry is the most
+common trade-management action there is, and it leaves `stop ==
+entry_price`, which the `entry_price != stop` guard treats as "no risk to
+measure against" -- so `r_multiple` stayed `None` and the trade was dropped
+from `average_r` entirely. The statistic silently excluded exactly the
+trades the user had managed well, and reported `None` for a session made
+entirely of them.
+
+The fix adds `ReplayTrade.initial_stop`, set by `set_stop` only when it is
+still `None` and never overwritten, and computes R from that. The persisted
+`replay_orders.stop` column keeps holding the current stop, which is what
+it means; `r_multiple` is not persisted, so no migration is involved.
+
+`tests/replay/test_engine.py` never called `set_stop` twice -- no test in
+the suite moved a stop at all -- and no test asserted `r_multiple` or
+`average_r` at any point. `test_statistics_after_a_losing_and_a_winning_trade`
+checks trades, win rate, best and worst, and its winning trade has no stop
+set at all, so R was `None` there regardless. Three tests now cover it: a
+trailed stop that exits at 2R, a breakeven-managed winner that must still
+count as 3R, and an unmanaged trade whose R must be unchanged.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

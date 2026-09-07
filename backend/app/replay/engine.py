@@ -31,6 +31,12 @@ class ReplayTrade:
     opened_at: datetime
     stop: float | None = None
     target: float | None = None
+    # The stop as first placed, kept separate from `stop` because blueprint
+    # §43 makes MOVE SL a first-class action and §44 asks for "Average R".
+    # R is reward measured in units of the risk actually taken, which is
+    # fixed the moment the stop is first placed; `stop` is wherever the
+    # user has since moved it. Set once by `set_stop` and never overwritten.
+    initial_stop: float | None = None
     exit_price: float | None = None
     closed_index: int | None = None
     closed_at: datetime | None = None
@@ -90,6 +96,8 @@ class ReplayEngine:
         if self.open_trade is None:
             raise ReplayError("No open position")
         self.open_trade.stop = price
+        if self.open_trade.initial_stop is None:
+            self.open_trade.initial_stop = price
 
     def set_target(self, price: float) -> None:
         if self.open_trade is None:
@@ -110,8 +118,17 @@ class ReplayEngine:
         trade.closed_index = self.clock.cursor
         trade.closed_at = candle.timestamp
         trade.pnl = (exit_price - trade.entry_price) * trade.quantity * sign
-        if trade.stop is not None and trade.entry_price != trade.stop:
-            risk_per_unit = abs(trade.entry_price - trade.stop)
+        # Against the stop as first placed, not wherever it has since been
+        # moved to. Measuring against the current stop makes R mean
+        # something different for every trade and silently drops the most
+        # common management action of all: moving to breakeven leaves
+        # `stop == entry_price`, so the guard below skipped the trade
+        # entirely and a managed winner contributed nothing to
+        # `ReplayStatistics.average_r`. A stop trailed to 120 on a 100
+        # entry with an initial stop at 90 reported R=1.0 for an exit that
+        # really made 2R.
+        if trade.initial_stop is not None and trade.entry_price != trade.initial_stop:
+            risk_per_unit = abs(trade.entry_price - trade.initial_stop)
             trade.r_multiple = ((exit_price - trade.entry_price) * sign) / risk_per_unit
 
         self.balance += trade.pnl

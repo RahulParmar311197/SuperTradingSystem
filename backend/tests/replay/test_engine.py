@@ -89,3 +89,72 @@ def test_statistics_after_a_losing_and_a_winning_trade():
     assert stats.win_rate == 0.5
     assert stats.best_trade > 0
     assert stats.worst_trade < 0
+
+
+# Entry 100 with an initial stop at 90 is 10/unit of risk, so every exit
+# below is a fixed, independently-known multiple of R regardless of where
+# the stop is later moved to.
+MANAGED_TRADE_OHLC = [
+    (100, 100, 99, 100),
+    (100, 115, 100, 114),  # runs up; this is where the user manages the stop
+    (114, 131, 113, 130),  # target hit (and any trailed stop below 113 is not)
+]
+
+
+def test_r_multiple_is_measured_against_the_stop_as_first_placed():
+    # Regression test: `close` computed `r_multiple` from `trade.stop`,
+    # which MOVE SL (blueprint §43, exposed as the `set_stop` action on
+    # POST /replay/{id}/action) overwrites. R is reward in units of the
+    # risk actually taken, and that is fixed when the stop is first
+    # placed -- measuring against the current stop makes R mean something
+    # different for every trade and corrupts blueprint §44's "Average R".
+    engine = ReplayEngine(make_candles(MANAGED_TRADE_OHLC), starting_balance=10_000)
+    engine.buy(quantity=1)
+    engine.set_stop(90)  # risk = 10/unit
+    engine.set_target(130)
+    engine.advance(steps=1)
+    engine.move_stop(120)  # trail it up; candle 3's low of 113 takes it out
+    engine.advance(steps=1)
+
+    trade = engine.closed_trades[0]
+    assert trade.exit_price == 120
+    assert trade.pnl == pytest.approx(20.0)
+    # 20 of profit against 10 of risk taken is 2R. Against the trailed
+    # stop it read 1.0.
+    assert trade.r_multiple == pytest.approx(2.0)
+    assert engine.statistics.average_r == pytest.approx(2.0)
+
+
+def test_a_trade_managed_to_breakeven_still_counts_toward_average_r():
+    # The sharper half: moving the stop to entry is the most common
+    # management action there is, and it left `stop == entry_price`, so
+    # the `entry_price != stop` guard skipped the trade and a 3R winner
+    # contributed *nothing* to Average R -- the statistic silently
+    # excluded exactly the trades a user had managed well.
+    engine = ReplayEngine(make_candles(MANAGED_TRADE_OHLC), starting_balance=10_000)
+    engine.buy(quantity=1)
+    engine.set_stop(90)  # risk = 10/unit
+    engine.set_target(130)
+    engine.advance(steps=1)
+    engine.move_stop(100)  # breakeven
+    engine.advance(steps=1)
+
+    trade = engine.closed_trades[0]
+    assert trade.exit_price == 130
+    assert trade.pnl == pytest.approx(30.0)
+    assert trade.r_multiple == pytest.approx(3.0)
+    assert engine.statistics.average_r == pytest.approx(3.0)
+
+
+def test_r_multiple_is_unchanged_when_the_stop_is_never_moved():
+    # The unmanaged case must be untouched: with one stop ever placed,
+    # `initial_stop` and `stop` are the same number.
+    engine = ReplayEngine(make_candles(MANAGED_TRADE_OHLC), starting_balance=10_000)
+    engine.buy(quantity=1)
+    engine.set_stop(90)
+    engine.set_target(130)
+    engine.advance(steps=2)
+
+    trade = engine.closed_trades[0]
+    assert trade.exit_price == 130
+    assert trade.r_multiple == pytest.approx(3.0)

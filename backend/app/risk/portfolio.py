@@ -19,7 +19,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models.instruments import Instrument
-from app.database.models.trading import ExecutionMode, Position
+from app.database.models.trading import ExecutionMode, Position, Trade
 from app.market.repository import get_candles
 from app.risk.correlation import build_correlation_matrix, closes_by_timestamp
 from app.risk.correlation import correlated_exposure as _correlated_exposure
@@ -29,10 +29,9 @@ from app.risk.correlation import correlated_exposure as _correlated_exposure
 class PortfolioExposure:
     total_exposure: float
     exposure_by_market: dict[str, float] = field(default_factory=dict)
-    # Summed over EVERY position row for this account, open or closed.
-    # Realized P&L by definition belongs to a position that is no longer
-    # open, so anything that restricts it to open positions reports 0.0 for
-    # a fully closed one -- see the note in `compute_portfolio_exposure`.
+    # Summed over the `trades` journal for this account, not over
+    # `positions` -- see the note in `compute_portfolio_exposure` for why
+    # the position rows cannot be summed.
     total_realized_pnl: float = 0.0
 
 
@@ -41,15 +40,28 @@ async def compute_portfolio_exposure(
 ) -> PortfolioExposure:
     """Total notional and per-market-type breakdown across a user's open
     positions, read from the real `positions` table, plus realized P&L
-    across every position the account has ever held in this execution mode.
+    across every trade the account has closed in this execution mode.
 
     Exposure is an open-positions figure -- a closed position has no
     notional at risk. Realized P&L is the opposite: it only exists *because*
-    a position closed, so it is deliberately summed without the `is_open`
-    filter. `GET /portfolio` previously derived it from the in-memory
-    manager's `open_positions()`, which meant a fully closed trade reported
-    0.0 and a partially closed one reported only the part realized so far --
-    closing the rest drove the number back down to zero.
+    a position closed, so restricting it to open positions reports 0.0 for a
+    fully closed trade, which is what `GET /portfolio` used to do when it
+    derived the number from the in-memory manager's `open_positions()`.
+
+    It comes from `trades`, not from `positions`, because
+    `Position.realized_pnl` is not an increment. `PositionManager.apply_fill`
+    keeps one `PositionRecord` per (account, symbol) forever and does
+    `realized_pnl += realized` on it, so the value is a running lifetime
+    total; `app.trading.persistence.persist_position` looks up only the
+    *open* row, so re-entering an instrument inserts a new row seeded with
+    that lifetime total, and summing the rows counts every earlier round
+    trip again -- two closed round trips of +500 and +300 summed to 1300
+    instead of 800. Each `Trade` row, by contrast, carries the realized
+    delta of exactly one fill (`pnl=realized_delta` in app/api/orders.py and
+    app/api/options.py, `pnl=outcome.closed_position_pnl` in app/api/paper.py
+    and app/workers/auto_trade_worker.py), so the journal sums correctly for
+    partial closes and flips as well. It also survives an API restart, which
+    resets the in-memory counter to 0 and starts a fresh row chain.
     """
     positions = (
         await db.execute(
@@ -64,9 +76,9 @@ async def compute_portfolio_exposure(
     total_realized_pnl = float(
         (
             await db.execute(
-                select(func.coalesce(func.sum(Position.realized_pnl), 0)).where(
-                    Position.user_id == user_id,
-                    Position.execution_mode == execution_mode,
+                select(func.coalesce(func.sum(Trade.pnl), 0)).where(
+                    Trade.user_id == user_id,
+                    Trade.execution_mode == execution_mode,
                 )
             )
         ).scalar_one()

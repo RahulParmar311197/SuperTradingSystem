@@ -163,3 +163,95 @@ async def test_portfolio_reports_realized_pnl_after_a_position_closes(require_in
             assert body["total_realized_pnl"] > 0
         finally:
             await _cleanup(user_id, instrument_id)
+
+
+async def test_portfolio_realized_pnl_is_not_double_counted_across_re_entries(require_infra):
+    # Regression test: `total_realized_pnl` summed `Position.realized_pnl`
+    # over every row for the account. That column is not an increment --
+    # `PositionManager.apply_fill` keeps one `PositionRecord` per (account,
+    # symbol) forever and does `realized_pnl += realized`, so it is a
+    # lifetime running total, and `persist_position` looks up only the
+    # *open* row, so re-entering an instrument inserts a NEW row seeded
+    # with that lifetime total. Summing the rows counted every earlier
+    # round trip again: two closes worth +p1 and +p2 reported 2*p1 + p2.
+    #
+    # The single-round-trip test above cannot see this -- one instrument,
+    # one row, and `scalar_one()` structurally asserts there is only ever
+    # one -- and it compares the endpoint against that same row's value, so
+    # `SUM(realized_pnl) == row.realized_pnl` held regardless.
+    with TestClient(app) as client:
+        email = f"realized2-{uuid.uuid4().hex[:8]}@example.com"
+        r = client.post("/auth/register", json={"email": email, "password": "testpass123", "name": "Realized Twice"})
+        assert r.status_code == 201, r.text
+        token = client.post("/auth/login", json={"email": email, "password": "testpass123"}).json()["access_token"]
+        headers = {"Authorization": f"Bearer {token}"}
+
+        from app.auth.security import TokenType, decode_token
+
+        user_id = uuid.UUID(decode_token(token, TokenType.ACCESS))
+        assert client.post(
+            "/trading-permissions/grant", json={"permission": "LIVE_TRADE", "confirm": True}, headers=headers
+        ).status_code == 200
+
+        async with async_session_factory() as db:
+            instrument = Instrument(
+                symbol=f"RPNL2{uuid.uuid4().hex[:5].upper()}", exchange="NSE", market=MarketType.EQUITY, instrument_type="EQ"
+            )
+            db.add(instrument)
+            await db.commit()
+            await db.refresh(instrument)
+            instrument_id = instrument.id
+
+        async def _open_quantity() -> float:
+            # Filtered to the open row on purpose: after the second entry
+            # there are two rows for this instrument, so `scalar_one()`
+            # over all of them -- what every other position test uses --
+            # would raise here.
+            async with async_session_factory() as db:
+                row = (
+                    await db.execute(
+                        select(Position).where(Position.user_id == user_id, Position.is_open.is_(True))
+                    )
+                ).scalar_one()
+                return float(row.quantity)
+
+        try:
+            # Two full round trips on the SAME instrument. MockBroker fills
+            # at the submitted entry, and every order is server-sized from
+            # `balance * risk_per_trade_pct / abs(entry - stop)`, so an
+            # equal-width stop on the closing order closes the position
+            # fully. Expected P&L is computed from the quantity actually
+            # opened and the prices chosen here -- never from the
+            # aggregation under test.
+            # Distinct prices per round trip: POST /orders keys idempotency
+            # on `{user}:{symbol}:{direction}:{entry}:{stop}`, so re-entering
+            # at the same entry/stop is deduped into the first order and no
+            # second position is ever opened.
+            expected = 0.0
+            for entry_in, exit_out in ((100.0, 110.0), (102.0, 108.0)):
+                assert client.post(
+                    "/orders",
+                    json={"symbol": instrument.symbol, "direction": "LONG", "entry": entry_in, "stop": entry_in - 5},
+                    headers=headers,
+                ).status_code == 201
+                quantity = await _open_quantity()
+                assert client.post(
+                    "/orders",
+                    json={"symbol": instrument.symbol, "direction": "SHORT", "entry": exit_out, "stop": exit_out + 5},
+                    headers=headers,
+                ).status_code == 201
+                expected += quantity * (exit_out - entry_in)
+
+            async with async_session_factory() as db:
+                rows = (await db.execute(select(Position).where(Position.user_id == user_id))).scalars().all()
+            assert len(rows) == 2, "re-entering an instrument should leave a closed row plus the re-opened one"
+            assert all(row.is_open is False for row in rows)
+            # Each row carries the account's lifetime total at the moment it
+            # was written, so they overlap -- summing them is exactly the bug.
+            assert sum(float(row.realized_pnl) for row in rows) > expected
+
+            body = client.get("/portfolio", headers=headers).json()
+            assert body["open_position_count"] == 0
+            assert body["total_realized_pnl"] == pytest.approx(expected, rel=1e-6)
+        finally:
+            await _cleanup(user_id, instrument_id)

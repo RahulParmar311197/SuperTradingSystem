@@ -3736,6 +3736,72 @@ prices deliberately: `POST /orders` keys idempotency on
 entry and stop is deduped into the first order and no second position is
 opened at all.
 
+## The options exposure gate was defeated by a net debit (§38-40)
+
+`evaluate_options_risk` sizes a whole multi-leg combination by one number,
+`risk_amount`, and feeds it to `exposure_limit`. When the payoff curve
+bounds the downside it uses `abs(max_loss)`, which is right. When
+`max_loss is None` -- the curve is still falling at a sampled edge, so the
+loss is unbounded -- it used `PayoffResult.capital_requirement`, on the
+stated assumption that this was "already its best estimate of worst-case
+loss for an unbounded-risk combination".
+
+It is not. `compute_payoff_summary` computes it as
+`max(premium, 0.0) or abs(min(payoffs))`: for a net **debit** that is the
+debit paid, and only for a net **credit** does it fall through to the worst
+sampled loss. So the exposure check on an unbounded-risk position entered
+for a debit was sized by its entry cost.
+
+A long 25000 put plus a short 26000 call at lot size 50 is a synthetic
+short: unlimited loss above 26000. Entered against a 100,000 balance with
+the default `max_exposure_pct` of 100%:
+
+| one leg's premium | net entry | `max_loss` | sized as | payoff at 39000 | decision |
+|---|---|---|---|---|---|
+| call at 30 | 1,000 debit | `None` | **1,000** | -651,000 | **APPROVE** at 1.00% |
+| call at 60 | 500 credit | `None` | 649,500 | -649,500 | REJECT at 649.50% |
+
+Raising one leg's premium by 10 rupees does not change the risk shape at
+all, and flipped the account from "649% of equity at risk, blocked" to "1%
+at risk, approved". A 1x2 front ratio call spread behaves the same way.
+`POST /options/execute` builds its legs directly from the client payload
+rather than through `build_strategy` -- deliberately, so arbitrary
+combinations are supported -- so any account with `LIVE_TRADE` can reach
+this shape, and both approved legs then go through the normal broker and
+persistence pipeline with no further size gate.
+
+The fix adds `PayoffResult.worst_sampled_loss`, set from the
+`max_loss_sample` the function already computes, and reads it in
+`evaluate_options_risk` as `max(-worst_sampled_loss, capital_requirement)`
+when `max_loss is None`. The floor at `capital_requirement` keeps the
+degenerate case -- a curve above zero everywhere in the sample but sloping
+down at an edge -- from reporting zero risk for an unbounded position.
+
+`capital_requirement` is deliberately left alone. It is returned by
+`POST /options/payoff` and `POST /options/execute` as the capital needed to
+enter, and for a debit strategy that really is the debit; overwriting it
+with a worst-case-loss figure would fix the gate by making a user-facing
+number wrong. A separate field also removes the overloading that caused
+this in the first place -- the reader now names exactly what it needs.
+
+The suite had a test called
+`test_unbounded_risk_strategy_uses_capital_requirement_not_zero`, which
+sounds like coverage of exactly this branch and is not: its fixture is a
+long call, whose *profit* is unbounded while its loss is bounded at the
+premium paid, so `max_loss is not None` and the branch never runs. Its own
+docstring says so. `capital_requirement` appears nowhere in the test suite
+except in that test's name, and no options fixture in the repo
+(`long_call`, `bull_call_spread`, `bear_call_spread`, `iron_condor`) has an
+unbounded loss, so the `max_loss is None` path had no coverage at all.
+
+Three tests now cover it: the debit synthetic short must be rejected and
+its projected exposure must read above 500%, not 1%; the debit and credit
+variants of the same position must produce exposures within 2 percentage
+points of each other (they differ by the premium, 1.5 points, rather than
+by the ~648 points the old sizing produced); and a bounded spread must
+still be sized by its real `max_loss`, pinned at exactly 3.5%. The first
+two fail against the pre-fix code with APPROVE where REJECT is required.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

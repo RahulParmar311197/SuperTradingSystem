@@ -295,9 +295,36 @@ class PaperTradingEngine:
             if db is not None
             else 0.0
         )
+        # Blueprint §57: `RiskLimits.risk_per_trade_pct` is the *account*
+        # cap on how much of the balance one trade may risk;
+        # `StrategyDefinition.risk.risk_percent` is what this strategy
+        # asks for. Size by the smaller of the two and hand that exact
+        # quantity to the RiskEngine as `proposed_quantity`, so the
+        # notional every exposure check is computed from is the notional
+        # actually filled below. `RiskEngine.evaluate` sizes the proposal
+        # from `limits.risk_per_trade_pct` itself when `proposed_quantity`
+        # is None, so approving against that and then filling
+        # `self.strategy.risk.risk_percent` traded a position the risk
+        # engine never saw -- the 0.5% default against a DSL carrying
+        # `risk_percent: 5.0` filled 10x the approved quantity, 165%
+        # account exposure through a `max_exposure_pct` of 50% that had
+        # checked the 15% version -- and, the other way round, a strategy
+        # risking less than the cap had every check computed against a
+        # bigger position than it would take. The live path
+        # (app/api/orders.py) has no such split; the backtester
+        # (app/backtest/engine.py) has no `RiskLimits` at all, so the
+        # strategy's own percent is the only authority there.
+        quantity = calculate_position_size(
+            account.balance,
+            min(self.strategy.risk.risk_percent, self.risk_engine.limits.risk_per_trade_pct),
+            result.entry,
+            result.stop,
+            self.risk_engine.limits.max_position_size,
+        )
         proposal = TradeRiskProposal(
             account_id=self.account_id,
             strategy_id=self.strategy_id,
+            proposed_quantity=quantity,
             entry=result.entry,
             stop=result.stop,
             account_balance=account.balance,
@@ -337,9 +364,6 @@ class PaperTradingEngine:
                 signal=result, risk_rejected_reason=decision.reason, risk_failed_check=failed_check, risk_checks=risk_checks
             )
 
-        quantity = calculate_position_size(
-            account.balance, self.strategy.risk.risk_percent, result.entry, result.stop, self.risk_engine.limits.max_position_size
-        )
         direction = Direction.LONG if result.direction.lower() == "bullish" else Direction.SHORT
         idempotency_key = f"{self.account_id}:{self.strategy.name}:{candle.timestamp.isoformat()}"
 

@@ -27,6 +27,14 @@ class PayoffResult:
     breakevens: list[float]
     net_premium: float  # positive = net debit paid, negative = net credit received
     capital_requirement: float
+    # The worst P&L actually seen anywhere in the sampled price range,
+    # always a real number (negative for a loss) even when `max_loss` is
+    # None because the curve is still falling at a sampled edge. `max_loss`
+    # says *whether* the loss is bounded; this says how bad it already gets
+    # inside the window we looked at, which is the only concrete figure
+    # available to size an unbounded-risk combination -- see
+    # app.risk.options_risk.evaluate_options_risk.
+    worst_sampled_loss: float = 0.0
 
 
 def _leg_intrinsic_value(leg: OptionLeg, underlying_price: float) -> float:
@@ -106,4 +114,5 @@ def compute_payoff_summary(
         breakevens=breakevens,
         net_premium=premium,
         capital_requirement=capital_requirement,
+        worst_sampled_loss=max_loss_sample,
     )

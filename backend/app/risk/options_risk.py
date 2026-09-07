@@ -66,11 +66,29 @@ def evaluate_options_risk(
         return RiskDecisionResult(RiskDecision.REJECT, checks, kill_reason)
 
     # Worst-case loss for this strategy: the defined max_loss when the
-    # payoff curve bounds it, otherwise compute_payoff_summary's own
-    # capital_requirement (already its best estimate of worst-case loss
-    # for an unbounded-risk combination — never treat "unbounded" as
-    # "zero risk").
-    risk_amount = abs(proposal.payoff.max_loss) if proposal.payoff.max_loss is not None else proposal.payoff.capital_requirement
+    # payoff curve bounds it; otherwise the worst P&L the payoff engine
+    # actually sampled, floored at the capital committed — never treat
+    # "unbounded" as "zero risk".
+    #
+    # This used to read `capital_requirement`, which does not mean what
+    # this check needs. `compute_payoff_summary` sets it to the net debit
+    # whenever the strategy is one (`max(premium, 0.0) or abs(min(payoffs))`
+    # in app/options/payoff.py), falling through to the worst sampled loss
+    # only for a net *credit*. So an unbounded-risk combination entered for
+    # a debit was sized by its entry cost: a long 25000 put plus a short
+    # 26000 call at lot size 50 is a synthetic short with unlimited loss
+    # above 26000, and a 1,000 debit made it "1.00% of a 100,000 account"
+    # against a curve already 651,000 underwater at the edge of the sampled
+    # range. Raising one leg's premium by 10 turned the same position into a
+    # 500 credit and the check into "649.50%" -- a rejection. Identical
+    # risk, opposite decision, decided by which side of zero the premium
+    # happened to land on.
+    payoff = proposal.payoff
+    risk_amount = (
+        abs(payoff.max_loss)
+        if payoff.max_loss is not None
+        else max(-payoff.worst_sampled_loss, payoff.capital_requirement)
+    )
 
     projected_exposure_pct = (
         (proposal.current_exposure + risk_amount) / proposal.account_balance * 100 if proposal.account_balance else 100.0

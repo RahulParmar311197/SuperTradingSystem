@@ -3588,6 +3588,72 @@ at version 3 (and explicitly *not* against `NEVER-MATCH`), and asserts
 `opened_at < closed_at`. Verified to fail against the pre-fix code on the
 strategy id.
 
+## Paper/auto-trade position sizing ignored the account risk limit (§57)
+
+`PaperTradingEngine.on_candle` — the engine behind both `POST
+/paper/{session}/candle` and every autonomous trade `AutoTradeSupervisor`
+places — built its `TradeRiskProposal` without a `proposed_quantity`.
+`RiskEngine.evaluate` sizes the proposal itself in that case, from
+`RiskLimits.risk_per_trade_pct`, and every downstream check
+(`exposure_limit`, `strategy_allocation_limit`, `correlated_exposure_limit`)
+is computed from `quantity * entry`. The engine then turned around and
+sized the order it actually submitted from a *different* number: the
+strategy DSL's own `StrategyDefinition.risk.risk_percent`.
+
+The two never had to agree, and by default they don't. `RiskLimits.
+risk_per_trade_pct` defaults to 0.5% and is what `POST
+/auto-trading/enable` writes per account; `RiskConfig.risk_percent`
+defaults to 0.5 but is validated only as `gt=0, le=100`, so any strategy —
+including one the AI strategy builder proposes — may carry a much larger
+number. Reproduced directly against the engine with a 100,000 balance, the
+0.5% account limit, and a strategy asking for 5.0%:
+
+```
+RiskEngine approved qty : 151.5152  notional 15606.06
+actually filled qty     : 1515.1515  notional 165151.52
+ratio                   : 10.00
+risk at stop (approved) : 0.500% of balance
+risk at stop (filled)   : 5.000% of balance
+exposure after fill     : 165.15% vs max_exposure_pct 50.0%
+```
+
+Ten times the approved quantity, ten times the risk per trade the user
+configured, and 165% account exposure through a `max_exposure_pct` of 50%
+that had been checked against the 15.6% version. The account-level limit
+was not merely loose here — it was inert, on the one path that runs
+unattended.
+
+The same split does harm in the other direction. A strategy deliberately
+risking *less* than the account cap had every exposure check computed
+against a position several times larger than the one it would take, so
+trades sitting comfortably inside the user's configured limits were
+rejected.
+
+The fix sizes the trade once, before the proposal, from `min(strategy
+risk_percent, limits.risk_per_trade_pct)` — the account value is a cap, so
+it bounds the strategy's request rather than replacing it — and passes that
+exact quantity as `TradeRiskProposal.proposed_quantity`. The field already
+existed for precisely this ("if None, engine sizes the position"); it was
+simply never used by this engine. The notional every check is computed from
+is now the notional that gets filled. The live path (`app/api/orders.py`)
+never had the split — it sizes from `limits.risk_per_trade_pct` on both
+sides — and `app/backtest/engine.py` is deliberately left alone: it has no
+`RiskLimits` at all, so the strategy's own percent is the only authority
+there and the two sides cannot disagree.
+
+Worth recording honestly: this split was noticed during the earlier
+`strategy_allocation` work, written off as a quirk, and a test threshold
+was calibrated around the inflated quantity it produces
+(`first_notional_pct * 0.5` in `tests/paper/test_engine.py`) rather than
+recognised as the bug it is. Those allocation tests derive their limits
+from the position actually opened, so they self-calibrate and stayed green
+either way — which is exactly why they never caught this. The two new
+tests assert the sized *value*: one pins risk-at-stop to
+`limits.risk_per_trade_pct` (5.0% vs 0.5% pre-fix, a clean 10x), the other
+sets `max_exposure_pct` between the real and the over-estimated notional
+and asserts the trade is approved (pre-fix: "Projected exposure 15.61% vs
+limit 3.5%"). Both verified to fail against the pre-fix engine.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

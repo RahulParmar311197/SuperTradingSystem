@@ -372,3 +372,73 @@ async def test_paper_engine_respects_strategy_level_kill_switch(require_infra):
         assert opened is True, "a kill on one strategy must not stop a different strategy"
     finally:
         await clear_strategy_kill(strategy_id)
+
+
+@pytest.mark.asyncio
+async def test_position_is_sized_by_the_account_risk_limit_not_the_strategy_dsl():
+    # Regression test: `on_candle` built its TradeRiskProposal without a
+    # `proposed_quantity`, so `RiskEngine.evaluate` sized (and approved)
+    # the trade from `RiskLimits.risk_per_trade_pct` -- then the engine
+    # turned around and filled a quantity sized from the strategy DSL's
+    # own `risk.risk_percent` instead. The two disagreed silently: the
+    # 0.5% default limit against a strategy carrying `risk_percent: 5.0`
+    # filled 10x the approved quantity, putting 5% of the balance at risk
+    # on a trade the risk engine had approved as risking 0.5%.
+    balance = 100_000
+    strategy = _strategy()
+    strategy.risk.risk_percent = 5.0  # 10x the account limit below
+    limits = RiskLimits(risk_per_trade_pct=0.5)
+    engine = PaperTradingEngine(
+        strategy, symbol="SIZED", account_id="sized-acct", starting_balance=balance, risk_limits=limits
+    )
+
+    outcome = None
+    for candle in make_candles(SETUP)[:9]:  # stops before target -- leaves the position open
+        outcome = await engine.on_candle(candle)
+        if outcome.order_created:
+            break
+
+    assert outcome is not None and outcome.order_created is True
+    position = engine.position_manager.get("sized-acct", "SIZED")
+    assert position is not None and position.is_open
+
+    # What the trade actually risks if its stop is hit, as a share of the
+    # balance -- the quantity itself is the thing under test, so assert on
+    # that value rather than on any pass/fail flag. Must respect the 0.5%
+    # account limit, not the strategy's 5.0%.
+    risk_at_stop_pct = abs(position.quantity) * abs(outcome.signal.entry - outcome.signal.stop) / balance * 100
+    assert risk_at_stop_pct == pytest.approx(limits.risk_per_trade_pct, rel=1e-6)
+
+
+@pytest.mark.asyncio
+async def test_exposure_checks_see_the_quantity_that_will_actually_be_filled():
+    # The other half of the same contract: a strategy risking *less* than
+    # the account cap. `RiskEngine.evaluate` sized the proposal from
+    # `risk_per_trade_pct` whenever `proposed_quantity` was None, so every
+    # exposure check ran against a position five times larger than the one
+    # this engine would actually take -- rejecting trades that sit
+    # comfortably inside the user's configured limits.
+    balance = 100_000
+    strategy = _strategy()
+    strategy.risk.risk_percent = 0.1  # a fifth of the account limit below
+    # 3.5% leaves room for the real 0.1%-sized notional (~3.1% of balance
+    # at these prices) but not for the 0.5%-sized one the engine used to
+    # evaluate (~15.6%).
+    limits = RiskLimits(risk_per_trade_pct=0.5, max_exposure_pct=3.5)
+    engine = PaperTradingEngine(
+        strategy, symbol="SMALL", account_id="small-acct", starting_balance=balance, risk_limits=limits
+    )
+
+    outcome = None
+    for candle in make_candles(SETUP)[:9]:
+        outcome = await engine.on_candle(candle)
+        if outcome.signal is not None and outcome.signal.matched:
+            break
+
+    assert outcome is not None
+    assert outcome.risk_rejected_reason is None
+    assert outcome.order_created is True
+    position = engine.position_manager.get("small-acct", "SMALL")
+    assert position is not None and position.is_open
+    risk_at_stop_pct = abs(position.quantity) * abs(outcome.signal.entry - outcome.signal.stop) / balance * 100
+    assert risk_at_stop_pct == pytest.approx(0.1, rel=1e-6)

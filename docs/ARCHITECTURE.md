@@ -4198,6 +4198,84 @@ fresh entry. None placed a closing order while a limit was tripped -- the
 same fixture-cannot-reach-the-breaking-state gap that hid this on the
 equities path.
 
+## An unvalidated `direction` traded declared longs as shorts (§33-34)
+
+`StrategyDefinition.direction` and `Condition.direction` were bare `str`
+fields with the vocabulary only in a comment (`"bullish" | "bearish"`).
+Every consumer reads them as a bare equality test with an implicit bearish
+`else`:
+
+```
+app/strategy/engine.py   is_bullish = direction.lower() == "bullish"
+app/paper/engine.py      Direction.LONG if result.direction.lower() == "bullish" else Direction.SHORT
+app/backtest/engine.py   is_long = result.direction.lower() == "bullish"
+```
+
+So **every** value that is not literally `"bullish"` silently meant
+*bearish* -- including `"long"`, a typo, and the empty string. Verified
+against the engine on a 90-120 dealing range with price at 100:
+
+```
+'bullish'  matched=True dir='bullish' entry=100 stop=90.0  target=120.0
+'LONG'     matched=True dir='LONG'    entry=100 stop=120.0 target=60.0
+'long'     matched=True dir='long'    entry=100 stop=120.0 target=60.0
+'bearish'  matched=True dir='bearish' entry=100 stop=120.0 target=60.0
+```
+
+A strategy the user named and declared long evaluates with the stop above
+entry and the target below, and the paper and autonomous engines open a
+short from it.
+
+`"LONG"` is not a far-fetched typo. This platform's own order endpoints
+take the **identically-named** `direction` key with the *other* vocabulary
+and enum-validate it (`Direction` LONG/SHORT in `app/api/orders.py` and
+`app/api/options.py`), so `POST /orders` refuses `"bullish"` while
+`POST /strategies` accepted `"LONG"` and traded it short. Two vocabularies,
+one key name, one of them unchecked.
+
+Exactly one of the four consumers noticed the boundary existed:
+`app/workers/scanner_worker.py` keeps a `_BIAS_TO_TRADE_DIRECTION` map and
+logs "Unrecognized strategy direction" rather than writing a `Signal`. Its
+three siblings coerce to short. The sibling-divergence pattern again, and
+`app/strategy/dsl.py` already had the right precedent in
+`_reject_unimplemented_boolean_operators` -- a `field_validator` on
+`Condition.operator`, added for this same bug class. The neighbouring
+field was left open, and this failure mode is the worse of the two: that
+one made a strategy never fire; this one makes it fire inverted.
+
+The fix adds a `field_validator` on `direction` for both models, rejecting
+anything outside the bias vocabulary and normalizing case and whitespace,
+so `POST /strategies`, `PUT /strategies/{id}` and
+`app.ai.strategy_builder.parse_strategy_json` all fail with a 422 naming
+both vocabularies. `None` still means "either -- take the SMC bias".
+
+`Condition.side` and `Condition.zone` are the same shape of unvalidated
+free text and are deliberately **not** included: an unrecognised value
+there never satisfies its condition (`app/strategy/evaluator.py`), so they
+fail closed into no trade rather than an inverted one. Worth tightening
+some day; not the same defect.
+
+**Live**, on the paper, auto-trade, backtest and `POST /scanner` paths --
+any authenticated user can create such a strategy today with no error
+anywhere. No real-money impact yet, because autonomous trading drives
+`MockBroker` and `POST /orders` does not consume the strategy DSL; the
+damage today is inverted simulated positions, inverted journaled `trades`
+rows, and inverted backtest results used to decide whether to promote a
+strategy to auto-trading. It becomes a real-money defect the moment a live
+broker is wired into the autonomous path.
+
+Coverage: `tests/strategy/test_dsl.py` existed solely for this bug class
+and never touched `direction`. Every strategy fixture in the suite --
+`tests/strategy/test_engine.py`, `tests/paper/test_engine.py`,
+`tests/backtest/test_engine.py`, and the backtest/AI API tests -- pins
+`"bullish"`, so the bearish branch had no coverage at all and
+`test_market_entry_inside_the_dealing_range_still_emits_a_valid_long`
+asserts exactly the invariant that breaks (`stop < entry < target`) from a
+fixture that can never reach the failing state. Three parametrized DSL
+tests now reject nine bad values across both models and pin the
+normalization, and a new engine test pins the polarity of both biases as
+mirror images -- the fork the bug routed into, which nothing had asserted.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

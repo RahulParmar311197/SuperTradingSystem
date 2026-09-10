@@ -37,6 +37,46 @@ class ConditionOperator(StrEnum):
     WITHIN = "WITHIN"
 
 
+_BIAS_VALUES = ("bullish", "bearish")
+
+
+def _validate_bias(value: str | None) -> str | None:
+    """Rejects anything that is not the SMC bias vocabulary.
+
+    `direction` was a bare `str` read as `direction.lower() == "bullish"`
+    (app/strategy/engine.py, app/paper/engine.py, app/backtest/engine.py),
+    so every other value -- including `""` -- silently meant *bearish*.
+    That is not a hypothetical typo: this platform's own order endpoints
+    take the identically-named `direction` key with the *other* vocabulary
+    and enum-validate it (`Direction` LONG/SHORT in app/api/orders.py and
+    app/api/options.py), so `POST /orders` refuses "bullish" while
+    `POST /strategies` accepted "LONG" and traded it short. A strategy
+    declared long, on a 90-120 dealing range with price at 100, evaluated
+    to `entry=100 stop=120 target=60` -- stop above entry, target below --
+    and the paper and autonomous engines opened a short from it.
+
+    `app.workers.scanner_worker` already refuses to write a `Signal` for a
+    direction outside this vocabulary; it was the only one of the four
+    consumers that noticed the boundary existed. Rejecting at the DSL
+    boundary means `POST /strategies`, `PUT /strategies/{id}` and
+    `app.ai.strategy_builder.parse_strategy_json` all fail loudly instead.
+
+    `Condition.side` and `Condition.zone` are the same shape of free text
+    but fail *closed* -- an unrecognised value simply never satisfies its
+    condition (app/strategy/evaluator.py), producing no trade rather than
+    an inverted one -- so they are deliberately left alone here.
+    """
+    if value is None:
+        return value
+    normalized = value.strip().lower()
+    if normalized not in _BIAS_VALUES:
+        raise ValueError(
+            f"direction={value!r} is not a valid bias. Use 'bullish' or 'bearish' -- this is the "
+            "SMC bias vocabulary, not the LONG/SHORT order direction used by POST /orders."
+        )
+    return normalized
+
+
 class Condition(BaseModel):
     """A single leaf condition. `type` selects which evaluator handles it;
     the remaining fields are interpreted by that evaluator (see
@@ -52,6 +92,11 @@ class Condition(BaseModel):
     min_value: float | None = None
     max_value: float | None = None
     lookback: int = 5  # how many recent candles/events count as "recent" for event-type conditions
+
+    @field_validator("direction")
+    @classmethod
+    def _validate_direction(cls, v: str | None) -> str | None:
+        return _validate_bias(v)
 
     @field_validator("operator")
     @classmethod
@@ -102,3 +147,8 @@ class StrategyDefinition(BaseModel):
     entry: EntryConfig = Field(default_factory=EntryConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
     score_weights: dict[str, float] | None = None
+
+    @field_validator("direction")
+    @classmethod
+    def _validate_direction(cls, v: str | None) -> str | None:
+        return _validate_bias(v)

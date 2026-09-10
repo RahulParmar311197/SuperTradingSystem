@@ -4002,6 +4002,63 @@ asserts the persisted row caught up: `stats["trades"] == 1`,
 `replay_orders` row carrying a non-null `closed_at` and a positive `pnl`.
 Pre-fix it fails with `Token "Infinity" is invalid`.
 
+## Weekly candles opened on Thursday (§14, §16)
+
+`bucket_start` derived every timeframe boundary from the Unix epoch:
+`minutes_since_epoch // target_minutes`. That is right for every bucket
+that divides a day evenly -- the epoch boundary and the midnight-UTC
+boundary coincide -- and wrong for the one that does not. 1970-01-01 was a
+**Thursday**, so a `1W` bucket ran Thursday to Wednesday:
+
+```
+2026-01-05 (Mon) -> weekly bucket 2026-01-01 (Thu)
+2026-01-07 (Wed) -> weekly bucket 2026-01-01 (Thu)
+2026-01-08 (Thu) -> weekly bucket 2026-01-08 (Thu)
+```
+
+A weekly candle built on that grid opens with Thursday's open, closes with
+the following Wednesday's close, and carries the weekend in its middle
+rather than at its edge. `1W` is in `SUPPORTED_TIMEFRAMES` (blueprint §16),
+and a weekly open/close is exactly the sort of level SMC and ICT
+methodology reads bias from, so the bar is not merely shifted -- it is
+about a different week than the one anyone reading it means.
+
+The codebase already disagreed with itself about this.
+`app.smc.liquidity.detect_session_levels` buckets previous-week highs and
+lows by `isocalendar()`, and `RiskWindow.roll` resets `weekly_pnl` on an
+ISO week boundary. Both start Monday. Only the candle grid started
+Thursday, so a weekly candle and the weekly liquidity levels drawn on it
+could belong to different weeks.
+
+The fix anchors weekly buckets on Monday and leaves sub-weekly buckets on
+their (correct) epoch arithmetic. `CandleWorker._completes_bucket` was
+re-deriving the same grid independently with its own epoch modulo, so it
+is now expressed in terms of `bucket_start` -- a base candle completes its
+bucket exactly when the next one falls into a different bucket. That holds
+for any anchoring and removes the possibility of the two drifting apart
+again.
+
+**Honest scope:** this is a latent defect, not a live incident.
+`resample_candles` has no production caller today (it is exported from
+`app.market` and used only by tests), and `CandleWorker.derived_timeframes`
+defaults to `[]`, so nothing currently derives a weekly candle. It becomes
+a wrong number the moment anyone configures the worker with `1W` or calls
+the exported helper -- both ordinary uses of shipped, blueprint-listed
+API. It is recorded here as a correctness fix with an unambiguous right
+answer, not as something that was silently corrupting data in production.
+
+`tests/market/test_aggregation.py` covered only 1m -> 5m resampling and a
+downsampling rejection; no test exercised daily or weekly bucketing at
+all, which is why an entire timeframe could be wrong without a failure.
+Three tests now cover it: every instant Monday through Sunday maps to that
+Monday (and Thursday no longer opens a bucket); two timestamps share a
+weekly bucket exactly when they share an ISO week, checked across a
+30-day span that crosses a year boundary; and a Monday-to-Friday run of
+daily candles resamples into exactly one weekly bar opening on the Monday
+with Monday's open and Friday's close. Pre-fix the first maps Monday to
+2026-01-01, the second disagrees on the Sunday/Monday pair, and the third
+produces two bars instead of one.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

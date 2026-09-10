@@ -8,7 +8,32 @@ from app.market.timeframes import is_valid_upsample, timeframe_to_minutes
 from app.smc.types import Candle
 
 
+_WEEK_MINUTES = 10080
+
+
 def bucket_start(timestamp: datetime, target_minutes: int) -> datetime:
+    """The start of the `target_minutes` bucket containing `timestamp`.
+
+    Weekly buckets are anchored on Monday, not on the Unix epoch. Epoch
+    arithmetic (`minutes_since_epoch // 10080`) puts the boundary wherever
+    1970-01-01 fell, and that was a **Thursday** -- so a "1W" candle ran
+    Thursday to Wednesday, opening mid-week and straddling the weekend in
+    its middle rather than at its edge. Every other week boundary in this
+    codebase is an ISO week (Monday): `app.smc.liquidity.detect_session_levels`
+    buckets previous-week highs and lows by `isocalendar()`, and
+    `RiskWindow.roll` resets `weekly_pnl` the same way. A weekly candle
+    whose open is Thursday's open disagrees with both, and with what a
+    weekly bar means to anyone reading it.
+
+    Sub-weekly buckets keep epoch anchoring, which is correct for them:
+    every one of them divides a day evenly, so the epoch boundary and the
+    midnight-UTC boundary coincide.
+    """
+    if target_minutes == _WEEK_MINUTES:
+        return (timestamp - timedelta(days=timestamp.weekday())).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+
     epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
     minutes_since_epoch = int((timestamp - epoch).total_seconds() // 60)
     bucket_index = minutes_since_epoch // target_minutes

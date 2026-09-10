@@ -40,9 +40,14 @@ class _FormingCandle:
 def _completes_bucket(candle_start: datetime, base_minutes: int, target_minutes: int) -> bool:
     """True when the base-timeframe candle starting at `candle_start` is the
     last one inside its enclosing target-timeframe bucket."""
+    # Expressed in terms of `bucket_start` rather than re-deriving the grid
+    # from the epoch, so the two can never disagree about where a bucket
+    # begins: this candle completes its bucket exactly when the next base
+    # candle falls into a different one. Independent epoch arithmetic here
+    # silently assumed every boundary is epoch-aligned, which weekly
+    # buckets are not (see app.market.aggregation.bucket_start).
     next_start = candle_start + timedelta(minutes=base_minutes)
-    minutes_since_epoch = int((next_start - _EPOCH).total_seconds() // 60)
-    return minutes_since_epoch % target_minutes == 0
+    return compute_bucket_start(next_start, target_minutes) != compute_bucket_start(candle_start, target_minutes)
 
 
 class CandleWorker:

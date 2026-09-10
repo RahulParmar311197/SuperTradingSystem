@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from app.strategy.dsl import Condition, ConditionOperator, ConditionType, StrategyDefinition
+from app.strategy.dsl import Condition, ConditionOperator, ConditionType, EntryConfig, StrategyDefinition
 
 
 @pytest.mark.parametrize("operator", [ConditionOperator.AND, ConditionOperator.OR, ConditionOperator.NOT])
@@ -62,3 +62,52 @@ def test_valid_bias_directions_are_accepted_and_normalized(supplied, expected):
     # value and `None` still means "either direction, take the SMC bias".
     assert StrategyDefinition(name="S", market="X", timeframe="15m", direction=supplied).direction == expected
     assert Condition(type=ConditionType.FVG, direction=supplied).direction == expected
+
+
+@pytest.mark.parametrize(
+    "entry_type", ["limit", "fvg-retest", "retest", "fvg_retest_entry", "market_order", "", "  "]
+)
+def test_entry_config_rejects_entry_types_the_engine_cannot_resolve(entry_type):
+    # Regression test: `EntryConfig.type` was a bare `str` and
+    # `app/strategy/engine.py`'s `_resolve_entry_and_stop` read it as a
+    # chain of bare equality tests with an implicit `else` -- anything
+    # that was not exactly "fvg_retest" or "order_block_retest" fell
+    # through to a *market* entry at `context.current_price`, stopped at
+    # the dealing-range edge. That is a different trade, not a near miss:
+    # on the same candles a 'fvg_retest' strategy waits for price to come
+    # back to the gap, while its silent market substitute chases the top
+    # of the move with a stop 2.5x further away, and fills on a candle
+    # where the strategy as written would not have traded at all.
+    #
+    # This is a live path: POST /strategies, PUT /strategies/{id} and
+    # app.ai.strategy_builder.parse_strategy_json all validate through
+    # this model, and the AI is explicitly told it may use "entry types
+    # the schema defines" -- which, until now, the schema did not define.
+    with pytest.raises(ValidationError):
+        EntryConfig(type=entry_type)
+    with pytest.raises(ValidationError):
+        StrategyDefinition(name="S", market="X", timeframe="15m", entry={"type": entry_type})
+
+
+@pytest.mark.parametrize(
+    ("supplied", "expected"),
+    [
+        ("market", "market"),
+        ("fvg_retest", "fvg_retest"),
+        ("order_block_retest", "order_block_retest"),
+        ("FVG_RETEST", "fvg_retest"),
+        (" Order_Block_Retest ", "order_block_retest"),
+    ],
+)
+def test_valid_entry_types_are_accepted_and_normalized(supplied, expected):
+    # Case and surrounding whitespace are normalized rather than rejected,
+    # matching `_validate_bias`, so `_resolve_entry_and_stop`'s
+    # `entry_type == "fvg_retest"` reads a canonical value instead of
+    # silently falling through to a market entry.
+    assert EntryConfig(type=supplied).type == expected
+    assert StrategyDefinition(name="S", market="X", timeframe="15m", entry={"type": supplied}).entry.type == expected
+
+
+def test_the_default_entry_type_is_still_a_market_entry():
+    assert EntryConfig().type == "market"
+    assert StrategyDefinition(name="S", market="X", timeframe="15m").entry.type == "market"

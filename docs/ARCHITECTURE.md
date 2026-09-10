@@ -4341,6 +4341,92 @@ MARKET with no quote and no price rejected), plus two API tests: the
 three unpriced order types must 422 and leave no `orders` or `positions`
 rows behind, and a LIMIT *with* a price must fill at that price.
 
+## Entry types outside the DSL's vocabulary (§33-34)
+
+`EntryConfig.type` was a bare `str` defaulting to `"market"`, and
+`app/strategy/engine.py`'s `_resolve_entry_and_stop` read it as a chain of
+bare equality tests with an implicit `else`: `== "fvg_retest"`, then
+`== "order_block_retest"`, then fall through to a market entry at
+`context.current_price` with the stop at the dealing-range edge. Every
+value that was not *exactly* one of those two strings took the fallback
+silently.
+
+That is not a near miss, it is a different trade. On one set of candles
+carrying an unfilled bullish FVG at 99-103, a confirmed swing low at 96
+and a swing high at 111, with price at 105:
+
+```
+entry.type='fvg_retest'   entry=102.75  stop=99.17  target=109.90   stop 3.48% away
+entry.type='FVG_RETEST'   entry=105.00  stop=96.00  target=123.00   stop 8.57% away
+```
+
+One character of case. The substitute chases price at the top of the move
+rather than waiting for it to come back to the gap, brackets itself
+against a level two and a half times further away, and -- because the
+retest gates added to `app/paper/engine.py` and `app/backtest/engine.py`
+only fill when `candle.low <= entry <= candle.high` -- opens a position on
+a candle where the strategy as written would have taken none at all. Note
+that position *sizing* still solves for the configured risk percent, so
+the currency at risk is unchanged; what changes is which trade is taken,
+at what price, against what invalidation level. A backtest run to validate
+the strategy before enabling it exercises the substitute too, so it never
+reveals the swap.
+
+`POST /strategies` returned 201 for `{"type": "FVG_RETEST"}` and persisted
+it verbatim. So did `PUT /strategies/{id}`, and so did
+`app.ai.strategy_builder.parse_strategy_json` -- which matters more than a
+human typo, because blueprint §32 makes the AI a first-class producer of
+these documents and its system prompt tells it to "Only use condition
+types, operators, and entry types the schema defines". The schema defined
+the first two and not the third.
+
+This is the third field in this DSL to fail this way and the last of the
+three that prompt names. `Condition.operator` (AND/OR/NOT, declared but
+unimplemented) and `direction` (the bullish/bearish bias vocabulary) are
+already rejected at the model boundary. `Condition.side` and
+`Condition.zone` remain deliberately unvalidated because they fail
+*closed* -- an unrecognised value simply never satisfies its condition,
+producing no trade. `entry.type` failed *open*, into a live position,
+which is what separates it from them.
+
+The fix is a `field_validator` on `EntryConfig.type` accepting exactly
+`market`, `fvg_retest` and `order_block_retest`. Case and surrounding
+whitespace are normalised rather than rejected, matching `_validate_bias`
+in the same module, so `"FVG_RETEST"` now resolves to the retest entry it
+names instead of to a market entry. Everything else raises, which means
+422 from both strategy endpoints and a `StrategyBuilderError` from the AI
+path.
+
+Two consequences worth stating plainly. First, a strategy row already
+persisted with an unrecognised entry type now fails
+`StrategyDefinition.model_validate` on load; `ScannerWorker` and
+`AutoTradeSupervisor` both already catch that, log it and skip the
+strategy, so such a row stops trading rather than continuing to trade as
+something it never said it was -- and `GET /strategies` still returns it
+(the response model carries `definition` as a plain `dict`) so it can be
+corrected with a `PUT`. Second, `EntryConfig.params` is accepted,
+persisted and read by nothing: no entry type takes parameters yet, since
+every entry and stop is derived from zone geometry alone. That is a
+feature gap rather than a defect -- nothing is *mis*-interpreted by it --
+and it is left in place because the DSL is a stored, versioned document.
+
+Coverage was the "every fixture pins a valid value" shape: of the
+seventeen strategy fixtures across the suite, sixteen spell a retest type
+exactly and the seventeenth (`tests/strategy/test_engine.py`'s inverted-
+bracket regression) spells `"market"`. Every one of them names a type the
+engine recognises, so the fallback branch was only ever reached by the
+fixture that meant to reach it -- never by one carrying an unrecognised
+value, which is the case that mattered. The
+new tests cover the validator directly (rejected values, normalised
+values, and the unchanged `"market"` default), the behavioural difference
+in `tests/strategy/test_engine.py` (a case-typo'd retest now resolves to
+the same entry/stop/target as the canonical spelling, while the market
+fallback demonstrably does not, has a bracket more than twice as wide, and
+fills on a candle the retest does not), and the API boundary in
+`tests/api/test_strategy_versions.py` (three bad types must 422 and leave
+no rows behind; `"FVG_RETEST"` must 201 and come back normalised; `PUT`
+must reject too).
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

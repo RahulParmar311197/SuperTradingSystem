@@ -127,9 +127,73 @@ class Condition(BaseModel):
         return v
 
 
+_ENTRY_TYPES = ("market", "fvg_retest", "order_block_retest")
+
+
 class EntryConfig(BaseModel):
-    type: str = "market"  # e.g. "market", "fvg_retest", "order_block_retest"
+    """How a matched setup turns into a price to enter at.
+
+    `params` is accepted and persisted but not read by any entry type yet
+    -- `app.strategy.engine._resolve_entry_and_stop` derives every entry
+    and stop from the zone geometry alone. It is left in place rather than
+    removed because the DSL is a stored, versioned document; nothing is
+    silently *mis*-interpreted by it, unlike `type` below.
+    """
+
+    type: str = "market"
     params: dict = Field(default_factory=dict)
+
+    @field_validator("type")
+    @classmethod
+    def _reject_unknown_entry_types(cls, v: str) -> str:
+        """Rejects anything outside the three entry types that exist.
+
+        `type` was a bare `str` read as a chain of bare equality tests
+        with an implicit `else` (`app/strategy/engine.py`'s
+        `_resolve_entry_and_stop`): `== "fvg_retest"`, then
+        `== "order_block_retest"`, then fall through to a market entry at
+        `context.current_price` with the stop at the dealing-range edge.
+        So every value that was not exactly one of those two strings --
+        `"FVG_RETEST"`, `"fvg-retest"`, `"limit"`, a typo, an AI
+        hallucination -- silently became a *market* entry, which is not a
+        near miss but a different trade:
+
+            entry.type='fvg_retest'  entry=102.75 stop=99.17 target=109.90
+                                     stop 3.48% away, fills only once price
+                                     trades back down to the gap
+            entry.type='FVG_RETEST'  entry=105.00 stop=96.00 target=123.00
+                                     stop 8.57% away, fills immediately
+
+        Same candles, same conditions, one character of case. The
+        substitute chases price at the top of the move instead of waiting
+        for the retest, brackets itself against a level 2.5x further away,
+        and -- because the retest gates in `app/paper/engine.py` and
+        `app/backtest/engine.py` only fill when `low <= entry <= high` --
+        takes a position on a candle where the strategy as written would
+        have taken none at all. A backtest run to validate the strategy
+        silently exercises the substitute too, so it never reveals the
+        swap.
+
+        This is the third field in this DSL to fail this way, and the
+        third named in `app.ai.strategy_builder`'s own system prompt
+        ("Only use condition types, operators, and entry types the schema
+        defines") -- `Condition.operator` and `direction` are already
+        rejected above. Unlike `Condition.side`/`zone`, which fail
+        *closed* (an unrecognised value simply never satisfies its
+        condition), this one fails open into a live trade, which is why it
+        cannot be left alone.
+
+        Case and surrounding whitespace are normalised rather than
+        rejected, matching `_validate_bias`.
+        """
+        normalized = v.strip().lower()
+        if normalized not in _ENTRY_TYPES:
+            raise ValueError(
+                f"entry.type={v!r} is not a supported entry type. Use one of "
+                f"{', '.join(_ENTRY_TYPES)} -- an unrecognised value used to be silently "
+                "traded as a market entry at the current price, which is a different trade."
+            )
+        return normalized
 
 
 class RiskConfig(BaseModel):

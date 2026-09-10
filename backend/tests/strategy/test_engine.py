@@ -204,3 +204,77 @@ def test_direction_polarity_is_pinned_for_both_biases():
     # Mirror images about the same entry, at the same R multiple.
     assert long_signal.entry == short_signal.entry
     assert long_signal.risk_reward == short_signal.risk_reward
+
+
+# A bullish FVG (99 .. 103) left unfilled, plus a confirmed swing low at 96
+# and swing high at 111 so the dealing range exists -- both entry types can
+# therefore resolve, which is what makes the substitution observable.
+RETEST_VS_MARKET_SETUP = [
+    (100, 101, 99.0, 100),
+    (100, 102, 99.5, 101),
+    (101, 103, 100.2, 102),
+    (102, 102.5, 96.0, 98),   # swing low @ 96
+    (98, 99, 96.5, 97),
+    (97, 99.5, 96.8, 99),
+    (99, 108, 103.0, 107),    # displacement -> bullish FVG 99 .. 103
+    (107, 110, 106.0, 109),
+    (109, 111, 107.0, 108),   # swing high @ 111
+    (108, 109, 106.5, 107),
+    (107, 108, 105.5, 106),
+    (106, 107, 104.5, 105),   # current price 105, still above the gap
+]
+
+
+def test_a_case_typo_in_the_entry_type_no_longer_silently_becomes_a_market_entry():
+    # Regression test: `EntryConfig.type` was a bare `str` and
+    # `_resolve_entry_and_stop` read it as bare equality tests with an
+    # implicit `else`, so "FVG_RETEST" -- one character of case away from
+    # the real thing -- fell through to a *market* entry at the current
+    # price with the stop at the dealing-range edge.
+    #
+    # Pre-fix, on these candles, that swap produced:
+    #     fvg_retest  entry=102.75 stop=99.17 target=109.90  (3.48% stop)
+    #     FVG_RETEST  entry=105.00 stop=96.00 target=123.00  (8.57% stop)
+    # -- a different entry, a stop 2.5x further away, and a fill on this
+    # candle where the retest strategy would not have traded at all
+    # (`app/paper/engine.py` and `app/backtest/engine.py` only fill a
+    # retest once `low <= entry <= high`).
+    candles = make_candles(RETEST_VS_MARKET_SETUP)
+    context = _build_context(candles)
+    assert context.smc.dealing_range is not None, "fixture must reach the market-entry fallback"
+    assert context.smc.unmitigated_fvgs(direction="BULLISH"), "fixture must reach the fvg_retest branch"
+
+    def evaluate(entry_type: str):
+        strategy = StrategyDefinition(
+            name="Bullish FVG retest",
+            market="TESTSYM",
+            timeframe="15m",
+            direction="bullish",
+            conditions=[Condition(type=ConditionType.FVG, direction="bullish")],
+            entry=EntryConfig(type=entry_type),
+            risk=RiskConfig(risk_percent=0.5, minimum_rr=2.0),
+        )
+        return StrategyEngine().evaluate(strategy, context)
+
+    canonical = evaluate("fvg_retest")
+    typoed = evaluate("FVG_RETEST")
+    market = evaluate("market")
+
+    assert canonical.matched and typoed.matched and market.matched
+
+    # The typo now resolves to the retest it names, not to the market entry.
+    assert (typoed.entry, typoed.stop, typoed.target) == (canonical.entry, canonical.stop, canonical.target)
+    assert (market.entry, market.stop) != (canonical.entry, canonical.stop)
+
+    # And the substitution it used to make was not a rounding difference:
+    # the market fallback enters at the current close with a stop at the
+    # dealing-range low, which is a materially wider bracket.
+    assert market.entry == candles[-1].close
+    assert market.stop == context.smc.dealing_range.range_low
+    assert abs(market.entry - market.stop) > 2 * abs(canonical.entry - canonical.stop)
+
+    # The retest waits for price to trade back down to the gap; the market
+    # substitute fills on this candle. That difference is the whole point.
+    last = candles[-1]
+    assert not last.low <= canonical.entry <= last.high
+    assert last.low <= market.entry <= last.high

@@ -4276,6 +4276,71 @@ tests now reject nine bad values across both models and pin the
 normalization, and a new engine test pins the polarity of both biases as
 mirror images -- the fork the bug routed into, which nothing had asserted.
 
+## A LIMIT order with no limit price filled at 0.0 (§59-60)
+
+`PlaceOrderRequest.price` is optional for every order type and had no
+cross-field validation, and `MockBroker._resolve_fill_price` read it as
+`request.price or 0.0` for anything that is not MARKET. So a LIMIT order
+carrying no limit price was accepted and **filled at zero**. Driven
+through the real API:
+
+```
+POST /orders (LIMIT, no price) -> 201 status=MONITORING qty=100.0
+GET /positions -> [{quantity: 100.0, average_price: 0.0, unrealized_pnl: 0.0}]
+GET /portfolio -> {open_position_count: 1, total_exposure: 0.0}
+# then close it with an ordinary MARKET short at 100:
+GET /portfolio -> {open_position_count: 0, total_realized_pnl: 10000.0}
+```
+
+A fill at zero is not a cheap fill. The position carries
+`average_price=0.0`, so `compute_portfolio_exposure` computes
+`abs(qty * average_price)` as **0** and reports a real 100-unit position
+as zero exposure -- and `place_order` feeds that same 0 into
+`current_exposure` for every later `exposure_limit` check. Closing the
+position then books the entire notional as realized profit: 100 units
+"bought at 0" and sold at 100 journals a 10,000 gain into `trades` and
+into `daily_pnl`/`weekly_pnl`, which *loosens* the daily and weekly loss
+budgets. That is the same harm the inverted-bracket guard in
+`app/strategy/engine.py` was added to stop, arriving by a different door.
+
+MARKET was never affected: it fills from the broker's own quote, seeded
+from `entry`.
+
+The fix refuses rather than fabricates, at both layers:
+
+- `PlaceOrderRequest` gains a model validator. LIMIT requires a positive
+  `price`. **SL and SL_M are refused outright**, because their trigger
+  cannot be expressed end to end: the request model has no
+  `trigger_price`, `OrderRecord` does not carry one, and
+  `ExecutionEngine.submit` does not pass one -- so `app/brokers/upstox/
+  adapter.py`, which does map both types and does send a `trigger_price`
+  field, would send `0` to a real broker. `OrderRequest` and the adapter
+  are ready for them; wiring the field through the three layers between
+  is a feature, and until it exists, refusing is the honest answer.
+- `MockBroker._resolve_fill_price` returns `None` instead of `0.0` when
+  there is no usable price, and `place_order` turns that into an ordinary
+  broker rejection -- a path the execution engine already understands. A
+  caller that cannot say what price it wants now gets a rejection it can
+  see rather than a position it cannot explain. This also closes the
+  MARKET-with-no-quote-anywhere case, which resolved to 0.0 too.
+
+Coverage was the "every fixture pins the same enum value" shape in its
+purest form. The only fill-price assertion anywhere in the suite is in
+`tests/trading/test_execution.py`, whose fixture hardcodes
+`order_type=OrderType.MARKET`; no test in `tests/api/` ever sent an
+`order_type` or `price` field at all, so every one of the suite's ~40
+order placements took the MARKET branch; and there was no
+`tests/brokers/test_mock.py` -- `_resolve_fill_price` had no direct test.
+The whole non-MARKET branch was unexecuted.
+
+There is now a `tests/brokers/test_mock.py` pinning the broker contract
+directly (unpriced LIMIT/SL/SL_M rejected leaving no position; a
+non-positive price refused; a LIMIT filling at its own price and not at a
+deliberately different quote; MARKET still filling from the quote; and
+MARKET with no quote and no price rejected), plus two API tests: the
+three unpriced order types must 422 and leave no `orders` or `positions`
+rows behind, and a LIMIT *with* a price must fill at that price.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

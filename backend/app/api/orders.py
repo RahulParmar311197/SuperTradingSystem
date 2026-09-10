@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -180,6 +180,46 @@ class PlaceOrderRequest(BaseModel):
     entry: float
     stop: float
     price: float | None = None
+
+    @model_validator(mode="after")
+    def _reject_order_types_this_platform_cannot_execute(self) -> "PlaceOrderRequest":
+        """Refuses an order whose price the execution path cannot honestly
+        determine, instead of letting one be filled at a fabricated price.
+
+        `price` is optional for every order type here, and `MockBroker.
+        _resolve_fill_price` reads it as `request.price or 0.0` for
+        anything that is not MARKET -- so a LIMIT order with no limit
+        price was accepted (201, status MONITORING) and **filled at 0.0**.
+        The position then carries `average_price=0.0`, which makes
+        `GET /portfolio.total_exposure` report 0 for a real open position
+        and feeds 0 into every later `exposure_limit` check; closing it
+        books the entire notional as realized profit (100 units bought at
+        "0" and sold at 100 journaled a 10,000 gain), which also *loosens*
+        the daily and weekly loss budgets -- the same harm the inverted
+        bracket guard in app/strategy/engine.py was added to stop.
+
+        MARKET is unaffected: it fills from the broker's own quote.
+
+        SL and SL_M are refused outright rather than validated, because
+        their trigger cannot be expressed end to end: this model has no
+        `trigger_price` field, `OrderRecord` does not carry one, and
+        `ExecutionEngine.submit` does not pass one -- so
+        `app/brokers/upstox/adapter.py` would send `trigger_price: 0` to a
+        real broker. `OrderRequest` and the adapter's own mapping are
+        ready for them; wiring the field through the three layers between
+        is a feature, and until that exists, refusing is the honest
+        answer. See docs/ARCHITECTURE.md.
+        """
+        if self.order_type is OrderType.MARKET:
+            return self
+        if self.order_type is OrderType.LIMIT:
+            if self.price is None or self.price <= 0:
+                raise ValueError("order_type=LIMIT requires a positive `price` (the limit price).")
+            return self
+        raise ValueError(
+            f"order_type={self.order_type.value} is not supported yet: its trigger price cannot be "
+            "carried through to the broker. Use MARKET, or LIMIT with a `price`."
+        )
 
 
 class OrderResponse(BaseModel):

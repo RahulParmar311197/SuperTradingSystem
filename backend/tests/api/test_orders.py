@@ -1294,3 +1294,98 @@ async def test_a_reducing_order_cannot_be_used_to_open_a_position(require_infra)
             async with async_session_factory() as db:
                 await db.execute(delete(Instrument).where(Instrument.id == loser_id))
                 await db.commit()
+
+
+@pytest.mark.parametrize("order_type", ["LIMIT", "SL", "SL_M"])
+async def test_orders_that_cannot_be_priced_are_refused_rather_than_filled_at_zero(order_type, require_infra):
+    # Regression test: `PlaceOrderRequest.price` is optional for every
+    # order type, and `MockBroker._resolve_fill_price` read it as
+    # `request.price or 0.0` for anything that is not MARKET. A LIMIT
+    # order carrying no limit price was therefore accepted (201, status
+    # MONITORING) and filled at 0.0:
+    #
+    #   GET /positions -> [{quantity: 100.0, average_price: 0.0}]
+    #   GET /portfolio -> {open_position_count: 1, total_exposure: 0.0}
+    #   ...then closing it with an ordinary MARKET short at 100 booked
+    #   GET /portfolio -> {total_realized_pnl: 10000.0}
+    #
+    # A zero fill is not a cheap fill. It reports a real open position as
+    # zero exposure, feeds 0 into every later exposure_limit check, and
+    # turns the close into a fabricated profit that also *loosens* the
+    # daily and weekly loss budgets.
+    #
+    # SL/SL_M are refused outright: their trigger cannot be carried to the
+    # broker (no `trigger_price` on this model, on OrderRecord, or in
+    # ExecutionEngine.submit), so a real broker would receive a 0 trigger.
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        async with async_session_factory() as db:
+            instrument = Instrument(
+                symbol=f"NOPX{uuid.uuid4().hex[:6].upper()}", exchange="NSE", market=MarketType.EQUITY, instrument_type="EQ"
+            )
+            db.add(instrument)
+            await db.commit()
+            await db.refresh(instrument)
+            instrument_id = instrument.id
+
+        try:
+            r = client.post(
+                "/orders",
+                json={
+                    "symbol": instrument.symbol, "direction": "LONG",
+                    "order_type": order_type, "entry": 100.0, "stop": 95.0,
+                },
+                headers=headers,
+            )
+            assert r.status_code == 422, r.text
+
+            # Nothing may have been created by a refused order.
+            async with async_session_factory() as db:
+                positions = (
+                    await db.execute(select(Position).where(Position.user_id == user_id))
+                ).scalars().all()
+                orders = (await db.execute(select(Order).where(Order.user_id == user_id))).scalars().all()
+            assert positions == []
+            assert orders == []
+        finally:
+            await _cleanup(user_id, instrument_id)
+
+
+async def test_a_limit_order_with_a_price_fills_at_that_price(require_infra):
+    # The other half: LIMIT is not banned, it just has to say what price
+    # it means. The fill must be that price, not the quote seeded from
+    # `entry` -- so this also pins that the two are distinguishable.
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        async with async_session_factory() as db:
+            instrument = Instrument(
+                symbol=f"LIMP{uuid.uuid4().hex[:6].upper()}", exchange="NSE", market=MarketType.EQUITY, instrument_type="EQ"
+            )
+            db.add(instrument)
+            await db.commit()
+            await db.refresh(instrument)
+            instrument_id = instrument.id
+
+        try:
+            r = client.post(
+                "/orders",
+                json={
+                    "symbol": instrument.symbol, "direction": "LONG", "order_type": "LIMIT",
+                    "entry": 100.0, "stop": 95.0, "price": 98.5,
+                },
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+
+            async with async_session_factory() as db:
+                position = (
+                    await db.execute(select(Position).where(Position.user_id == user_id, Position.is_open.is_(True)))
+                ).scalar_one()
+                assert float(position.average_price) == pytest.approx(98.5)
+                assert float(position.quantity) > 0
+        finally:
+            await _cleanup(user_id, instrument_id)

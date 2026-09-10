@@ -110,16 +110,30 @@ async def persist_position(
     instrument_id: uuid.UUID,
     position: PositionRecord,
     execution_mode: ExecutionMode = ExecutionMode.LIVE,
+    *,
+    source_key: str,
 ) -> PositionRow:
     """Upsert the DB mirror of `position` — the single open `positions`
-    row for this (user, instrument, execution_mode), or a freshly-closed
-    one if `position` just went flat."""
+    row for this (user, instrument, execution_mode, source_key), or a
+    freshly-closed one if `position` just went flat.
+
+    `source_key` identifies which engine's `PositionManager` this row
+    mirrors, and is required rather than defaulted precisely so a new
+    caller cannot silently join an existing engine's row. Three unrelated
+    managers write here — the manual stack in `app/api/orders.py`, each
+    `PaperTradingEngine` behind `POST /paper`, and `AutoTradeSupervisor`
+    in the worker process — and all of them persist as
+    `ExecutionMode.PAPER` when no broker is connected, which is every
+    account's default. Without it in the key they overwrote each other's
+    row in place, so `GET /portfolio` reported whichever engine wrote last
+    as the account's entire exposure. See `Position.source_key`."""
     row = (
         await db.execute(
             select(PositionRow).where(
                 PositionRow.user_id == user_id,
                 PositionRow.instrument_id == instrument_id,
                 PositionRow.execution_mode == execution_mode,
+                PositionRow.source_key == source_key,
                 PositionRow.is_open.is_(True),
             )
         )
@@ -130,6 +144,7 @@ async def persist_position(
             user_id=user_id,
             instrument_id=instrument_id,
             execution_mode=execution_mode,
+            source_key=source_key,
             quantity=position.quantity,
             average_price=position.average_price,
             stop=position.stop,

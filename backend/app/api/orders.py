@@ -517,7 +517,9 @@ async def place_order(
             # reduces/closes a position in the other direction, whose stop
             # belongs to that original entry, not this one.
             position_after.stop = payload.stop
-        position_row = await persist_position(db, user.id, instrument.id, position_after, execution_mode=execution_mode)
+        position_row = await persist_position(
+            db, user.id, instrument.id, position_after, execution_mode=execution_mode, source_key="manual"
+        )
         realized_delta = position_after.realized_pnl - realized_pnl_before
         if realized_delta != 0 and position_before is not None:
             # Mirrors PaperTradingEngine._maybe_exit (app/paper/engine.py) --

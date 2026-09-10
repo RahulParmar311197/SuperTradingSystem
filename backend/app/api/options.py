@@ -429,7 +429,9 @@ async def execute_options_strategy(
             opened_or_added = (
                 just_filled and position_after.is_open and position_after.is_long == (leg.direction == Direction.LONG)
             )
-            position_row = await persist_position(db, user.id, instrument.id, position_after, execution_mode=execution_mode)
+            position_row = await persist_position(
+                db, user.id, instrument.id, position_after, execution_mode=execution_mode, source_key="manual"
+            )
             realized_delta = position_after.realized_pnl - realized_pnl_before
             if realized_delta != 0 and position_before is not None:
                 # Same fix as app/api/orders.py's place_order -- without

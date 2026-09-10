@@ -4691,6 +4691,104 @@ one user cannot disconnect another's account. Pre-fix the first three fail
 with `ForeignKeyViolationError: ... is still referenced from table
 "orders"`.
 
+## One positions row per engine, not per instrument (§9, §86)
+
+`positions` is a DB mirror of an in-memory `PositionManager`, and three
+unrelated ones write into it:
+
+- the manual/live stack in `app/api/orders.py`'s `_STACKS`, used by both
+  `POST /orders` and `POST /options/execute`
+- one `PaperTradingEngine` per `POST /paper` session
+- `AutoTradeSupervisor`, in the separate worker process
+
+They share no state, and cannot: the supervisor is a different process.
+Each also carries its own `MockBroker` with its own balance. Yet all three
+persist under `ExecutionMode.PAPER` whenever no broker account is
+connected -- which is every account's default, because
+`_execution_mode_for` maps a `MockBroker` stack to PAPER -- and
+`persist_position` looked its row up by `(user, instrument,
+execution_mode, is_open)`. One key, three writers, last write wins.
+
+Driven through the real API as one user with no broker connected:
+
+```
+paper session fills            positions: [(151.515152 @ 103.0, open)]
+GET /portfolio total_exposure  15606.06
+POST /orders (same instrument) 201, quantity 100
+positions                      [(100.0 @ 100.0, open)]     <- same row id
+GET /portfolio total_exposure  10000.0
+```
+
+The paper session's 15,606 did not move, close or merge; it was
+overwritten in place and disappeared from `positions`, from
+`GET /portfolio`, from `POST /admin/portfolio-snapshot`, and from the
+correlated-exposure risk check. That is exactly backwards from why
+`persist_position` was called from those paths at all -- both
+`app/api/paper.py` and `app/workers/auto_trade_worker.py` carry comments
+saying they persist *so that* `GET /portfolio`, the admin snapshot and the
+correlated-exposure check can see the position. The reverse ordering is
+just as bad: feeding a candle to a paper session whose position has since
+flattened writes `quantity=0, is_open=False` over the *manual* position's
+row, so `total_exposure` reads 0.0 while the manual stack still holds
+stock, and the next manual fill inserts a second row, splitting one
+position in two.
+
+Two paper sessions on one instrument collide the same way, with no
+`LIVE_TRADE` permission needed at all -- `create_paper_session` has no
+guard against a second session on an instrument the user already trades,
+and needs none once rows are keyed per session.
+
+The fix is a `source_key` discriminator on `positions`, added by migration
+`c93a5f2e10b7`, carried in the lookup key and enforced by a partial unique
+index `uq_open_position_per_source` on `(user_id, instrument_id,
+execution_mode, source_key) WHERE is_open`. `"manual"` for `POST /orders`
+and `POST /options/execute`, `"auto"` for the supervisor, and
+`"paper:{session_id}"` per paper session, since two sessions are two
+independent engines. `persist_position` takes it as a **required**
+keyword-only argument rather than a defaulted one, precisely so a future
+caller cannot silently join an existing engine's row -- the mistake this
+whole section is about. `compute_portfolio_exposure` needs no change: it
+already sums every open row for the mode, so it now reports 25,606.06
+where it used to report whichever engine wrote last.
+
+Existing rows are backfilled to `'manual'`. There is no way to recover
+which engine produced a historical row, and those rows are unreliable
+anyway precisely because they have been overwriting each other; `'manual'`
+is chosen because `POST /orders` is the likeliest origin of a surviving
+one. The partial index builds safely on existing data, since the old code
+overwrote rather than inserted and so could only ever leave one open row
+per `(user, instrument, execution_mode)`.
+
+What this does **not** fix, and is worth being plain about: two engines in
+two processes still hold independent in-memory position state for the same
+account and instrument, and neither knows about the other. Their risk
+limits, their `max_open_positions` counts and their broker balances remain
+separate. Unifying that is an architecture change, not a bug fix. This
+change stops the *database* from silently discarding one of them, so
+`/portfolio` and the exposure checks finally see the whole picture.
+
+A related pre-existing split, deliberately left alone: `GET /portfolio`
+computes `open_position_count` from the in-memory manual stack while
+`total_exposure` comes from the DB, so during the repro above the response
+read `open_position_count: 0` alongside `total_exposure: 15606.06`. Both
+sources are documented in that endpoint, and reconciling them is a
+separate question from the clobber.
+
+Coverage was fake-coverage shape (b) throughout: every existing positions
+assertion in the suite is single-writer, and all of them --
+`tests/api/test_paper.py`'s persistence test and the eight in
+`tests/api/test_orders.py` -- read
+`select(Position).where(Position.user_id == ...)` then `.scalar_one()`.
+The assertion itself presumes exactly one row, so no fixture in the suite
+could reach the collision. The new `tests/api/test_position_sources.py`
+drives the paper API and `POST /orders` against one instrument for one
+user, two paper sessions against one instrument (with different starting
+balances, so the two rows are provably distinct rather than one value
+written twice), a control that repeated writes from one source still
+upsert a single row rather than accumulating one per candle, and the
+partial unique index itself -- including that two *closed* rows for one
+source stay legal, which is what lets a source reopen after flattening.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

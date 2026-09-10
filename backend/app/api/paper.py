@@ -174,7 +174,16 @@ async def feed_candle(
     # actually closes.
     position_after = engine.position_manager.get(engine.account_id, engine.symbol)
     if position_after is not None:
-        await persist_position(db, user.id, session.instrument_id, position_after, execution_mode=ExecutionMode.PAPER)
+        await persist_position(
+            db,
+            user.id,
+            session.instrument_id,
+            position_after,
+            execution_mode=ExecutionMode.PAPER,
+            # Per session, not per user: two sessions on one instrument are
+            # two independent engines with their own MockBroker balances.
+            source_key=f"paper:{session_id}",
+        )
 
     if outcome.risk_checks is not None:
         # Blueprint's `risk_events` table (see AI_TRADING_PLATFORM_BLUEPRINT.md)

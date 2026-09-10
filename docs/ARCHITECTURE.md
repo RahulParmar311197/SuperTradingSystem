@@ -4149,6 +4149,55 @@ execution-sanity set -- asserted as set equality, so a future check added
 on the wrong side of the fence fails the test -- and must still be stopped
 by the kill switch and by an unhealthy broker.
 
+## The same exit trap on POST /options/execute (§37-40, §56-57)
+
+The companion to the `POST /orders` fix recorded above, and the half that
+was deliberately left out of it. `evaluate_options_risk` ran
+unconditionally on every order, and its `exposure_limit`,
+`daily_loss_limit`, `weekly_loss_limit`, `max_open_positions` and
+`max_trades_per_day` checks are all entry checks -- `max_open_positions`
+is phrased "N open vs limit M" here too. The gate also ran well before the
+per-leg `existing_position` lookup inside the execution loop, so it could
+not have known the order was a close. `POST /options/execute` is the only
+path that closes an options position, so the holder of a losing spread was
+refused the one order that would end the loss. Confirmed by running the
+new tests against the pre-fix code: `assert 403 == 201`, twice.
+
+The reason this was not folded into the previous change is that a
+multi-leg order needs a definition of "reduces exposure" that a
+single-instrument order does not, and guessing at one inside that change
+would have been worse than naming the gap. The definition settled on here:
+
+**An options order is reducing only if _every_ leg opposes an open
+position in that leg's own instrument.** All-or-nothing, deliberately. If
+any leg opens exposure the whole order is an entry and faces the full
+gate, so a fresh position can never ride in alongside a genuine close --
+which is exactly the "two legs close and one opens" case that made the
+question worth deferring. The conservative answer costs a user nothing:
+they close the spread, then open the new position as its own
+fully-checked order.
+
+Each reducing leg is additionally clamped to `abs(existing.quantity)`
+where it is submitted. That clamp is what makes the exemption safe rather
+than a hole, the same way it does on the equities path: without it, a
+client could clear every limit by sending an oversized opposing leg and
+calling it a close. Verified: five lots sent against one open lot leave
+the leg flat, not four lots short.
+
+The exempt set mirrors the equities fix -- exposure, both loss limits, and
+both count limits are skipped (skipped, not recorded as passed, so the
+`RiskEvent` row lists the checks that governed the decision). Everything
+about whether these legs can be executed sanely right now still applies:
+the kill switch, repeated rejections, liquidity, premium deviation, market
+data freshness and broker health. The halt check is gated on
+`not is_reducing`, matching its own "New entries are halted" wording.
+
+Neither existing options test could reach the state: every one of them
+either opens a spread with a clean account, or asserts a rejection on a
+fresh entry. None placed a closing order while a limit was tripped -- the
+same fixture-cannot-reach-the-breaking-state gap that hid this on the
+equities path.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

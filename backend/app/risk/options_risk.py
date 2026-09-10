@@ -51,6 +51,17 @@ class OptionsRiskProposal:
     # is otherwise trusted input that sizes this strategy's own payoff/risk
     # math (compute_payoff_summary), unchecked against anything real.
     premium_deviation_pct: float = 0.0
+    # True when every leg of this order opposes an open position in that
+    # leg's own instrument, and each leg is clamped to at most the open
+    # quantity -- i.e. the order can only reduce or flatten what the
+    # account already holds. The exposure, loss and count limits below cap
+    # how much risk an account may take ON; applying them to an exit
+    # inverts their purpose and leaves the holder of a losing options
+    # position with no way out, since POST /options/execute is the only
+    # path that closes one. Deliberately all-or-nothing: if any leg opens
+    # exposure, the whole order is an entry and faces the full gate, so a
+    # new position can never ride in alongside a genuine close.
+    is_reducing: bool = False
 
 
 def evaluate_options_risk(
@@ -90,47 +101,56 @@ def evaluate_options_risk(
         else max(-payoff.worst_sampled_loss, payoff.capital_requirement)
     )
 
-    projected_exposure_pct = (
-        (proposal.current_exposure + risk_amount) / proposal.account_balance * 100 if proposal.account_balance else 100.0
-    )
-    checks.append(
-        RiskCheck(
-            "exposure_limit",
-            projected_exposure_pct <= limits.max_exposure_pct,
-            f"Projected exposure {projected_exposure_pct:.2f}% vs limit {limits.max_exposure_pct}%",
+    # Entry-only limits -- skipped, not recorded as passed, for an
+    # order that can only reduce, so the RiskEvent audit row lists
+    # exactly the checks that governed the decision. Everything below
+    # (repeated rejections, liquidity, premium deviation, market data
+    # freshness, broker health) is about whether these legs can be
+    # executed sanely right now, which applies to a close as much as
+    # to an open -- as does the kill switch above.
+    if not proposal.is_reducing:
+        projected_exposure_pct = (
+            (proposal.current_exposure + risk_amount) / proposal.account_balance * 100 if proposal.account_balance else 100.0
         )
-    )
+        checks.append(
+            RiskCheck(
+                "exposure_limit",
+                projected_exposure_pct <= limits.max_exposure_pct,
+                f"Projected exposure {projected_exposure_pct:.2f}% vs limit {limits.max_exposure_pct}%",
+            )
+        )
 
-    daily_loss_pct = max(-proposal.daily_pnl, 0) / proposal.account_balance * 100 if proposal.account_balance else 0
-    checks.append(
-        RiskCheck(
-            "daily_loss_limit",
-            daily_loss_pct < limits.max_daily_loss_pct,
-            f"Daily loss {daily_loss_pct:.2f}% vs limit {limits.max_daily_loss_pct}%",
+        daily_loss_pct = max(-proposal.daily_pnl, 0) / proposal.account_balance * 100 if proposal.account_balance else 0
+        checks.append(
+            RiskCheck(
+                "daily_loss_limit",
+                daily_loss_pct < limits.max_daily_loss_pct,
+                f"Daily loss {daily_loss_pct:.2f}% vs limit {limits.max_daily_loss_pct}%",
+            )
         )
-    )
-    weekly_loss_pct = max(-proposal.weekly_pnl, 0) / proposal.account_balance * 100 if proposal.account_balance else 0
-    checks.append(
-        RiskCheck(
-            "weekly_loss_limit",
-            weekly_loss_pct < limits.max_weekly_loss_pct,
-            f"Weekly loss {weekly_loss_pct:.2f}% vs limit {limits.max_weekly_loss_pct}%",
+        weekly_loss_pct = max(-proposal.weekly_pnl, 0) / proposal.account_balance * 100 if proposal.account_balance else 0
+        checks.append(
+            RiskCheck(
+                "weekly_loss_limit",
+                weekly_loss_pct < limits.max_weekly_loss_pct,
+                f"Weekly loss {weekly_loss_pct:.2f}% vs limit {limits.max_weekly_loss_pct}%",
+            )
         )
-    )
-    checks.append(
-        RiskCheck(
-            "max_open_positions",
-            proposal.open_positions < limits.max_open_positions,
-            f"{proposal.open_positions} open vs limit {limits.max_open_positions}",
+        checks.append(
+            RiskCheck(
+                "max_open_positions",
+                proposal.open_positions < limits.max_open_positions,
+                f"{proposal.open_positions} open vs limit {limits.max_open_positions}",
+            )
         )
-    )
-    checks.append(
-        RiskCheck(
-            "max_trades_per_day",
-            proposal.trades_today < limits.max_trades_per_day,
-            f"{proposal.trades_today} trades today vs limit {limits.max_trades_per_day}",
+        checks.append(
+            RiskCheck(
+                "max_trades_per_day",
+                proposal.trades_today < limits.max_trades_per_day,
+                f"{proposal.trades_today} trades today vs limit {limits.max_trades_per_day}",
+            )
         )
-    )
+
     checks.append(
         RiskCheck(
             "no_repeated_rejections",

@@ -4427,6 +4427,112 @@ fills on a candle the retest does not), and the API boundary in
 no rows behind; `"FVG_RETEST"` must 201 and come back normalised; `PUT`
 must reject too).
 
+## Sizing a LIMIT order on the price it fills at (§56-57)
+
+`PlaceOrderRequest` carries two prices with different meanings. `entry` is
+a claim about the current market, and `price` is the limit price. Sizing
+and every notional risk check read `entry` for all order types -- but only
+a MARKET order fills there. A LIMIT order fills at `price`, which was
+passed straight through to the broker and compared to nothing: not to
+`entry`, not to the broker's quote, not to `max_entry_deviation_pct`.
+
+The result, driven through the real API on a fresh 100,000 account at the
+default 0.5% risk per trade:
+
+```
+POST /orders {"direction":"LONG","order_type":"LIMIT",
+              "entry":100.0,"stop":95.0,"price":5000.0}
+  -> 201 status=MONITORING quantity=100.0
+GET /positions  -> [{quantity: 100.0, average_price: 5000.0}]
+GET /portfolio  -> {balance: 100000.0, total_exposure: 500000.0}
+```
+
+The risk engine sized `500 / |100 - 95| = 100` units and measured the
+position as `100 x 100 = 10,000` notional -- 10% of the account, against a
+100% exposure cap. The account then held **500,000, or 500% of its own
+balance**, with `100 x |5000 - 95| = 490,500` at risk on an order approved
+as 0.5% risk. The persisted `RiskEvent` row for it reads `APPROVE` with
+`exposure_limit`, `entry_matches_market` and `valid_stop_distance` all
+`True`.
+
+`entry_matches_market` could not help. For `MockBroker` the quote is
+seeded from `payload.entry` a few lines earlier, so that check is 0.00% by
+construction -- the code's own comment says so. It guards `entry` against
+the market; nothing guarded `price` against anything.
+
+It does not take an adversarial payload. `entry=100, stop=105, price=90`
+on a short is an ordinary resting limit: sized `500 / |100 - 105| = 100`
+units, carrying `100 x |90 - 105| = 1,500` of real risk -- three times the
+configured cap, silently. The wrong `average_price` then flows into
+`positions`, `GET /portfolio`'s `total_exposure`, every later
+`current_exposure` the risk gate reads, and on close into `Trade.pnl` and
+`stack.daily_pnl`, which is what the daily and weekly loss halts are
+measured against.
+
+The fix is one value. `fill_price` is `payload.price` for a LIMIT order
+and `payload.entry` otherwise, and it feeds both `calculate_position_size`
+and `TradeRiskProposal.entry`. A LIMIT order fills at its limit price or
+better -- a buy pays at most that, a sell receives at least it -- so it is
+simultaneously the value that determines the fill and the conservative
+worst case in either direction. Post-fix the same call sizes 0.102 units,
+`total_exposure` is 510, and the risk actually taken on is 500.00, exactly
+the configured 0.5%.
+
+Two decisions worth recording, because the obvious wider fixes are wrong:
+
+- The deviation check is deliberately **not** retargeted at `price`.
+  `max_entry_deviation_pct` exists to catch a forged claim about the
+  current market, which is what `entry` is. A limit price is a *chosen*
+  price, not a claim; forcing it within 1% of the quote would refuse every
+  legitimate resting limit order. Once sizing reads the fill price, no
+  bypass remains without it.
+- The fix is not in `MockBroker`. Filling a LIMIT at its own price is
+  correct broker behaviour and `tests/brokers/test_mock.py` deliberately
+  pins it. The disagreement was always in the endpoint, between the price
+  it sized on and the price it sent.
+
+The idempotency key grows a `price` component for the same reason: it was
+`{user}:{symbol}:{direction}:{entry}:{stop}`, and now that the limit price
+decides both the fill and the size, two orders differing only in it are
+two different orders. Without it the second silently deduped onto the
+first and returned its fill.
+
+Scope, honestly. The unbounded version above is specific to `MockBroker`,
+which fills a LIMIT instantly at any price regardless of its own quote --
+a price the simulated market never traded at. That is the default broker
+for every account here and it writes real `orders`/`positions`/`trades`
+state. Against a real adapter (`app/brokers/upstox/adapter.py` sends
+`price` as the limit) a resting limit fills at or better than `price`, so
+the pre-fix error flips sign into consistent under-sizing rather than a
+bypass -- still a wrong number, and still fixed by the same change. This
+was reasoned from the adapter's payload mapping, not verified against live
+Upstox. The sibling entry paths were never affected: `PaperTradingEngine`,
+`AutoTradeSupervisor` and `POST /options/execute` only ever submit
+`OrderType.MARKET`, where the fill price is the seeded quote is `entry`.
+`POST /orders` is the only path where the sized price and the filled price
+can differ, and it was the only one with nothing tying them together.
+
+One thing this does *not* fix: a LIMIT price on the wrong side of the stop
+(`LONG entry=100 stop=95 price=90`) still produces an inverted bracket.
+That is the already-recorded gap that `TradeRiskProposal` carries no
+`direction`, so `valid_stop_distance` measures `abs(entry - stop)` and
+cannot tell which side anything is on. The inversion was equally present
+before this change -- the position really was long at 90 under a stop at
+95 -- and this change only makes the recorded numbers reflect it.
+
+Coverage was the "assertion that is direction-free" shape.
+`tests/api/test_orders.py::test_a_limit_order_with_a_price_fills_at_that_price`
+was the only LIMIT test on the endpoint, and its fixture pinned
+`entry=100.0, price=98.5` -- a gap too small to show anything -- asserting
+`average_price == 98.5` and `quantity > 0`. It checked *that* the fill
+price differs from `entry` while never checking that the quantity was
+solved from the price actually filled, and `quantity > 0` holds just as
+well for the wrong number. No test anywhere asserted that the approved
+notional matches the resulting `average_price x quantity`. That test now
+asserts the exact size, joined by three new ones (the 5,000 bypass with
+its portfolio numbers, the ordinary 3x short, and the dedup case) and a
+control that pins MARKET sizing as unchanged.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

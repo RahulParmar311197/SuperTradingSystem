@@ -1386,6 +1386,175 @@ async def test_a_limit_order_with_a_price_fills_at_that_price(require_infra):
                     await db.execute(select(Position).where(Position.user_id == user_id, Position.is_open.is_(True)))
                 ).scalar_one()
                 assert float(position.average_price) == pytest.approx(98.5)
-                assert float(position.quantity) > 0
+                # ...and the size must be solved from the price it fills
+                # at, not from `entry`. `quantity > 0` was the whole of
+                # this assertion before, which is direction-free: it holds
+                # just as well for the wrong number. On a 100,000 balance
+                # at the default 0.5% risk per trade, 500 of risk over a
+                # |98.5 - 95| = 3.5 stop distance is 142.857 units. Sizing
+                # from `entry` instead gives |100 - 95| = 5 -> 100 units,
+                # which carries 100 x 3.5 = 350 of real risk against a 500
+                # budget -- the same disagreement that, at a wider gap,
+                # becomes a limit bypass (see the test below).
+                assert float(position.quantity) == pytest.approx(500 / 3.5)
+                assert float(position.quantity) != pytest.approx(500 / 5)
+        finally:
+            await _cleanup(user_id, instrument_id)
+
+
+async def test_a_limit_order_is_sized_and_gated_on_the_price_it_will_fill_at(require_infra):
+    # Regression test: sizing and every notional risk check read
+    # `payload.entry` for all order types, while only MARKET actually
+    # fills there. `payload.price` -- the thing that decides a LIMIT
+    # order's fill -- was passed straight to the broker and compared to
+    # nothing.
+    #
+    # Pre-fix, this order was sized as 500 / |100 - 95| = 100 units and
+    # gated as 100 x 100 = 10,000 notional (10% of balance, against a 100%
+    # exposure cap), then filled at 5,000 -- leaving the account holding
+    # 500,000, i.e. 500% of its own balance, with 100 x |5000 - 95| =
+    # 490,500 at risk on an order the engine approved as 0.5% risk. Its
+    # RiskEvent row recorded every check green.
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        async with async_session_factory() as db:
+            instrument = Instrument(
+                symbol=f"LIMR{uuid.uuid4().hex[:6].upper()}", exchange="NSE", market=MarketType.EQUITY, instrument_type="EQ"
+            )
+            db.add(instrument)
+            await db.commit()
+            await db.refresh(instrument)
+            instrument_id = instrument.id
+
+        try:
+            r = client.post(
+                "/orders",
+                json={
+                    "symbol": instrument.symbol, "direction": "LONG", "order_type": "LIMIT",
+                    "entry": 100.0, "stop": 95.0, "price": 5000.0,
+                },
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+            quantity = r.json()["quantity"]
+
+            # 500 of risk over a |5000 - 95| = 4905 stop distance.
+            assert quantity == pytest.approx(500 / 4905)
+            assert quantity < 1.0, "pre-fix this was 100 units"
+
+            # The risk actually taken on is the configured 0.5%, not 490%.
+            assert quantity * abs(5000.0 - 95.0) == pytest.approx(500.0)
+
+            # And the exposure the account really carries is the exposure
+            # the gate approved -- GET /portfolio reads `positions`, whose
+            # `average_price` is the real fill.
+            # `rel=1e-4` because `positions.quantity`/`average_price` are
+            # Numeric columns, so the value read back is rounded relative
+            # to the in-memory float -- 509.685 vs 509.684.
+            portfolio = client.get("/portfolio", headers=headers).json()
+            assert portfolio["total_exposure"] == pytest.approx(quantity * 5000.0, rel=1e-4)
+            assert portfolio["total_exposure"] < portfolio["balance"], "pre-fix this was 500,000 vs a 100,000 balance"
+        finally:
+            await _cleanup(user_id, instrument_id)
+
+
+async def test_a_short_limit_order_is_sized_on_its_limit_price_too(require_infra):
+    # The same disagreement in the other direction, at a gap small enough
+    # to look ordinary rather than adversarial. A short entered at 90 with
+    # a stop at 105 risks 15 per unit, not the 5 that `entry=100` implies.
+    # Pre-fix: sized 500 / 5 = 100 units carrying 100 x 15 = 1,500 of real
+    # risk -- 1.5% of the account against a configured 0.5% cap, three
+    # times over, with nothing anywhere recording that it happened.
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        async with async_session_factory() as db:
+            instrument = Instrument(
+                symbol=f"LIMS{uuid.uuid4().hex[:6].upper()}", exchange="NSE", market=MarketType.EQUITY, instrument_type="EQ"
+            )
+            db.add(instrument)
+            await db.commit()
+            await db.refresh(instrument)
+            instrument_id = instrument.id
+
+        try:
+            r = client.post(
+                "/orders",
+                json={
+                    "symbol": instrument.symbol, "direction": "SHORT", "order_type": "LIMIT",
+                    "entry": 100.0, "stop": 105.0, "price": 90.0,
+                },
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+            quantity = r.json()["quantity"]
+
+            assert quantity == pytest.approx(500 / 15)
+            assert quantity != pytest.approx(500 / 5), "pre-fix this was 100 units"
+            assert quantity * abs(90.0 - 105.0) == pytest.approx(500.0)
+        finally:
+            await _cleanup(user_id, instrument_id)
+
+
+async def test_a_market_order_is_still_sized_on_entry(require_infra):
+    # The fill price for a MARKET order is the market, which is what
+    # `entry` claims to be and what `entry_matches_market` checks against
+    # the broker's own quote. Nothing about that path changes.
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        async with async_session_factory() as db:
+            instrument = Instrument(
+                symbol=f"MKTS{uuid.uuid4().hex[:6].upper()}", exchange="NSE", market=MarketType.EQUITY, instrument_type="EQ"
+            )
+            db.add(instrument)
+            await db.commit()
+            await db.refresh(instrument)
+            instrument_id = instrument.id
+
+        try:
+            r = client.post(
+                "/orders",
+                json={"symbol": instrument.symbol, "direction": "LONG", "entry": 100.0, "stop": 95.0},
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+            assert r.json()["quantity"] == pytest.approx(500 / 5)
+        finally:
+            await _cleanup(user_id, instrument_id)
+
+
+async def test_two_limit_orders_differing_only_in_price_are_not_deduped(require_infra):
+    # The idempotency key was `{user}:{symbol}:{direction}:{entry}:{stop}`
+    # -- no `price`. Now that the limit price decides both the fill and
+    # the size, two orders differing only in it are two different orders;
+    # without it in the key the second silently returned the first's fill
+    # and no second order was ever placed.
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        async with async_session_factory() as db:
+            instrument = Instrument(
+                symbol=f"LIMD{uuid.uuid4().hex[:6].upper()}", exchange="NSE", market=MarketType.EQUITY, instrument_type="EQ"
+            )
+            db.add(instrument)
+            await db.commit()
+            await db.refresh(instrument)
+            instrument_id = instrument.id
+
+        try:
+            base = {"symbol": instrument.symbol, "direction": "LONG", "order_type": "LIMIT", "entry": 100.0, "stop": 95.0}
+            first = client.post("/orders", json={**base, "price": 99.0}, headers=headers)
+            second = client.post("/orders", json={**base, "price": 98.0}, headers=headers)
+            assert first.status_code == 201, first.text
+            assert second.status_code == 201, second.text
+            assert first.json()["id"] != second.json()["id"]
+            assert first.json()["quantity"] == pytest.approx(500 / 4)
+            assert second.json()["quantity"] == pytest.approx(500 / 3)
         finally:
             await _cleanup(user_id, instrument_id)

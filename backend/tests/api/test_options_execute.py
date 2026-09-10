@@ -666,3 +666,123 @@ async def test_closing_leg_records_the_real_fill_price_not_the_claimed_premium(r
                 assert float(trade.exit_price) != pytest.approx(125.0)
         finally:
             await _cleanup(user_id, [long_leg.id, short_leg.id])
+
+
+async def test_an_options_position_can_still_be_closed_after_the_daily_loss_limit_trips(require_infra):
+    # Regression test: `evaluate_options_risk` ran unconditionally on every
+    # order, and its exposure/loss/count checks are all *entry* checks --
+    # `max_open_positions` is literally phrased "N open vs limit M". The
+    # gate also ran well before the per-leg `existing_position` lookup in
+    # the execution loop, so it could not have known the order was a close.
+    # `POST /options/execute` is the only path that closes an options
+    # position, so the holder of a losing spread was refused the one order
+    # that would end the loss -- the same trap `POST /orders` had.
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+        long_leg, short_leg = await _make_two_leg_instruments(f"OPTX{uuid.uuid4().hex[:4].upper()}")
+
+        try:
+            opened = client.post(
+                "/options/execute",
+                json={
+                    "strategy_name": "bull_call_spread",
+                    "legs": [
+                        {"symbol": long_leg.symbol, "direction": "LONG", "quantity": 1, "premium": 120.0},
+                        {"symbol": short_leg.symbol, "direction": "SHORT", "quantity": 1, "premium": 50.0},
+                    ],
+                },
+                headers=headers,
+            )
+            assert opened.status_code == 201, opened.text
+
+            # Drive the account past the daily loss limit by closing the
+            # spread's short leg at a punishing premium... which is itself
+            # a reducing order, so it must be allowed through.
+            hit = client.post(
+                "/options/execute",
+                json={
+                    "strategy_name": "close_short_leg",
+                    "legs": [{"symbol": short_leg.symbol, "direction": "LONG", "quantity": 1, "premium": 2050.0}],
+                },
+                headers=headers,
+            )
+            assert hit.status_code == 201, hit.text
+
+            # The limit is now tripped: a fresh entry must be refused...
+            entry = client.post(
+                "/options/execute",
+                json={
+                    "strategy_name": "new_long_call",
+                    "legs": [{"symbol": short_leg.symbol, "direction": "LONG", "quantity": 1, "premium": 50.0}],
+                },
+                headers=headers,
+            )
+            assert entry.status_code == 403, entry.text
+
+            # ...while the order closing the surviving long leg goes
+            # through. This returned 403 before the fix.
+            close = client.post(
+                "/options/execute",
+                json={
+                    "strategy_name": "close_long_leg",
+                    "legs": [{"symbol": long_leg.symbol, "direction": "SHORT", "quantity": 1, "premium": 110.0}],
+                },
+                headers=headers,
+            )
+            assert close.status_code == 201, close.text
+
+            async with async_session_factory() as db:
+                still_open = (
+                    await db.execute(
+                        select(Position).where(Position.user_id == user_id, Position.is_open.is_(True))
+                    )
+                ).scalars().all()
+            assert still_open == [], "every leg must be closable once the limit trips"
+        finally:
+            await _cleanup(user_id, [long_leg.id, short_leg.id])
+
+
+async def test_a_reducing_options_order_cannot_open_a_leg(require_infra):
+    # The security property behind the exemption. An oversized opposing
+    # leg must be clamped to what is open, so an order that skipped the
+    # entry limits can only flatten -- never open or flip a leg. And an
+    # order mixing a genuine close with a fresh entry is not reducing at
+    # all: it faces the full gate.
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+        long_leg, short_leg = await _make_two_leg_instruments(f"OPTC{uuid.uuid4().hex[:4].upper()}")
+
+        try:
+            assert client.post(
+                "/options/execute",
+                json={
+                    "strategy_name": "long_call",
+                    "legs": [{"symbol": long_leg.symbol, "direction": "LONG", "quantity": 1, "premium": 120.0}],
+                },
+                headers=headers,
+            ).status_code == 201
+
+            # 5 lots against 1 open lot: must flatten, not open a short.
+            oversized = client.post(
+                "/options/execute",
+                json={
+                    "strategy_name": "oversized_close",
+                    "legs": [{"symbol": long_leg.symbol, "direction": "SHORT", "quantity": 5, "premium": 120.0}],
+                },
+                headers=headers,
+            )
+            assert oversized.status_code == 201, oversized.text
+
+            async with async_session_factory() as db:
+                rows = (
+                    await db.execute(
+                        select(Position).where(Position.user_id == user_id, Position.instrument_id == long_leg.id)
+                    )
+                ).scalars().all()
+            assert len(rows) == 1
+            assert float(rows[0].quantity) == pytest.approx(0.0)
+            assert rows[0].is_open is False
+        finally:
+            await _cleanup(user_id, [long_leg.id, short_leg.id])

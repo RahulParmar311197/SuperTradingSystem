@@ -208,10 +208,6 @@ async def execute_options_strategy(
     if not payload.legs:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "At least one leg is required")
 
-    halt_reason = await account_halt_reason(str(user.id))
-    if halt_reason is not None:
-        raise HTTPException(status.HTTP_423_LOCKED, f"New entries are halted for this account: {halt_reason}")
-
     instruments: dict[str, Instrument] = {}
     for leg in payload.legs:
         instrument = (
@@ -281,6 +277,33 @@ async def execute_options_strategy(
         market_data_age_seconds = max(market_data_age_seconds, age)
 
     stack = await _stack_for(user, db)
+
+    # Does every leg oppose an open position in its own instrument? Only
+    # then can this order do nothing but reduce what the account already
+    # holds, and only then may it skip the entry-only limits below.
+    # All-or-nothing on purpose: one leg that opens exposure makes the
+    # whole order an entry, so a fresh position can never ride in
+    # alongside a genuine close. Each reducing leg is additionally clamped
+    # to the open quantity where it is submitted, so an exempted order
+    # cannot open or flip a leg either.
+    #
+    # `POST /options/execute` is the only path that closes an options
+    # position, so an exit refused here is a position the holder cannot
+    # get out of -- the same trap `POST /orders` had.
+    leg_positions = {leg.symbol: stack.position_manager.get(str(user.id), leg.symbol) for leg in payload.legs}
+    is_reducing = bool(payload.legs) and all(
+        (position := leg_positions[leg.symbol]) is not None
+        and position.is_open
+        and position.is_long != (leg.direction == Direction.LONG)
+        for leg in payload.legs
+    )
+
+    halt_reason = await account_halt_reason(str(user.id))
+    if halt_reason is not None and not is_reducing:
+        # Gated on `not is_reducing` to match this message's own wording,
+        # and because reconciliation halts an account precisely when its
+        # positions look wrong -- the worst moment to forbid closing them.
+        raise HTTPException(status.HTTP_423_LOCKED, f"New entries are halted for this account: {halt_reason}")
     # Blueprint §56/§57: rolls stack.trades_today/daily_pnl/weekly_pnl at a
     # day/week boundary -- see _UserTradingStack._roll_risk_window. Without
     # this, an options strategy submitted right after midnight would still
@@ -292,6 +315,7 @@ async def execute_options_strategy(
 
     risk_proposal = OptionsRiskProposal(
         account_id=str(user.id),
+        is_reducing=is_reducing,
         account_balance=(await stack.broker.get_account()).balance,
         current_exposure=current_exposure,
         payoff=payoff,
@@ -363,6 +387,13 @@ async def execute_options_strategy(
 
         idempotency_key = f"{user.id}:{batch_id}:{leg.symbol}"
         total_quantity = leg.quantity * instrument.lot_size
+        if is_reducing and existing_position is not None:
+            # What makes the exemption above safe rather than a hole: an
+            # order that skipped the entry limits can only ever reduce or
+            # flatten each leg, never open or flip one. Without this, a
+            # client could clear every limit by sending an oversized
+            # opposing leg and calling it a close.
+            total_quantity = min(total_quantity, abs(existing_position.quantity))
         order, created = stack.order_manager.create_order(
             idempotency_key, str(user.id), leg.symbol, leg.direction, OrderType.MARKET, total_quantity
         )

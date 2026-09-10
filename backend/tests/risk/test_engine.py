@@ -127,3 +127,79 @@ def test_rejects_when_entry_deviates_from_the_real_market_quote():
     result = RiskEngine().evaluate(proposal)
     assert result.decision == RiskDecision.REJECT
     assert any(c.name == "entry_matches_market" and not c.passed for c in result.checks)
+
+
+def _tripped_proposal(**overrides) -> TradeRiskProposal:
+    """A proposal that fails every entry-only limit at once."""
+    defaults = dict(
+        account_id="acct-1",
+        strategy_id=None,
+        entry=100.0,
+        stop=95.0,
+        account_balance=100_000.0,
+        open_positions=99,
+        trades_today=99,
+        daily_pnl=-50_000.0,
+        weekly_pnl=-50_000.0,
+        current_exposure=10_000_000.0,
+        strategy_allocation=10_000_000.0,
+        correlated_exposure=10_000_000.0,
+        market_data_age_seconds=0.0,
+        broker_healthy=True,
+    )
+    defaults.update(overrides)
+    return TradeRiskProposal(**defaults)
+
+
+def test_a_reducing_proposal_skips_only_the_entry_limits():
+    # An order that can only reduce an existing position takes on no new
+    # risk, so the limits that cap risk-taking must not block it -- but
+    # everything about whether *this* order can execute sanely right now
+    # still applies. Pinning the exact split, not just "it was approved":
+    # a future check added to the wrong side of the fence is the failure
+    # mode this guards.
+    entry_only = {
+        "daily_loss_limit",
+        "weekly_loss_limit",
+        "exposure_limit",
+        "strategy_allocation_limit",
+        "correlated_exposure_limit",
+        "max_open_positions",
+        "max_trades_per_day",
+    }
+    always = {
+        "kill_switch",
+        "valid_stop_distance",
+        "entry_matches_market",
+        "liquidity_acceptable",
+        "market_data_fresh",
+        "broker_healthy",
+        "no_repeated_rejections",
+        "no_abnormal_price_jump",
+    }
+
+    entry_decision = RiskEngine().evaluate(_tripped_proposal())
+    assert entry_decision.decision == RiskDecision.REJECT
+    assert entry_only <= {c.name for c in entry_decision.checks}
+
+    reducing = RiskEngine().evaluate(_tripped_proposal(is_reducing=True))
+    assert reducing.decision == RiskDecision.APPROVE
+    names = {c.name for c in reducing.checks}
+    assert names == always, "a reducing order must run exactly the execution-sanity checks"
+    assert not (names & entry_only)
+
+
+def test_a_reducing_proposal_is_still_stopped_by_the_kill_switch():
+    # The kill switch is a deliberate human stop, not an exposure limit:
+    # it must hold against every order, exits included.
+    kill_switch = KillSwitchState()
+    kill_switch.kill_global()
+    decision = RiskEngine(kill_switch=kill_switch).evaluate(_tripped_proposal(is_reducing=True))
+    assert decision.decision == RiskDecision.REJECT
+    assert "Global kill switch" in decision.reason
+
+
+def test_a_reducing_proposal_is_still_stopped_by_an_unhealthy_broker():
+    decision = RiskEngine().evaluate(_tripped_proposal(is_reducing=True, broker_healthy=False))
+    assert decision.decision == RiskDecision.REJECT
+    assert any(c.name == "broker_healthy" and not c.passed for c in decision.checks)

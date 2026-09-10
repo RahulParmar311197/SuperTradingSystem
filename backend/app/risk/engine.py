@@ -47,6 +47,17 @@ class TradeRiskProposal:
     liquidity_acceptable: bool = True
 
     proposed_quantity: float | None = None  # if None, engine sizes the position
+    # True when this order can only reduce or flatten an existing position
+    # in the opposite direction. The exposure, loss and count limits below
+    # exist to stop an account taking *on* risk, and applying them to an
+    # exit inverts their purpose: a user who hits the daily loss limit
+    # while still holding a losing position would be refused the one order
+    # that ends the loss, and left holding it. Callers must only set this
+    # for an order clamped to at most the open quantity (see
+    # app/api/orders.py), so an exempted order can never open or flip a
+    # position -- otherwise this flag would be a way to launder an entry
+    # past every limit.
+    is_reducing: bool = False
 
 
 def calculate_position_size(
@@ -96,77 +107,88 @@ class RiskEngine:
             )
         position_notional = quantity * proposal.entry
 
-        daily_loss_pct = max(-proposal.daily_pnl, 0) / proposal.account_balance * 100 if proposal.account_balance else 0
-        checks.append(
-            RiskCheck(
-                "daily_loss_limit",
-                daily_loss_pct < limits.max_daily_loss_pct,
-                f"Daily loss {daily_loss_pct:.2f}% vs limit {limits.max_daily_loss_pct}%",
+        # Entry-only limits: everything that caps how much risk the
+        # account may take ON. An order that only reduces an existing
+        # position takes none, so these are skipped rather than
+        # recorded as passed -- the RiskEvent audit row then lists
+        # exactly the checks that actually governed the decision.
+        # Everything outside this block is about whether *this* order
+        # can be executed sanely right now (kill switch, a valid stop,
+        # an entry matching the market, fresh data, a healthy broker,
+        # no abnormal price jump), which applies to exits just as much.
+        if not proposal.is_reducing:
+            daily_loss_pct = max(-proposal.daily_pnl, 0) / proposal.account_balance * 100 if proposal.account_balance else 0
+            checks.append(
+                RiskCheck(
+                    "daily_loss_limit",
+                    daily_loss_pct < limits.max_daily_loss_pct,
+                    f"Daily loss {daily_loss_pct:.2f}% vs limit {limits.max_daily_loss_pct}%",
+                )
             )
-        )
 
-        weekly_loss_pct = max(-proposal.weekly_pnl, 0) / proposal.account_balance * 100 if proposal.account_balance else 0
-        checks.append(
-            RiskCheck(
-                "weekly_loss_limit",
-                weekly_loss_pct < limits.max_weekly_loss_pct,
-                f"Weekly loss {weekly_loss_pct:.2f}% vs limit {limits.max_weekly_loss_pct}%",
+            weekly_loss_pct = max(-proposal.weekly_pnl, 0) / proposal.account_balance * 100 if proposal.account_balance else 0
+            checks.append(
+                RiskCheck(
+                    "weekly_loss_limit",
+                    weekly_loss_pct < limits.max_weekly_loss_pct,
+                    f"Weekly loss {weekly_loss_pct:.2f}% vs limit {limits.max_weekly_loss_pct}%",
+                )
             )
-        )
 
-        projected_exposure_pct = (
-            (proposal.current_exposure + position_notional) / proposal.account_balance * 100
-            if proposal.account_balance
-            else 100.0
-        )
-        checks.append(
-            RiskCheck(
-                "exposure_limit",
-                projected_exposure_pct <= limits.max_exposure_pct,
-                f"Projected exposure {projected_exposure_pct:.2f}% vs limit {limits.max_exposure_pct}%",
+            projected_exposure_pct = (
+                (proposal.current_exposure + position_notional) / proposal.account_balance * 100
+                if proposal.account_balance
+                else 100.0
             )
-        )
+            checks.append(
+                RiskCheck(
+                    "exposure_limit",
+                    projected_exposure_pct <= limits.max_exposure_pct,
+                    f"Projected exposure {projected_exposure_pct:.2f}% vs limit {limits.max_exposure_pct}%",
+                )
+            )
 
-        strategy_allocation_pct = (
-            (proposal.strategy_allocation + position_notional) / proposal.account_balance * 100
-            if proposal.account_balance
-            else 100.0
-        )
-        checks.append(
-            RiskCheck(
-                "strategy_allocation_limit",
-                strategy_allocation_pct <= limits.max_strategy_allocation_pct,
-                f"Strategy allocation {strategy_allocation_pct:.2f}% vs limit {limits.max_strategy_allocation_pct}%",
+            strategy_allocation_pct = (
+                (proposal.strategy_allocation + position_notional) / proposal.account_balance * 100
+                if proposal.account_balance
+                else 100.0
             )
-        )
+            checks.append(
+                RiskCheck(
+                    "strategy_allocation_limit",
+                    strategy_allocation_pct <= limits.max_strategy_allocation_pct,
+                    f"Strategy allocation {strategy_allocation_pct:.2f}% vs limit {limits.max_strategy_allocation_pct}%",
+                )
+            )
 
-        correlated_exposure_pct = (
-            (proposal.correlated_exposure + position_notional) / proposal.account_balance * 100
-            if proposal.account_balance
-            else 100.0
-        )
-        checks.append(
-            RiskCheck(
-                "correlated_exposure_limit",
-                correlated_exposure_pct <= limits.max_correlated_exposure_pct,
-                f"Correlated exposure {correlated_exposure_pct:.2f}% vs limit {limits.max_correlated_exposure_pct}%",
+            correlated_exposure_pct = (
+                (proposal.correlated_exposure + position_notional) / proposal.account_balance * 100
+                if proposal.account_balance
+                else 100.0
             )
-        )
+            checks.append(
+                RiskCheck(
+                    "correlated_exposure_limit",
+                    correlated_exposure_pct <= limits.max_correlated_exposure_pct,
+                    f"Correlated exposure {correlated_exposure_pct:.2f}% vs limit {limits.max_correlated_exposure_pct}%",
+                )
+            )
 
-        checks.append(
-            RiskCheck(
-                "max_open_positions",
-                proposal.open_positions < limits.max_open_positions,
-                f"{proposal.open_positions} open vs limit {limits.max_open_positions}",
+            checks.append(
+                RiskCheck(
+                    "max_open_positions",
+                    proposal.open_positions < limits.max_open_positions,
+                    f"{proposal.open_positions} open vs limit {limits.max_open_positions}",
+                )
             )
-        )
-        checks.append(
-            RiskCheck(
-                "max_trades_per_day",
-                proposal.trades_today < limits.max_trades_per_day,
-                f"{proposal.trades_today} trades today vs limit {limits.max_trades_per_day}",
+            checks.append(
+                RiskCheck(
+                    "max_trades_per_day",
+                    proposal.trades_today < limits.max_trades_per_day,
+                    f"{proposal.trades_today} trades today vs limit {limits.max_trades_per_day}",
+                )
             )
-        )
+
         checks.append(RiskCheck("liquidity_acceptable", proposal.liquidity_acceptable))
         checks.append(
             RiskCheck(

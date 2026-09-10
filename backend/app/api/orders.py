@@ -228,14 +228,32 @@ async def place_order(
     user: User = Depends(require_permission(TradingPermission.LIVE_TRADE)),
     db: AsyncSession = Depends(get_db),
 ) -> OrderResponse:
-    halt_reason = await account_halt_reason(str(user.id))
-    if halt_reason is not None:
-        raise HTTPException(status.HTTP_423_LOCKED, f"New entries are halted for this account: {halt_reason}")
-
     instrument = await _get_instrument_by_symbol(db, payload.symbol)
 
     stack = await _stack_for(user, db)
     stack._roll_risk_window(datetime.now(timezone.utc))
+
+    # Does this order oppose an open position -- i.e. can it only reduce or
+    # flatten it? Established here, before the halt check and the risk gate,
+    # because both of them are entry controls and both used to be applied
+    # to exits as well. `POST /orders` is the only way to leave a position
+    # (app/api/positions.py and app/api/portfolio.py are read-only, and
+    # `POST /orders/{id}/cancel` refuses anything already filled), so an
+    # exit refused here is a position the user cannot get out of at all.
+    existing = stack.position_manager.get(str(user.id), payload.symbol)
+    is_reducing = (
+        existing is not None
+        and existing.is_open
+        and existing.is_long != (payload.direction == Direction.LONG)
+    )
+
+    halt_reason = await account_halt_reason(str(user.id))
+    if halt_reason is not None and not is_reducing:
+        # Matches this message's own wording: a halt stops *new entries*.
+        # Reconciliation halts an account precisely when something looks
+        # wrong with its positions (app/workers/reconciliation_worker.py),
+        # which is the worst possible moment to also forbid closing them.
+        raise HTTPException(status.HTTP_423_LOCKED, f"New entries are halted for this account: {halt_reason}")
     if isinstance(stack.broker, MockBroker):
         # Only MockBroker needs a quote fed in — a real broker gets its
         # own price from the market, not from what the client submitted
@@ -267,8 +285,21 @@ async def place_order(
         open_position_notionals=other_position_notionals,
         threshold=stack.risk_engine.limits.correlation_threshold,
     )
+    quantity = calculate_position_size(
+        account.balance, stack.risk_engine.limits.risk_per_trade_pct, payload.entry, payload.stop, stack.risk_engine.limits.max_position_size
+    )
+    if is_reducing:
+        # Clamped to what is actually open, which is what makes the
+        # exemption below safe: an order that skips the entry limits can
+        # then only ever reduce or flatten, never open or flip. Without
+        # this, `is_reducing` would be a way to launder a fresh entry past
+        # every exposure, loss and count limit by sending it as a larger
+        # opposing order.
+        quantity = min(quantity, abs(existing.quantity))
     proposal = TradeRiskProposal(
         account_id=str(user.id),
+        proposed_quantity=quantity,
+        is_reducing=is_reducing,
         strategy_id=None,
         entry=payload.entry,
         stop=payload.stop,
@@ -335,9 +366,6 @@ async def place_order(
         )
         raise HTTPException(status.HTTP_403_FORBIDDEN, f"Risk engine rejected this trade: {decision.reason}")
 
-    quantity = calculate_position_size(
-        account.balance, stack.risk_engine.limits.risk_per_trade_pct, payload.entry, payload.stop, stack.risk_engine.limits.max_position_size
-    )
     idempotency_key = f"{user.id}:{payload.symbol}:{payload.direction.value}:{payload.entry}:{payload.stop}"
     order, created = stack.order_manager.create_order(
         idempotency_key, str(user.id), payload.symbol, payload.direction, payload.order_type, quantity, payload.price

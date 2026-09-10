@@ -1146,3 +1146,151 @@ async def test_cancel_order_broker_failure_is_surfaced_cleanly_and_leaves_status
             assert order["status"] == "ACKNOWLEDGED"
         finally:
             await _cleanup(user_id, instrument_id)
+
+
+async def test_a_position_can_still_be_closed_after_the_daily_loss_limit_trips(require_infra):
+    # Regression test: `RiskEngine.evaluate` was run on every order, and
+    # every one of its exposure/loss/count checks is an *entry* check --
+    # `max_open_positions` is literally phrased "N open vs limit M". So a
+    # user who tripped the daily loss limit while still holding a losing
+    # position was refused the one order that would end the loss, and left
+    # holding it. `POST /orders` is the only way out: app/api/positions.py
+    # and app/api/portfolio.py are read-only, and `POST /orders/{id}/cancel`
+    # refuses anything already filled. The risk gate ran ~50 lines before
+    # the request path even looked up `existing_position`, so it could not
+    # have known the order was an exit.
+    #
+    # The existing daily-loss test cannot reach this state: it opens and
+    # closes the *same* instrument, so the account is flat by the time the
+    # limit trips, and its third order is a fresh entry.
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        async with async_session_factory() as db:
+            keeper = Instrument(
+                symbol=f"KEEP{uuid.uuid4().hex[:6].upper()}", exchange="NSE", market=MarketType.EQUITY, instrument_type="EQ"
+            )
+            loser = Instrument(
+                symbol=f"LOSE{uuid.uuid4().hex[:6].upper()}", exchange="NSE", market=MarketType.EQUITY, instrument_type="EQ"
+            )
+            db.add_all([keeper, loser])
+            await db.commit()
+            await db.refresh(keeper)
+            await db.refresh(loser)
+            keeper_id, loser_id = keeper.id, loser.id
+
+        try:
+            # Two open longs, 100 shares each (0.5% of 100,000 over a 5-wide stop).
+            for symbol in (keeper.symbol, loser.symbol):
+                assert client.post(
+                    "/orders",
+                    json={"symbol": symbol, "direction": "LONG", "entry": 100.0, "stop": 95.0},
+                    headers=headers,
+                ).status_code == 201
+
+            # Close the loser at 50: a 5,000 realized loss, 5% of the
+            # account against the 2% daily limit.
+            assert client.post(
+                "/orders",
+                json={"symbol": loser.symbol, "direction": "SHORT", "entry": 50.0, "stop": 55.0},
+                headers=headers,
+            ).status_code == 201
+
+            # The limit is now genuinely tripped -- a fresh entry is refused.
+            entry = client.post(
+                "/orders",
+                json={"symbol": keeper.symbol, "direction": "LONG", "entry": 90.0, "stop": 85.0},
+                headers=headers,
+            )
+            assert entry.status_code == 403, entry.text
+            assert "Daily loss" in entry.text
+
+            # ...but the order that CLOSES the remaining position must go
+            # through. This returned 403 before the fix, leaving the user
+            # holding a losing position with no way out until the UTC day
+            # rolled over -- after the NSE session had closed.
+            close = client.post(
+                "/orders",
+                json={"symbol": keeper.symbol, "direction": "SHORT", "entry": 99.0, "stop": 104.0},
+                headers=headers,
+            )
+            assert close.status_code == 201, close.text
+
+            async with async_session_factory() as db:
+                still_open = (
+                    await db.execute(
+                        select(Position).where(Position.user_id == user_id, Position.is_open.is_(True))
+                    )
+                ).scalars().all()
+            assert still_open == [], "the account must be flat once the closing order fills"
+        finally:
+            await _cleanup(user_id, keeper_id)
+            async with async_session_factory() as db:
+                await db.execute(delete(Instrument).where(Instrument.id == loser_id))
+                await db.commit()
+
+
+async def test_a_reducing_order_cannot_be_used_to_open_a_position(require_infra):
+    # The security property that makes the exemption above safe. Skipping
+    # the entry limits for an opposing order would otherwise be a way to
+    # launder a fresh entry past every exposure, loss and count limit by
+    # sending it as a larger opposing order, so the sized quantity is
+    # clamped to what is actually open: such an order can only reduce or
+    # flatten, never open or flip.
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        async with async_session_factory() as db:
+            keeper = Instrument(
+                symbol=f"CLMP{uuid.uuid4().hex[:6].upper()}", exchange="NSE", market=MarketType.EQUITY, instrument_type="EQ"
+            )
+            loser = Instrument(
+                symbol=f"CLML{uuid.uuid4().hex[:6].upper()}", exchange="NSE", market=MarketType.EQUITY, instrument_type="EQ"
+            )
+            db.add_all([keeper, loser])
+            await db.commit()
+            await db.refresh(keeper)
+            await db.refresh(loser)
+            keeper_id, loser_id = keeper.id, loser.id
+
+        try:
+            for symbol in (keeper.symbol, loser.symbol):
+                assert client.post(
+                    "/orders",
+                    json={"symbol": symbol, "direction": "LONG", "entry": 100.0, "stop": 95.0},
+                    headers=headers,
+                ).status_code == 201
+            assert client.post(
+                "/orders",
+                json={"symbol": loser.symbol, "direction": "SHORT", "entry": 50.0, "stop": 55.0},
+                headers=headers,
+            ).status_code == 201  # limit now tripped
+
+            # A 1-wide stop sizes this at 500 units against an open 100 --
+            # unclamped it would flatten the long and open a fresh 400-unit
+            # short, having skipped every limit on the way through.
+            oversized = client.post(
+                "/orders",
+                json={"symbol": keeper.symbol, "direction": "SHORT", "entry": 100.0, "stop": 101.0},
+                headers=headers,
+            )
+            assert oversized.status_code == 201, oversized.text
+
+            async with async_session_factory() as db:
+                rows = (
+                    await db.execute(
+                        select(Position).where(Position.user_id == user_id, Position.instrument_id == keeper_id)
+                    )
+                ).scalars().all()
+            assert len(rows) == 1
+            # Flat, not short: the exemption reduced the position to zero
+            # and stopped there.
+            assert float(rows[0].quantity) == pytest.approx(0.0)
+            assert rows[0].is_open is False
+        finally:
+            await _cleanup(user_id, keeper_id)
+            async with async_session_factory() as db:
+                await db.execute(delete(Instrument).where(Instrument.id == loser_id))
+                await db.commit()

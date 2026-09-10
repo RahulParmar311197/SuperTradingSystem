@@ -4059,6 +4059,96 @@ with Monday's open and Friday's close. Pre-fix the first maps Monday to
 2026-01-01, the second disagrees on the Sunday/Monday pair, and the third
 produces two bars instead of one.
 
+## The risk gate locked users into losing positions (§56-57)
+
+`RiskEngine.evaluate` runs on every order `POST /orders` receives, and
+every one of its exposure, loss and count checks is an **entry** check --
+`max_open_positions` is literally phrased `f"{proposal.open_positions} open
+vs limit {limits.max_open_positions}"`. `TradeRiskProposal` carried nothing
+saying whether an order opens exposure or reduces it, and the gate ran
+about fifty lines before the request path looked up `existing_position`,
+so it could not have known.
+
+The result inverts the purpose of the limits. Reproduced end to end
+through the API on default limits (0.5% per trade, 2% daily loss):
+
+```
+open A (long 100)                  -> 201
+open B (long 100)                  -> 201
+close B at a 5,000 loss            -> 201
+CLOSE A (the exit that matters)    -> 403 Daily loss 5.00% vs limit 2.0%
+still open: [(100.0, 'A')]
+```
+
+The user is now holding a losing position and is refused the one order
+that would end the loss. This is not recoverable by another route:
+`POST /orders` is the only way out, since `app/api/positions.py` and
+`app/api/portfolio.py` are read-only and `POST /orders/{id}/cancel`
+rejects anything not still `SUBMITTED`/`ACKNOWLEDGED`. There is no live
+stop enforcement either (recorded elsewhere in this document), so nothing
+else will close it. `_UserTradingStack.daily_pnl` clears only at a **UTC**
+day boundary, which for an NSE session (03:45-10:00 UTC) falls after the
+close -- so the position is frozen for the rest of the trading day while
+its loss runs on.
+
+`max_open_positions` and `max_trades_per_day` trap the same way: at five
+open positions no sixth order can be placed, including the one that closes
+the fifth; after ten orders in a day, nothing can be exited. And the halt
+check returns 423 `"New entries are halted for this account"` for exits
+too -- reconciliation halts an account precisely when its positions look
+wrong, which is the worst moment to also forbid closing them.
+
+The fix establishes, before both the halt check and the gate, whether the
+order opposes an open position, and treats such an order as reducing:
+
+- Its sized quantity is clamped to `abs(existing.quantity)`. This is what
+  makes the exemption safe rather than a hole -- an exempted order can
+  then only reduce or flatten, never open or flip. Without the clamp,
+  `is_reducing` would be a way to launder a fresh entry past every limit
+  by sending it as a larger opposing order.
+- `TradeRiskProposal.is_reducing` skips exactly the seven entry-only
+  checks: `daily_loss_limit`, `weekly_loss_limit`, `exposure_limit`,
+  `strategy_allocation_limit`, `correlated_exposure_limit`,
+  `max_open_positions`, `max_trades_per_day`. They are skipped rather than
+  recorded as passed, so the `RiskEvent` audit row lists exactly the
+  checks that actually governed the decision.
+- Everything about whether *this* order can execute sanely right now still
+  applies: `kill_switch` (a deliberate human stop), `valid_stop_distance`,
+  `entry_matches_market`, `liquidity_acceptable`, `market_data_fresh`,
+  `broker_healthy`, `no_repeated_rejections`, `no_abnormal_price_jump`.
+- The halt check is gated on `not is_reducing`, matching its own wording.
+
+One behaviour change falls out of the clamp: a single order can no longer
+flip a position from long to short. It flattens instead, and the new entry
+is a separate, fully-checked order. That is the correct shape -- the
+opening half of a flip is an entry and should face the entry limits.
+
+**Not fixed here:** `POST /options/execute` has the same defect, running
+`evaluate_options_risk` unconditionally on closing legs. It is left for
+its own change rather than half-done: a multi-leg order needs its own
+definition of "reduces exposure" (what if two legs close and one opens?),
+and guessing at that inside this change would be worse than naming it.
+
+Why the tests missed it: `test_daily_loss_limit_is_enforced_after_a_real_realized_loss`
+looks exactly like coverage of this state and cannot reach it -- it opens
+and closes the *same* instrument, so the account is flat when the limit
+trips, and its third order is a fresh entry.
+`test_place_and_close_order_persists_to_database` does close a position,
+but with `daily_pnl` 0 and one position open, so every entry gate passes
+anyway. And `tests/risk/test_engine.py`'s limit tests could not express
+"this is an exit" at all, so they structurally could not tell correct
+behaviour from broken. No test anywhere placed a closing order while a
+limit was tripped.
+
+Five tests now do. Two at the API: a second position must still be
+closable once the daily loss limit trips (403 pre-fix), and an oversized
+opposing order must leave the account flat rather than short, proving the
+clamp holds. Three at the engine: a reducing proposal against a fixture
+that fails *every* entry limit must be approved and must run exactly the
+execution-sanity set -- asserted as set equality, so a future check added
+on the wrong side of the fence fails the test -- and must still be stopped
+by the kill switch and by an unhealthy broker.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

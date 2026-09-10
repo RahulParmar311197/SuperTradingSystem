@@ -4622,6 +4622,75 @@ holder with an open position can still close it after someone re-registers
 the symbol), the database constraint itself independent of the API, and a
 control that distinct symbols still register normally.
 
+## Disconnecting a broker account that has traded (§70, §120)
+
+`DELETE /brokers/{account_id}` hard-deleted the `broker_accounts` row.
+That worked for as long as `orders.broker_account_id` was NULL for every
+row -- which it was, until `resolve_broker` started returning the account
+id so a placed order could be traced back to the account that executed it.
+From that point every order stamped the column, the foreign key
+(`ON DELETE NO ACTION`, verified against `pg_constraint` on the running
+database rather than inferred) began refusing the delete, and the
+resulting `IntegrityError` went uncaught into the catch-all handler:
+
+```
+POST /brokers/connect {"broker":"PAPER","credentials":{}}   201
+DELETE /brokers/{id}          (no orders yet)               204
+POST /brokers/connect                                       201
+POST /orders                                                201
+  orders.broker_account_id -> the connected account
+DELETE /brokers/{id}          (after one order)             500
+GET /brokers                  -> still ACTIVE
+```
+
+So the endpoint failed for exactly the accounts it matters for: the ones
+that have actually traded, which are the ones a user most wants to revoke
+after a leaked token or when switching brokers. `BrokerName.PAPER` stamps
+its id too, so reaching this needs no real broker credentials at all. And
+there is no other endpoint that disables a broker account -- a user could
+connect several and disconnect none of them.
+
+The fix is a soft disconnect: mark the row `DISCONNECTED` and scrub its
+credentials, rather than deleting it. Every piece of that already existed
+and was simply never written to. `BrokerAccountStatus.DISCONNECTED` was a
+declared-but-unused enum member (nothing in `app/` assigned it),
+`resolve_broker` already selects only `status == ACTIVE` -- falling
+through to the next active account or `MockBroker` -- and
+`tests/trading/test_broker_resolver.py::test_disconnected_account_is_ignored`
+already asserted that behaviour against a status nothing produced.
+
+The two alternatives were both worse. A delete cascade, or
+`ON DELETE SET NULL` on the FK, destroys precisely the per-order audit
+trail that `broker_account_id` was added to provide.
+
+The credentials are cleared because the hard delete removed them as a side
+effect, so a naive soft-delete would have silently regressed the security
+posture of an endpoint whose likely trigger is a compromised token.
+`encrypt_credentials({})` keeps the NOT NULL column valid, and
+`resolve_broker` only ever decrypts an ACTIVE account, so a scrubbed row
+is never read back; reconnecting creates a fresh row.
+
+Two properties worth stating. The operation is idempotent -- disconnecting
+an already-disconnected account is another 204, not a 404, because the row
+is still there. And a trading stack already built for this user in this
+process keeps its resolved broker until the process restarts, which is the
+same limitation `_stack_for` in `app/api/orders.py` already documents for
+connects; this change does not alter that, and closing it would mean
+invalidating the in-memory stack cache, which is a separate piece of work.
+
+Coverage was absent: `grep "client.delete"` across the suite hits only
+`/replay/{id}`, `/paper/{id}` and three admin kill-switch keys --
+`DELETE /brokers/{account_id}` had no test of any kind. The suite's own
+cleanup helpers delete orders before broker accounts and *have* to, so the
+ordering constraint was understood by the tests and simply never asserted
+against the endpoint. The new `tests/api/test_brokers_disconnect.py`
+covers the account-with-orders case (asserting first that the order really
+does reference the account, so the test cannot pass without exercising the
+bug), the status/credential-scrub result, idempotency, and a control that
+one user cannot disconnect another's account. Pre-fix the first three fail
+with `ForeignKeyViolationError: ... is still referenced from table
+"orders"`.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

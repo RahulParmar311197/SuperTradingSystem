@@ -4919,6 +4919,99 @@ rather than an index error. It drives `_process` directly for one triple
 rather than `run_once()`, which would iterate every active instrument in
 the database.
 
+## The shared risk window was reset by any instrument whose feed ran behind (§56-57)
+
+Two sections above describe getting the daily/weekly risk counters to
+accumulate and then to reset at calendar boundaries. `RiskWindow`
+(`app/paper/engine.py`) is where that reset lives for the autonomous
+path, and `AutoTradeSupervisor` keeps **one per user**
+(`self._risk_windows`, `app/workers/auto_trade_worker.py`) precisely
+because `max_trades_per_day`, `daily_loss_limit` and `weekly_loss_limit`
+are account-wide: a user trading N instruments across M strategies gets
+one engine per triple, and a counter held on an engine would be a
+per-triple counter, giving them N*M times the cap they configured.
+
+That sharing is right, but it hands the object a clock it cannot trust.
+`PaperTradingEngine.on_candle` rolls the window with `candle.timestamp`
+— its logical clock, the same convention `detect_session_levels` uses —
+and it does so as its *first* statement, before the open-position early
+return and before the `len(self.candles) < 3` guard. So the one shared
+window is driven by N different instruments' feeds. Those are not
+synchronised with one another, `run_once` selects active instruments with
+no `ORDER BY` so the iteration order is arbitrary, and an instrument can
+simply be behind: illiquid and yet to print a bar today, mid-backfill, or
+halted. Its "latest" candle is then genuinely older than the one another
+instrument has already established the window at.
+
+`roll` compared with `!=`:
+
+```python
+if self.risk_day is not None and today != self.risk_day:
+    self.trades_today = 0
+    self.daily_pnl = 0.0
+```
+
+which makes a step *backwards* indistinguishable from a new day. One bar
+from a lagging instrument zeroed `trades_today` and `daily_pnl` for the
+whole account, mid-session, handing back the entire risk budget it had
+already spent. Reproduced through `POST /paper/{id}/candle`, driving a
+real stop-loss so the engine accumulated the loss itself rather than
+having one injected:
+
+```
+STEP 1  entry + stop-loss on day D  -> trades_today=1  daily_pnl=-500.00  risk_day=2026-01-05
+        daily_loss_pct the gate sees = 0.50% (cap 2.00%)
+STEP 2  ONE candle dated D-1        -> trades_today=0  daily_pnl=0.00     risk_day=2026-01-04
+        daily_loss_pct the gate sees = 0.00%  <- the halt can no longer fire
+```
+
+The fix is not simply `>` in place of `!=`. The marks are now high-water
+marks that only ever move forward:
+
+```python
+if self.risk_day is None:
+    self.risk_day = today
+elif today > self.risk_day:
+    self.trades_today = 0
+    self.daily_pnl = 0.0
+    self.risk_day = today
+```
+
+Guarding only the reset while still assigning `self.risk_day = today`
+unconditionally leaves the mark tracking "the last timestamp seen", so
+the lagging instrument rewinds it and the *next* bar from the up-to-date
+instrument compares against the rewound value, reads as a fresh day and
+resets after all — and with N instruments this alternates, wiping the
+counters repeatedly. That variant was written out and run against the new
+tests to confirm it: it still fails three of the seven.
+
+`None` continues to mean "no window established yet", so a freshly
+constructed window adopts whatever clock it is first shown, in either
+direction, without treating it as a boundary crossing.
+
+**Left alone deliberately:** `_UserTradingStack._roll_risk_window`
+(`app/api/orders.py`), the sibling this mirrors, keeps its `!=`
+comparison. It is fed `datetime.now(timezone.utc)` — one monotonic wall
+clock per account, not N instrument feeds — so it cannot exhibit this,
+and the two paths' clock disciplines are genuinely different rather than
+accidentally divergent. Changing it would be a speculative edit to a path
+with no demonstrated failure.
+
+Why the suite could not see this. `tests/workers/test_auto_trade_worker.py::
+test_supervisor_caps_trades_per_day_account_wide_across_instruments` is
+the one fixture with two instruments sharing a window — and it writes the
+*same* `candles[i]` object to both, so both engines always roll with an
+identical timestamp and `roll` is a permanent no-op. It varies everything
+about the two-instrument case except the one thing that matters. The only
+other tests of the reset (`tests/paper/test_engine.py::
+test_paper_engine_resets_daily_and_weekly_counters_at_boundaries` and
+`tests/api/test_orders.py::test_risk_window_rolls_at_day_and_week_boundaries`)
+only ever advance the clock and assert *that* the counters reset; that a
+backwards step must **not** reset them is a contract neither states.
+`tests/paper/test_risk_window.py` covers it now, including the alternating
+lagging/forward sequence and the two-engine shared-window case driven
+through `on_candle` itself.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

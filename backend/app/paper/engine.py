@@ -8,7 +8,7 @@ rejections are simulated by the underlying `MockBroker`).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from typing import Literal
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -98,10 +98,12 @@ class RiskWindow:
     daily_pnl: float = 0.0
     weekly_pnl: float = 0.0
     repeated_rejections: int = 0
-    # `None` means "no window established yet", so the first candle never
-    # wrongly resets a freshly constructed window.
-    risk_day: object | None = None
-    risk_week: object | None = None
+    # High-water marks, not "the last timestamp seen": `roll` only ever
+    # advances them (see below). `None` means "no window established yet",
+    # so the first candle never wrongly resets a freshly constructed
+    # window.
+    risk_day: date | None = None
+    risk_week: tuple[int, int] | None = None
 
     def roll(self, now: datetime) -> None:
         """Resets `trades_today`/`daily_pnl` at a day boundary and
@@ -113,16 +115,37 @@ class RiskWindow:
         lifetime-of-process limits rather than the rolling limits they are
         meant to be -- see docs/ARCHITECTURE.md. Mirrors
         `_UserTradingStack._roll_risk_window` (app/api/orders.py), which
-        does the same thing keyed off wall clock instead."""
+        does the same thing keyed off wall clock instead.
+
+        Only a timestamp *later* than the window rolls it, and the stored
+        marks only ever move forward. That matters because the clock
+        driving this object is not monotonic: `AutoTradeSupervisor` shares
+        one `RiskWindow` per user across one engine per (strategy,
+        instrument) triple, and each engine rolls it with its *own*
+        instrument's latest candle timestamp. Those timestamps are neither
+        synchronised nor iterated in any defined order, so an instrument
+        whose feed lags -- an illiquid symbol with no bar yet today, a
+        backfill, a halted symbol -- hands this window an older date than
+        the one already established. Treating that as a boundary crossing
+        would zero the account-wide daily counters mid-session and hand
+        back the `max_trades_per_day` / `daily_loss_limit` budget the
+        account had already spent. Advancing the marks backwards would be
+        just as wrong even with a `>` guard on the reset: the next roll
+        from the up-to-date instrument would then compare against the
+        rewound mark, read as a fresh day, and reset after all."""
         today = now.date()
         this_week = now.isocalendar()[:2]
-        if self.risk_day is not None and today != self.risk_day:
+        if self.risk_day is None:
+            self.risk_day = today
+        elif today > self.risk_day:
             self.trades_today = 0
             self.daily_pnl = 0.0
-        if self.risk_week is not None and this_week != self.risk_week:
+            self.risk_day = today
+        if self.risk_week is None:
+            self.risk_week = this_week
+        elif this_week > self.risk_week:
             self.weekly_pnl = 0.0
-        self.risk_day = today
-        self.risk_week = this_week
+            self.risk_week = this_week
 
 
 class PaperTradingEngine:

@@ -1,7 +1,10 @@
+from dataclasses import replace
+
 from app.ict.engine import ICTConfig, ICTEngine
 from app.smc.engine import SMCConfig, SMCEngine
 from app.strategy.context import EvaluationContext
 from app.strategy.dsl import Condition, ConditionType, EntryConfig, RiskConfig, StrategyDefinition
+from app.smc.types import PremiumDiscountZone
 from app.strategy.engine import StrategyEngine
 from tests.smc.conftest import make_candles
 
@@ -161,3 +164,43 @@ def test_strategy_fails_when_required_condition_missing():
     result = StrategyEngine().evaluate(strategy, context)
     assert result.matched is False
     assert result.missing
+
+
+def test_direction_polarity_is_pinned_for_both_biases():
+    # Nothing in this file exercised the bearish branch -- all four tests
+    # above pin `direction="bullish"` -- so the polarity of the
+    # `is_bullish` fork was never asserted at all. That is the fork the
+    # unvalidated `direction` field routed into: any value that was not
+    # literally "bullish" fell through to bearish, so a strategy declared
+    # "LONG" produced stop *above* entry and target *below* it, and the
+    # paper and autonomous engines opened a short from it.
+    #
+    # The DSL now rejects that input outright (tests/strategy/test_dsl.py),
+    # so this pins the other half: each valid bias must bracket its entry
+    # on the correct side, and the two must be genuine mirror images.
+    smc = SMCEngine(SMCConfig(swing_length=2)).analyze(make_candles(BULLISH_SETUP))
+    smc = replace(smc, dealing_range=PremiumDiscountZone(range_high=120.0, range_low=90.0))
+    context = EvaluationContext(
+        symbol="TESTSYM", timeframe="15m", timestamp=make_candles(BULLISH_SETUP)[-1].timestamp,
+        current_price=100.0, smc=smc, ict=None,
+    )
+
+    def _evaluate(direction: str):
+        strategy = StrategyDefinition(
+            name="Polarity", market="TESTSYM", timeframe="15m", direction=direction,
+            conditions=[], entry=EntryConfig(type="market"),
+            risk=RiskConfig(risk_percent=1.0, minimum_rr=2.0),
+        )
+        return StrategyEngine().evaluate(strategy, context)
+
+    long_signal = _evaluate("bullish")
+    assert long_signal.matched
+    assert long_signal.stop < long_signal.entry < long_signal.target
+
+    short_signal = _evaluate("bearish")
+    assert short_signal.matched
+    assert short_signal.target < short_signal.entry < short_signal.stop
+
+    # Mirror images about the same entry, at the same R multiple.
+    assert long_signal.entry == short_signal.entry
+    assert long_signal.risk_reward == short_signal.risk_reward

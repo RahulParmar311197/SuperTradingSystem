@@ -78,6 +78,20 @@ class MockBroker(Broker):
                 return OrderResult(broker_order_id, OrderStatus.REJECTED, rejection_reason="Simulated rejection")
 
         fill_price = self._resolve_fill_price(request)
+        if fill_price is None:
+            reason = f"No usable price for a {request.order_type.value} order on {request.symbol}"
+            order = BrokerOrder(
+                broker_order_id=broker_order_id,
+                symbol=request.symbol,
+                direction=request.direction,
+                order_type=request.order_type,
+                quantity=request.quantity,
+                price=request.price,
+                status=OrderStatus.REJECTED,
+                updated_at=datetime.now(timezone.utc),
+            )
+            self._orders[broker_order_id] = order
+            return OrderResult(broker_order_id, OrderStatus.REJECTED, rejection_reason=reason)
 
         filled_quantity = request.quantity
         if self.partial_fill_probability > 0:
@@ -109,12 +123,25 @@ class MockBroker(Broker):
             average_fill_price=fill_price,
         )
 
-    def _resolve_fill_price(self, request: OrderRequest) -> float:
+    def _resolve_fill_price(self, request: OrderRequest) -> float | None:
+        """The price this order fills at, or None when there isn't one.
+
+        Returning None fails the order closed rather than inventing a
+        fill the market never offered. `request.price or 0.0` used to
+        resolve a LIMIT order carrying no limit price to **0.0**, and a
+        fill at zero is not a cheap fill -- it corrupts the position's
+        average price, reports the position as zero exposure, and turns
+        its eventual close into a fabricated profit. A caller that cannot
+        say what price it wants gets a rejection it can see, not a
+        position it cannot explain.
+        """
         if request.order_type == OrderType.MARKET:
             quote = self._quotes.get(request.symbol)
-            base_price = quote.ltp if quote else (request.price or 0.0)
+            base_price = quote.ltp if quote else request.price
         else:
-            base_price = request.price or 0.0
+            base_price = request.price
+        if not base_price or base_price <= 0:
+            return None
         slippage = base_price * (self.slippage_pct / 100)
         return base_price + slippage if request.direction.value == "LONG" else base_price - slippage
 

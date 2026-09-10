@@ -27,7 +27,20 @@ class Instrument(Base):
     __tablename__ = "instruments"
 
     id: Mapped[uuid.UUID] = uuid_pk()
-    symbol: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    # Unique, not merely indexed. Every reader of this table looks an
+    # instrument up by symbol alone and calls `.scalar_one_or_none()` --
+    # app/api/orders.py's `_get_instrument_by_symbol`, app/api/options.py's
+    # per-leg lookup, app/risk/portfolio.py's `compute_correlated_exposure`
+    # and app/trading/portfolio_snapshots.py -- so "exactly one row per
+    # symbol" is already the operative contract; it just was not enforced
+    # anywhere. A second row made every one of them raise
+    # `MultipleResultsFound`, i.e. a 500.
+    #
+    # Note this makes `symbol` globally unique rather than unique per
+    # exchange. That matches what the readers do (none of them qualifies by
+    # `exchange`), and listing the same ticker on two exchanges would need
+    # those five call sites changed, not just this constraint.
+    symbol: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
     exchange: Mapped[str] = mapped_column(String(32), nullable=False)
     market: Mapped[MarketType] = mapped_column(Enum(MarketType, name="market_type"), nullable=False)
     instrument_type: Mapped[str] = mapped_column(String(32), nullable=False)

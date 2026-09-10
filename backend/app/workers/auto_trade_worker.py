@@ -178,6 +178,51 @@ class AutoTradeSupervisor:
             return None
         self._last_candle_seen[key] = latest.timestamp
 
+        # Seed a freshly-built engine with the stored history behind
+        # `latest`, so its first evaluation analyses the same series every
+        # other component analyses.
+        #
+        # `PaperTradingEngine` keeps its own `self.candles`, starts it
+        # empty, appends one bar per `on_candle`, and runs
+        # `smc_engine.analyze(self.candles)` over *that* list. This
+        # supervisor already loads the whole stored series a few lines
+        # above and then passed only `candles[-1]`, so the analysis window
+        # was not the instrument's history -- it was however long this
+        # process had been running. Every sibling passes the full series:
+        # `ScannerWorker`, `POST /scanner`, `GET /charts/{id}/smc`,
+        # `POST /backtest`, `POST /replay`, `POST /ai/analyze`.
+        #
+        # That is not a warm-up that clears in three bars.
+        # `detect_session_levels` only emits a PREVIOUS_DAY_* /
+        # PREVIOUS_WEEK_* pool when the candle list it is given spans a
+        # bucket boundary, so an engine built mid-session sees zero
+        # previous-day pools -- and therefore zero sweeps -- for the rest
+        # of that session, and up to a week for the weekly levels.
+        # `ConditionType.LIQUIDITY_SWEEP` reads exactly those pools, and
+        # it is the blueprint's own canonical strategy. Measured on three
+        # days of 15m bars: the scanner reported `matched=True` on the
+        # same instrument and bar where this supervisor reported no
+        # signal, with `engine.candles` holding 1 bar against 75 in the
+        # database.
+        #
+        # It also moves numbers rather than only decisions:
+        # `smc.dealing_range` is the stop for the default
+        # `entry.type="market"`, so entry, stop and the
+        # `calculate_position_size` quantity all came off a window whose
+        # length was process uptime.
+        #
+        # Seeded after the `_last_candle_seen` guard, not before: an early
+        # return there would leave the engine holding `candles[:-1]`
+        # having never consumed `latest`, and the next pass would append a
+        # newer bar over that gap. `[:-1]` because `on_candle` appends
+        # `latest` itself. A new engine is built on a worker restart, but
+        # also whenever a strategy is first marked
+        # `eligible_for_auto_trading` or an instrument first becomes
+        # active -- i.e. on ordinary onboarding, against instruments that
+        # already have months of stored candles.
+        if not engine.candles:
+            engine.candles = list(candles[:-1])
+
         position_before = engine.position_manager.get(engine.account_id, engine.symbol)
         snapshot = None
         # The strategy that actually opened this position, stamped by

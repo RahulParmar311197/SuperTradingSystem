@@ -4789,6 +4789,136 @@ upsert a single row rather than accumulating one per candle, and the
 partial unique index itself -- including that two *closed* rows for one
 source stay legal, which is what lets a source reopen after flattening.
 
+## The autonomous loop analyses stored history, not process uptime (§54)
+
+`AutoTradeSupervisor._process` loads the instrument's whole stored series
+and then used one bar of it:
+
+```python
+candles = await get_candles(db, instrument.id, strategy.timeframe)
+latest = candles[-1]
+...
+outcome = await engine.on_candle(latest, db)
+```
+
+`PaperTradingEngine` -- the engine this supervisor drives -- keeps its own
+`self.candles`, starts it empty, appends one bar per `on_candle`, and runs
+`smc_engine.analyze(self.candles)` over *that* list. The engine is cached
+in `self._engines` and only ever refreshed for `strategy` and
+`risk_engine.limits`; nothing seeded its history and nothing else writes
+to it. So the analysis window was not the instrument's history -- it was
+however long the worker process had been running.
+
+Every sibling passes the full series: `ScannerWorker`, `POST /scanner`,
+`GET /charts/{id}/smc`, `POST /backtest`, `POST /replay`,
+`POST /ai/analyze`. This was the one component that did not.
+
+Driven through the real supervisor against three NSE sessions of 15m bars
+(75 stored), a fresh worker process:
+
+```
+DB candle count                 75
+engine.candles after one pass    1
+PREVIOUS_* liquidity pools       0   (full history: 4)
+sweeps detected                  0   (full history: 4)
+ScannerWorker, same bar          matched=True
+AutoTradeSupervisor, same bar    no signal
+```
+
+It is not a warm-up that clears in three bars.
+`detect_session_levels` only emits a `PREVIOUS_DAY_*` / `PREVIOUS_WEEK_*`
+pool when the candle list it is given spans a bucket boundary, so an
+engine built mid-session carries no previous day inside its window at all
+and produces zero such pools -- and therefore zero sweeps -- for the rest
+of that session, and up to a full trading week for the weekly levels.
+`ConditionType.LIQUIDITY_SWEEP` reads exactly those pools via
+`smc.recent_sweeps()`, and it is the blueprint's own canonical strategy
+example. So for a whole session the scanner writes a `Signal` row and
+publishes it on `/ws/signals` while the supervisor -- whose module
+docstring says it is "what turns a match into VALIDATE/RISK CHECK/TRADE"
+-- silently declines the same strategy on the same instrument at the same
+bar.
+
+It moves numbers as well as decisions. `smc.dealing_range` is the stop for
+the default `entry.type="market"`, so entry, stop and the
+`calculate_position_size` quantity derived from them all came off a window
+whose length equalled process uptime.
+
+This is not only a restart concern. A fresh engine is built the first time
+a strategy is flipped `eligible_for_auto_trading` via
+`PATCH /strategies/{id}/status`, and the first time an instrument becomes
+active -- i.e. on the ordinary onboarding path, against instruments that
+already have months of stored candles.
+
+The fix seeds a freshly-built engine with `candles[:-1]` (`on_candle`
+appends `latest` itself) so its first evaluation sees the same series
+every other component sees. Placement matters: the seed goes *after* the
+`_last_candle_seen` guard, because an early return there would leave the
+engine holding history it had never consumed the final bar of, and the
+next pass would append a newer bar over that gap. The condition is
+`if not engine.candles`, which is true exactly once per engine.
+
+`POST /paper` is deliberately left alone. A manual paper session starts
+empty because the caller drives it with `POST /paper/{id}/candle`; mixing
+stored history into a hand-fed session would change what that endpoint
+means. The supervisor is the path where the stored series is the
+authoritative input and was being discarded.
+
+Not addressed here: `engine.candles` now grows without bound across a long
+worker lifetime, and each pass re-runs full SMC analysis over it. That
+cost profile is the same one `ScannerWorker` already has (it re-analyses
+the full series for every instrument on every pass), so this change makes
+the supervisor consistent with its siblings rather than newly expensive --
+but bounding the window is a real follow-up, and it should be done for
+both components together or neither, since they must analyse the same
+thing to agree.
+
+One consequence worth flagging loudly, because this change enlarges it.
+`AutoTradeSupervisor.run_once` selects **every active instrument** and runs
+every eligible strategy against all of them -- it does not filter on
+`StrategyDefinition.market` (the same gap `ScannerWorker` has, recorded
+separately). While the supervisor was analysing one-bar windows that was
+largely inert: almost nothing matched, whatever the instrument. Now that
+it analyses real history, an auto-trading user's strategy will genuinely
+fire against every instrument in the system whose data satisfies it, and
+because `PositionManager`, `RiskWindow` and the daily-trade counter are
+shared per user, unrelated instruments consume that user's
+`max_open_positions` and `max_trades_per_day` budget. The behaviour was
+always specified this way; this change is what makes it bite. Anyone
+running the autonomous loop against a multi-instrument universe should
+treat honouring `strategy.market` as a prerequisite rather than a
+nice-to-have.
+
+That is not theoretical: it is exactly how it surfaced here. Six existing
+`test_auto_trade_worker.py` tests fail against the long-lived development
+database, which has accumulated 41 leftover instruments carrying 40 stored
+candles each; those instruments now produce signals for the test user's
+strategy and exhaust its shared risk budget before the test's own
+instrument is reached. The same suite is green on a database created fresh
+from the migrations (381 passed), which is what CI uses, and the full
+suite passing there rules out any ordering dependency within a single run.
+The existing tests are left as they are -- they are correct against a
+clean database -- but they call `run_once()`, so they inherit whatever
+else lives in the database, and the new tests deliberately drive
+`_process` for a single triple instead.
+
+Coverage was fake-coverage shape (b). Every test in
+`tests/workers/test_auto_trade_worker.py` inserts exactly one candle and
+then calls `run_once()`, in a loop, so the stored history and the engine's
+in-memory history are identical by construction and the divergence cannot
+occur. Its `SETUP` fixture is also ten bars one minute apart inside a
+single morning, so `detect_session_levels` returns `[]` for both windows
+and the previous-day path is never exercised at all. The new
+`tests/workers/test_auto_trade_history.py` seeds three sessions of stored
+bars *before* the supervisor ever runs and asserts the engine analyses all
+75; that the seeded window yields previous-day pools and sweeps where the
+one-bar window yields neither; that a second pass appends rather than
+re-seeding (no duplicated or missing bars); and that an instrument with
+two stored bars still declines via the `len(self.candles) < 3` guard
+rather than an index error. It drives `_process` directly for one triple
+rather than `run_once()`, which would iterate every active instrument in
+the database.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

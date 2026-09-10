@@ -4533,6 +4533,95 @@ asserts the exact size, joined by three new ones (the 5,000 bypass with
 its portfolio numbers, the ordinary 3x short, and the dedup case) and a
 control that pins MARKET sizing as unchanged.
 
+## One row per instrument symbol (§9-13)
+
+`instruments` is a global, un-owned table -- no `user_id` -- and every
+reader of it resolves a symbol with `.scalar_one_or_none()`:
+
+- `app/api/orders.py::_get_instrument_by_symbol`, whose own docstring
+  states the contract, called as the **first statement** of both
+  `place_order` and `cancel_order`, and by `POST /paper`
+- `app/api/options.py`'s per-leg lookup for `POST /options/execute`
+- `app/risk/portfolio.py::compute_correlated_exposure`
+- `app/trading/portfolio_snapshots.py`'s Greeks aggregation
+
+"Exactly one row per symbol" was therefore already the operative contract
+across the whole codebase. Nothing enforced it. `POST /instruments` did no
+existence check, `Instrument.symbol` was `index=True` but not `unique=True`
+with `__table_args__ = ()`, and the initial migration created the index
+with `unique=False`. A second row for one symbol made every reader above
+raise `MultipleResultsFound`, which the catch-all handler in `app/main.py`
+turns into a 500.
+
+Driven through the real API with two separate users:
+
+```
+first  POST /instruments        201
+victim opens LONG               201  MONITORING qty=100.0
+GET /positions                  [{quantity: 100.0, average_price: 100.0}]
+second POST /instruments        201        <-- should be 409
+GET /instruments?symbol=X       2 rows for one symbol
+victim tries to CLOSE           500  Internal server error
+GET /positions                  [{quantity: 100.0, ...}]   still open
+```
+
+The lockout is the sharp end of it. `POST /orders` is, by its own comment,
+the only way to leave a position; `cancel_order` refuses anything already
+filled, and `/positions` and `/portfolio` are read-only. The
+reducing-order exemption exists precisely so that an exit is never refused
+-- but it is unreachable here, because `_get_instrument_by_symbol` runs
+*before* `is_reducing` is computed. The holder is left in an open
+100-unit position with no exit path through the API at all, and since
+there is no endpoint to delete or deactivate an instrument, recovery needs
+direct SQL.
+
+This needs no malicious actor. The endpoint is gated on plain
+`get_current_user`, not the admin role `app/api/admin.py` uses, so any
+user can register any symbol -- but the likelier trigger is an operator
+bootstrapping the instrument master and re-running the same registration
+call twice, which permanently bricks that symbol for the entire
+deployment.
+
+The fix is in three places, because a check in only one of them would be a
+half-measure:
+
+- `Instrument.symbol` becomes `unique=True`, with migration
+  `b7c1d40e9a52` swapping the index for a unique one. This is what
+  actually makes the readers' assumption true.
+- `POST /instruments` looks the symbol up first and returns **409** with
+  the existing row's id, rather than letting the constraint surface as a
+  500.
+- That lookup is read-then-write and so cannot be the guarantee on its
+  own -- two concurrent registrations can both pass it -- so an
+  `IntegrityError` on commit is caught and turned into the same 409.
+
+Note this makes `symbol` globally unique rather than unique per exchange.
+That matches what the readers actually do (none of them qualifies by
+`exchange`), and listing one ticker on two exchanges would require
+changing those five call sites, not just this constraint.
+
+The migration deliberately does **not** dedupe existing rows. If a
+database already contains duplicate symbols it will fail with a unique
+violation, and that is the right outcome: duplicate instrument rows can
+each own `candles`, `orders`, `positions` and `trades` via
+`instrument_id`, so deciding which row survives and what becomes of the
+other's children is an operator judgement, not something a schema
+migration should make silently. The migration docstring carries the query
+that lists them.
+
+Coverage was absent rather than weak: `grep -rn '/instruments'` over the
+test suite returned nothing at all -- both the create and list endpoints
+had zero tests. And every test that needs an instrument inserts the row
+directly with a uuid-suffixed symbol (`f"ORD{uuid.uuid4().hex[:6]}"` and
+friends, across `test_orders.py`, `test_paper.py`,
+`test_options_execute.py` and `workers/conftest.py`), so the suite was
+uniquely-symbolled *by construction* and structurally could not reach the
+duplicate case. There is now a `tests/api/test_instruments.py` covering
+the 409 and the surviving single row, the lockout scenario end to end (a
+holder with an open position can still close it after someone re-registers
+the symbol), the database constraint itself independent of the API, and a
+control that distinct symbols still register normally.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

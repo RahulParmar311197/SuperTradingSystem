@@ -2,9 +2,10 @@ import dataclasses
 import uuid
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.dependencies import get_current_user
@@ -65,9 +66,50 @@ async def list_instruments(
 async def create_instrument(
     payload: InstrumentCreateRequest, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
 ) -> Instrument:
+    """Registers a symbol in the global instrument master.
+
+    Refuses a symbol that already exists. `instruments` is un-owned and
+    shared by every user, and every reader of it resolves a symbol with
+    `.scalar_one_or_none()` -- app/api/orders.py's
+    `_get_instrument_by_symbol`, app/api/options.py's per-leg lookup,
+    app/risk/portfolio.py's `compute_correlated_exposure`, and
+    app/trading/portfolio_snapshots.py. A second row for one symbol made
+    every one of them raise `MultipleResultsFound`, which the app's
+    catch-all handler turns into a 500.
+
+    That is worse than it sounds, because `_get_instrument_by_symbol` is
+    the *first* statement of `place_order`: the failure lands before
+    `is_reducing` is even computed, so the exit-order exemption that
+    exists precisely so a position can always be closed never runs. A
+    single duplicate registration -- an operator re-running a bootstrap
+    script, not necessarily anyone malicious -- locked every holder of
+    that symbol into their open position with no way out through the API,
+    since POST /orders is the only path that closes one and there is no
+    endpoint to delete or deactivate an instrument.
+    """
+    existing = (
+        await db.execute(select(Instrument).where(Instrument.symbol == payload.symbol))
+    ).scalar_one_or_none()
+    if existing is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Instrument symbol {payload.symbol!r} is already registered (id {existing.id}).",
+        )
+
     instrument = Instrument(**payload.model_dump())
     db.add(instrument)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        # The check above is read-then-write, so two concurrent
+        # registrations of the same symbol can both pass it. The unique
+        # index on `instruments.symbol` is what actually guarantees the
+        # invariant; this turns the loser of that race into the same 409
+        # rather than a 500.
+        await db.rollback()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, f"Instrument symbol {payload.symbol!r} is already registered."
+        ) from exc
     await db.refresh(instrument)
     return instrument
 

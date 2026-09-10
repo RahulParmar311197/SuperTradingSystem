@@ -112,8 +112,44 @@ async def upstox_callback(code: str, state: str, db: AsyncSession = Depends(get_
 async def disconnect_broker(
     account_id: uuid.UUID, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
 ) -> None:
+    """Disconnects a broker account: marks it DISCONNECTED and scrubs its
+    stored credentials, keeping the row itself.
+
+    This used to `db.delete(account)`, which worked only while
+    `orders.broker_account_id` was NULL for every row. Once `resolve_broker`
+    started returning the account id -- so a placed order could be traced
+    back to the account that executed it -- every order stamped it, and the
+    FK (`ON DELETE NO ACTION`) began refusing the delete. The
+    `IntegrityError` was uncaught, so the endpoint returned **500** rather
+    than 204, and it failed for exactly the accounts a user most wants to
+    revoke: the ones that have actually traded. `BrokerName.PAPER` stamps
+    its id too, so this needed no real broker credentials to hit. There is
+    no other endpoint that disables a broker account, so a user could
+    connect several and disconnect none of them.
+
+    Soft-disconnect rather than a delete cascade or `ON DELETE SET NULL`,
+    because both of those destroy the per-order audit trail that
+    `broker_account_id` was added to provide. Everything this needs
+    already existed and was simply never written to: `BrokerAccountStatus.
+    DISCONNECTED` was a declared-but-unused enum member, `resolve_broker`
+    already selects only `status == ACTIVE` (falling back to the next
+    active account, or `MockBroker`), and
+    `tests/trading/test_broker_resolver.py` already asserts a disconnected
+    account is ignored.
+
+    The credentials are scrubbed because the hard delete removed them as a
+    side effect, and a disconnect prompted by a leaked or compromised token
+    should not leave that token sitting in the row. `resolve_broker` only
+    ever decrypts an ACTIVE account, so a scrubbed row is never read; a
+    reconnect creates a fresh row via POST /brokers/connect.
+
+    A stack already built for this user in this process keeps its resolved
+    broker until the process restarts -- the same documented limitation
+    `_stack_for` in app/api/orders.py already carries for connects.
+    """
     account = await db.get(BrokerAccount, account_id)
     if account is None or account.user_id != user.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Broker account not found")
-    await db.delete(account)
+    account.status = BrokerAccountStatus.DISCONNECTED
+    account.encrypted_credentials = encrypt_credentials({})
     await db.commit()

@@ -325,8 +325,39 @@ async def place_order(
         open_position_notionals=other_position_notionals,
         threshold=stack.risk_engine.limits.correlation_threshold,
     )
+    # The price this order will actually fill at, as far as it can be known
+    # before submission. For MARKET that is the market itself, which `entry`
+    # claims to be and `entry_matches_market` above checks. For LIMIT the
+    # broker fills at `payload.price` and never worse -- a buy pays at most
+    # that, a sell receives at least it -- so it is both the value that
+    # determines the fill and the conservative worst case in either
+    # direction.
+    #
+    # Sizing and the notional risk checks used to read `payload.entry` for
+    # every order type, while only MARKET actually fills there. `price` was
+    # passed straight through to the broker and compared to nothing: not to
+    # `entry`, not to the quote, not to `max_entry_deviation_pct`. A LONG
+    # LIMIT with `entry=100 stop=95 price=5000` was therefore sized as
+    # `500 / |100-95| = 100` units and gated as `100 x 100 = 10,000`
+    # notional (10% of a 100,000 account, against a 100% cap) -- then filled
+    # at 5000, leaving the account holding 500,000 (500% of balance) with
+    # `100 x |5000-95| = 490,500` at risk on an order the engine approved as
+    # 0.5% risk, every check green in its own RiskEvent row. The wrong
+    # `average_price` then flows into `positions`, GET /portfolio's
+    # `total_exposure`, every later `current_exposure`, and on close into
+    # `Trade.pnl` and the daily/weekly loss halts.
+    #
+    # Measuring both from the fill price makes the approved notional the
+    # notional actually taken on, and `valid_stop_distance` measure the real
+    # distance from the fill to the stop. `entry` keeps its own meaning --
+    # a claim about the current market, checked against the broker's quote
+    # above -- which is why the deviation check is deliberately *not*
+    # retargeted here: a limit price is a chosen price, not a claim about
+    # the market, and forcing it within `max_entry_deviation_pct` would
+    # refuse every legitimate resting limit order.
+    fill_price = payload.price if payload.order_type is OrderType.LIMIT else payload.entry
     quantity = calculate_position_size(
-        account.balance, stack.risk_engine.limits.risk_per_trade_pct, payload.entry, payload.stop, stack.risk_engine.limits.max_position_size
+        account.balance, stack.risk_engine.limits.risk_per_trade_pct, fill_price, payload.stop, stack.risk_engine.limits.max_position_size
     )
     if is_reducing:
         # Clamped to what is actually open, which is what makes the
@@ -341,7 +372,7 @@ async def place_order(
         proposed_quantity=quantity,
         is_reducing=is_reducing,
         strategy_id=None,
-        entry=payload.entry,
+        entry=fill_price,
         stop=payload.stop,
         account_balance=account.balance,
         open_positions=len(open_positions),
@@ -406,7 +437,13 @@ async def place_order(
         )
         raise HTTPException(status.HTTP_403_FORBIDDEN, f"Risk engine rejected this trade: {decision.reason}")
 
-    idempotency_key = f"{user.id}:{payload.symbol}:{payload.direction.value}:{payload.entry}:{payload.stop}"
+    # `price` is part of the order's identity now that it decides the fill
+    # and the size: two LIMIT orders differing only in limit price are two
+    # different orders, and without it here the second silently deduped
+    # onto the first and returned its fill.
+    idempotency_key = (
+        f"{user.id}:{payload.symbol}:{payload.direction.value}:{payload.entry}:{payload.stop}:{payload.price}"
+    )
     order, created = stack.order_manager.create_order(
         idempotency_key, str(user.id), payload.symbol, payload.direction, payload.order_type, quantity, payload.price
     )

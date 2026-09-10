@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import delete, select
+from sqlalchemy import delete
 
 from app.auth.security import hash_password
 from app.database.models.instruments import Instrument, MarketType

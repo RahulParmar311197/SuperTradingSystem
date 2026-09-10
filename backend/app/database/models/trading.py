@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from enum import StrEnum
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Integer, JSON, Numeric, String
+from sqlalchemy import DateTime, Enum, ForeignKey, Index, Integer, JSON, Numeric, String, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -119,9 +119,39 @@ class Position(Base):
     unrealized_pnl: Mapped[float] = mapped_column(Numeric(18, 6), default=0)
     realized_pnl: Mapped[float] = mapped_column(Numeric(18, 6), default=0)
     is_open: Mapped[bool] = mapped_column(default=True)
+    # Which independent engine owns this row. `positions` is a DB mirror of
+    # an in-memory `PositionManager`, and there are three unrelated ones
+    # writing here: the manual/live stack in `app/api/orders.py`'s
+    # `_STACKS`, each `PaperTradingEngine` behind `POST /paper`, and
+    # `AutoTradeSupervisor` in the worker process. They share no state --
+    # they cannot, since the supervisor runs in a different process -- and
+    # every one of them persists under `ExecutionMode.PAPER` whenever no
+    # broker is connected, which is every account's default.
+    #
+    # Without this column the lookup key was (user, instrument,
+    # execution_mode, is_open), so whichever engine wrote last silently
+    # overwrote the others' row: a paper session holding 151.5 units and a
+    # manual order holding 100 became one row reading 100, and
+    # GET /portfolio reported that as the account's whole exposure.
+    #
+    # "manual" for POST /orders and POST /options/execute, "auto" for the
+    # supervisor, "paper:{session_id}" per paper session.
+    source_key: Mapped[str] = mapped_column(String(72), nullable=False, server_default="manual")
 
     created_at: Mapped[datetime] = created_at_col()
     updated_at: Mapped[datetime] = updated_at_col()
+
+    __table_args__ = (
+        Index(
+            "uq_open_position_per_source",
+            "user_id",
+            "instrument_id",
+            "execution_mode",
+            "source_key",
+            unique=True,
+            postgresql_where=text("is_open"),
+        ),
+    )
 
 
 class Trade(Base):

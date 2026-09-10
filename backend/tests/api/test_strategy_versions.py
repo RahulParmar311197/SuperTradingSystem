@@ -136,3 +136,45 @@ async def test_user_cannot_access_another_users_strategy_versions(require_infra)
             assert r.status_code == 404, r.text
         finally:
             await _cleanup([owner_id, other_id], [uuid.UUID(strategy_id)] if strategy_id else [])
+
+
+async def test_creating_or_updating_a_strategy_rejects_an_unresolvable_entry_type(require_infra):
+    # Regression test: `EntryConfig.type` was an unvalidated `str`, so
+    # POST /strategies returned 201 for `entry.type="limit"` (or a case
+    # typo of a real type) and persisted it. `_resolve_entry_and_stop`
+    # then read it with bare equality tests and an implicit `else`,
+    # silently trading that strategy as a *market* entry at the current
+    # price -- a different entry, a different stop, and a fill on candles
+    # where the strategy as written would not have traded.
+    with TestClient(app) as client:
+        token, user_id = await _register(client, "stratentry")
+        headers = {"Authorization": f"Bearer {token}"}
+        strategy_id = None
+        try:
+            for bad in ("limit", "fvg-retest", "retest"):
+                payload = _strategy_payload("Bad entry type")
+                payload["entry"] = {"type": bad}
+                r = client.post("/strategies", json=payload, headers=headers)
+                assert r.status_code == 422, f"{bad!r} -> {r.status_code}: {r.text}"
+
+            # Nothing was persisted by any of those attempts.
+            r = client.get("/strategies", headers=headers)
+            assert r.status_code == 200, r.text
+            assert r.json() == []
+
+            # A real entry type still works, and a case typo of one is
+            # normalized rather than silently swapped for a market entry.
+            payload = _strategy_payload("Good entry type")
+            payload["entry"] = {"type": "FVG_RETEST"}
+            r = client.post("/strategies", json=payload, headers=headers)
+            assert r.status_code == 201, r.text
+            strategy_id = r.json()["id"]
+            assert r.json()["definition"]["entry"]["type"] == "fvg_retest"
+
+            # PUT validates through the same model.
+            update = _strategy_payload("Good entry type")
+            update["entry"] = {"type": "market_order"}
+            r = client.put(f"/strategies/{strategy_id}", json=update, headers=headers)
+            assert r.status_code == 422, r.text
+        finally:
+            await _cleanup([user_id], [uuid.UUID(strategy_id)] if strategy_id else [])

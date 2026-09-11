@@ -626,6 +626,18 @@ async def cancel_order(
     order = stack.order_manager.get(order_id)
     if order is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Order not found")
+    # These two statuses and the `CANCELLED` entries in
+    # `app.trading.order_manager._ALLOWED_TRANSITIONS` are two halves of one
+    # contract and have to agree; they did not, and the SUBMITTED half 500'd.
+    # `tests/trading/test_cancel_transitions.py` now pins the relationship
+    # rather than the instance.
+    #
+    # PARTIALLY_FILLED stays out deliberately, even though the transition
+    # table permits it. Cancelling there would retire the order while the
+    # filled portion remains a real open position, and nothing on this path
+    # reconciles that remainder -- so admitting it is a decision about
+    # partial-fill semantics, not a repair. The table entry is currently
+    # reachable from no caller at all, which harms nothing.
     if order.status not in (OrderStatus.SUBMITTED, OrderStatus.ACKNOWLEDGED):
         raise HTTPException(status.HTTP_409_CONFLICT, f"Cannot cancel an order in status {order.status.value}")
 

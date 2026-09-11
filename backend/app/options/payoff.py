@@ -74,7 +74,17 @@ def compute_payoff_summary(
 
     if price_range is None:
         strikes = [leg.strike for leg in legs]
-        low, high = min(strikes) * 0.5, max(strikes) * 1.5
+        # The low end is 0, not a fraction of the lowest strike. An
+        # underlying cannot trade below zero, so 0 is where the put side of
+        # any combination reaches its true extreme -- a short put's maximum
+        # loss, a long put's maximum profit -- and both are finite. Sampling
+        # from `min(strikes) * 0.5` stopped short of that extreme while the
+        # curve was still sloping, so the edge-slope test below (rightly, for
+        # the window it was given) called those bounded outcomes unbounded
+        # and `worst_sampled_loss` reported roughly half the real figure. The
+        # high end stays a multiple of the top strike because the call side
+        # genuinely has no upper bound to find.
+        low, high = 0.0, max(strikes) * 1.5
         span = high - low
         steps = 2000
         price_range = [low + span * i / steps for i in range(steps + 1)]
@@ -85,17 +95,30 @@ def compute_payoff_summary(
     max_profit_sample = max(payoffs)
     max_loss_sample = min(payoffs)
 
-    # If the payoff is still sloping at either sampled edge, the true extreme
-    # in that direction is unbounded (e.g. a naked long/short call) rather
-    # than whatever value happens to sit at the edge of our sample window.
+    # A payoff at expiry is piecewise linear with kinks only at strikes, so
+    # past the outermost strike its slope is constant forever. A sampled edge
+    # that is still sloping therefore keeps sloping without limit, and the
+    # extreme in that direction lies outside the window rather than on its
+    # boundary. The slope alone settles it: it is *not* additionally required
+    # that the sampled extreme sit on that edge. A short straddle is the case
+    # that distinguishes them -- its loss runs away in both directions, so
+    # whichever edge is worse, the other is still unbounded.
+    #
+    # The inference is only valid where the edge is a truncation. Price 0 is
+    # not: no underlying trades below it, so a curve still sloping at a left
+    # edge of 0 has already reached its extreme there, and reporting `None`
+    # would discard a loss that is finite and knowable. The default range
+    # above starts at 0; an explicitly supplied range may not, so this is
+    # decided from the range actually sampled rather than assumed.
+    left_edge_is_domain_floor = price_range[0] <= 0.0
     left_slope = payoffs[1] - payoffs[0]
     right_slope = payoffs[-1] - payoffs[-2]
 
     max_profit = max_profit_sample
     max_loss = max_loss_sample
-    if (right_slope > 0 and max_profit_sample == payoffs[-1]) or (left_slope < 0 and max_profit_sample == payoffs[0]):
+    if right_slope > 0 or (not left_edge_is_domain_floor and left_slope < 0):
         max_profit = None
-    if (right_slope < 0 and max_loss_sample == payoffs[-1]) or (left_slope > 0 and max_loss_sample == payoffs[0]):
+    if right_slope < 0 or (not left_edge_is_domain_floor and left_slope > 0):
         max_loss = None
 
     breakevens: list[float] = []

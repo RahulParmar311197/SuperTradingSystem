@@ -5012,6 +5012,93 @@ backwards step must **not** reset them is a contract neither states.
 lagging/forward sequence and the two-engine shared-window case driven
 through `on_candle` itself.
 
+## The payoff window never reached the put side's real extreme (§38-40, §56)
+
+`compute_payoff_summary` (`app/options/payoff.py`) decides whether a
+strategy's profit or loss is bounded by looking at whether the payoff curve
+is still sloping at the edge of a sampled price range. The default range ran
+from `min(strikes) * 0.5` to `max(strikes) * 1.5`.
+
+The upper end is right: a call's loss really does run away as the underlying
+rises, with nothing to stop it. The lower end is not. An underlying cannot
+trade below zero, so price 0 is a *domain boundary*, not a truncation, and it
+is exactly where the put side of any combination reaches its extreme — a
+short put's maximum loss, a long put's maximum profit — both finite and
+computable in closed form. Sampling only down to half the lowest strike
+stopped short of that point while the curve was still falling, so the edge
+test concluded "unbounded" for outcomes that are bounded, and every figure
+derived from the sampled minimum came back roughly half its real size.
+
+That matters because `app/risk/options_risk.py` sizes the strategy from
+exactly these fields:
+
+```python
+risk_amount = (
+    abs(payoff.max_loss)
+    if payoff.max_loss is not None
+    else max(-payoff.worst_sampled_loss, payoff.capital_requirement)
+)
+```
+
+A naked short put — the plainest short-volatility position there is, and one
+`POST /options/execute` accepts directly, since it takes an arbitrary list of
+legs with arbitrary direction — therefore fell into the `None` branch and was
+sized by a number drawn from half the strike. Measured on a 1000-strike put
+sold at 100 with a lot size of 150, against the 100,000 mock balance:
+
+```
+max_loss reported by the payoff engine : None
+risk_amount the gate actually used     : 60,000   -> exposure  60.00% vs limit 100%  APPROVE
+TRUE max loss at underlying = 0        : 135,000  -> exposure 135.00% vs limit 100%  REJECT
+```
+
+`POST /options/execute` returned 201 and the leg went to the broker. The
+account was allowed to sell a put that can lose more than its entire balance,
+because the control that exists to prevent that was shown 44% of the real
+number. Note this is a different fault from the earlier options-exposure fix
+recorded above: that one corrected *which field* the gate reads, and left the
+sampling window that produces those fields unexamined.
+
+The fix is in two parts, and the second is not optional.
+
+**Sample from 0.** The default range now starts at the real floor of an
+underlying price, so the put side's extreme is inside the window and comes
+out exact rather than inferred.
+
+**Settle boundedness from the edge slope alone.** The original test also
+required the sampled extreme to *sit* on the sloping edge
+(`right_slope < 0 and max_loss_sample == payoffs[-1]`). Moving the floor to
+zero moves where the sampled minimum sits: for a short straddle the worst
+sampled point becomes the left edge, not the right, and that conjunct stops
+firing — silently re-labelling a genuinely unlimited-loss position as
+defined-risk. The first cut of this fix did exactly that, and the control
+test caught it before it shipped. The conjunct was never the right test: a
+payoff at expiry is piecewise linear with kinks only at strikes, so past the
+outermost strike the slope is constant forever, and a still-falling right
+edge keeps falling regardless of where the sampled minimum happens to be.
+The left-edge inference is kept for an explicitly supplied `price_range`
+that does not reach zero, since such a window genuinely is truncated.
+
+Verified across the matrix: short put, long put and defined-risk spreads
+report exact bounded figures; naked short call, short straddle and short
+strangle still report `max_loss=None`; long call and long straddle still
+report `max_profit=None`. `worst_sampled_loss` for a genuinely unbounded
+combination also improves — a short straddle's now reaches its true −120,000
+floor at zero instead of the −45,000 that happened to sit at the old right
+edge — which tightens the fallback sizing path for unbounded strategies
+without changing what that field means.
+
+Why the suite could not see this. Every fixture in
+`tests/options/test_payoff.py` is call-side or fully defined-risk
+(`long_call`, `bull_call_spread`, `bear_call_spread`, `iron_condor`); not one
+carries an uncovered short put. The "unbounded" fixture in
+`tests/risk/test_options_risk.py` is `_synthetic_short` (long put + short
+call), whose unboundedness comes from the *call* leg running away to the
+right, so the put-side truncation is never what an assertion turns on. This
+is fake-coverage shape (b) again: a fixture that structurally cannot reach
+the breaking state. `tests/options/test_payoff_put_side.py` covers it now,
+including the unbounded-loss controls that pin the second half of the fix.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

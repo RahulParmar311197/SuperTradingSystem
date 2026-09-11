@@ -5499,6 +5499,103 @@ produce an order resting at SUBMITTED, and the SUBMITTED row of
 `_ALLOWED_TRANSITIONS` had no test of its own. Shape (b) again, with the
 fixture's own docstring naming the contract it could not reach.
 
+## Six condition types were dead by construction (§77, §82-83)
+
+`app/strategy/evaluator.py` routes six of the fifteen `ConditionType` members
+— `volume`, `volatility`, `indicator`, `options_iv`, `options_oi`,
+`options_greeks` — to the same two lines:
+
+```python
+key = condition.name or condition.type.value
+return _numeric_compare(context.indicators.get(key), condition)
+```
+
+`EvaluationContext.indicators` has **no writer anywhere in `app/`**. All five
+construction sites (`app/backtest/engine.py`, `app/paper/engine.py`,
+`app/api/ai.py`, `app/api/scanner.py`, `app/workers/scanner_worker.py`) omit
+it, so the bag is always `{}`, `.get` always returns `None`, and
+`_numeric_compare` returns `False` on its first line. Its only other mention
+is `app/ai/context_builder.py`, which serializes the empty dict back out.
+
+Because conditions AND implicitly, one such condition zeroes the whole
+strategy. Measured against the suite's own pinned setup, on bars carrying
+`volume=100.0`:
+
+```
+fvg only                          -> matched=True
+fvg + volume > 0                  -> matched=False
+fvg + volatility < 1e9            -> matched=False
+fvg + indicator rsi within ±1e9   -> matched=False
+```
+
+Every added condition there is *vacuously true*, and each one silently kills
+a strategy that was producing signals a moment earlier.
+
+Nothing surfaces why. `ScannerWorker` and `AutoTradeSupervisor` re-evaluate
+such a strategy every 60 seconds forever with `matched=False`, no log and no
+error. `POST /backtest` runs the identical evaluator over the identical
+context shape, so a validation backtest reports zero trades —
+indistinguishable from "this history contained no setups" — which means
+blueprint §77's graduation path (Backtest → Out-of-sample → Replay → Paper →
+`eligible_for_auto_trading`) cannot catch it at any stage.
+
+The codebase had already ruled on this exact failure mode, twice.
+`Condition._reject_unimplemented_boolean_operators` refuses `AND`/`OR`/`NOT`
+because a condition using one "silently fell through to `return False` ... on
+every single candle forever — a strategy that can structurally never fire,
+with nothing anywhere indicating why", and `EntryConfig._reject_unknown_entry_types`
+refuses unknown entry types for the same reason. The worked example in the
+first of those write-ups, a few sections above, is itself
+`type=indicator, name=rsi, operator=NOT` — rejected for its *operator* while
+its type went unexamined. Change `NOT` to `LESS_THAN` and the strategy still
+could never fire.
+
+So this applies the established ruling to the types themselves. A validator
+on `Condition.type` refuses all six, naming the structural types that do
+work. Rejecting is not a claim that these conditions are unwanted: `volume`
+and `volatility` are computable from the candle series every caller already
+holds, `indicator` needs a library, and `options_*` additionally needs the
+option-chain ingestion the readiness doc records as missing. Populating
+`indicators` at those five sites is the other way to close this, and is what
+should replace this validator when the data exists — a regression test pins
+that the bag is still empty, so it fails the day a real writer appears.
+
+Already-stored strategies degrade safely rather than crashing: both worker
+read paths (`auto_trade_worker.py`, `scanner_worker.py`) already wrap
+`StrategyDefinition.model_validate` in `try/except`, log, and skip. A stored
+strategy using one of these types therefore moves from *silently never
+matching, forever, with no signal* to *skipped with a logged exception naming
+the strategy* — strictly better. (No such strategy exists in the development
+database; the count is zero.)
+
+**The score denominator is fixed in the same change, because this fix makes
+it permanently wrong otherwise.** `app/strategy/scoring.py` reserved
+`"volatility": 10.0` of a 100-point `DEFAULT_WEIGHTS` total, and
+`compute_strategy_score` divides by `sum(weights.values())`. With
+`ConditionType.VOLATILITY` unable to appear in `satisfied_condition_types`,
+the reachable ceiling was 90.0 — a strategy satisfying every condition type it
+*could* satisfy, at target R, scored 90 and nothing could ever score higher.
+Dropping the key makes the denominator the reachable maximum, so that
+strategy now scores 100.0. Absolute scores change; ranking does not, since
+every score was divided by the same inflated total. The scoring branch itself
+is kept and commented, so restoring the component is one weight key rather
+than re-derived logic.
+
+Why the suite could not see this.
+`tests/strategy/test_dsl.py::test_condition_accepts_implemented_operators` is
+the test that *looks* like coverage — it builds a `ConditionType.INDICATOR`
+condition — but it only asserts `condition.operator == operator`, both sides
+of which come from the same parametrised value, and it never evaluates the
+condition. Both shared context helpers (`test_engine.py::_build_context`,
+`test_evaluator.py::_context`) construct `EvaluationContext` without
+`indicators`, exactly like the production sites, so no fixture in the suite
+could produce a non-empty bag. The six types had no evaluation test of any
+kind, `_numeric_compare` had no direct test, and `compute_strategy_score` and
+`DEFAULT_WEIGHTS` had no test at all — which is why a 10-point unearnable
+weight sat unnoticed. Shapes (a), (b) and (f) together. The two operator
+tests have been retargeted to a live condition type so each proves the one
+thing it names.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

@@ -16,15 +16,20 @@ def test_condition_rejects_unimplemented_boolean_operators(operator):
     # condition silently fell through to `evaluate_condition`'s final
     # `return False` on every candle forever: a strategy that could
     # structurally never fire, with no error anywhere indicating why.
+    # A live condition type, so this proves operator rejection alone --
+    # `ConditionType.INDICATOR` is now rejected on its own account by
+    # `_reject_unfed_condition_types`, which would mask what this asserts.
     with pytest.raises(ValidationError, match="not yet implemented"):
-        Condition(type=ConditionType.INDICATOR, name="rsi", operator=operator, min_value=40, max_value=60)
+        Condition(type=ConditionType.FVG, direction="bullish", operator=operator, min_value=40, max_value=60)
 
 
 @pytest.mark.parametrize(
     "operator", [ConditionOperator.GREATER_THAN, ConditionOperator.LESS_THAN, ConditionOperator.WITHIN]
 )
 def test_condition_accepts_implemented_operators(operator):
-    condition = Condition(type=ConditionType.INDICATOR, name="rsi", operator=operator, value=50, min_value=40, max_value=60)
+    condition = Condition(
+        type=ConditionType.FVG, direction="bullish", operator=operator, value=50, min_value=40, max_value=60
+    )
     assert condition.operator == operator
 
 

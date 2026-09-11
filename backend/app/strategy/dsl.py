@@ -77,6 +77,20 @@ def _validate_bias(value: str | None) -> str | None:
     return normalized
 
 
+# Condition types whose evaluator reads `EvaluationContext.indicators`, which
+# nothing writes -- see `Condition._reject_unfed_condition_types`.
+_UNFED_CONDITION_TYPES = frozenset(
+    {
+        ConditionType.VOLUME,
+        ConditionType.VOLATILITY,
+        ConditionType.INDICATOR,
+        ConditionType.OPTIONS_IV,
+        ConditionType.OPTIONS_OI,
+        ConditionType.OPTIONS_GREEKS,
+    }
+)
+
+
 class Condition(BaseModel):
     """A single leaf condition. `type` selects which evaluator handles it;
     the remaining fields are interpreted by that evaluator (see
@@ -92,6 +106,55 @@ class Condition(BaseModel):
     min_value: float | None = None
     max_value: float | None = None
     lookback: int = 5  # how many recent candles/events count as "recent" for event-type conditions
+
+    @field_validator("type")
+    @classmethod
+    def _reject_unfed_condition_types(cls, v: ConditionType) -> ConditionType:
+        """Rejects the condition types no data source feeds.
+
+        `app.strategy.evaluator` routes all six of these to
+        `_numeric_compare(context.indicators.get(key), condition)`, and
+        `EvaluationContext.indicators` has no writer anywhere in `app/` --
+        all five construction sites (`app/backtest/engine.py`,
+        `app/paper/engine.py`, `app/api/ai.py`, `app/api/scanner.py`,
+        `app/workers/scanner_worker.py`) omit it, so the bag is always
+        empty, `.get` always returns `None`, and `_numeric_compare` returns
+        `False` on its first line. Every such condition is therefore false
+        on every candle forever.
+
+        Because conditions AND implicitly, one of them zeroes the whole
+        strategy: a working `fvg` strategy stops producing signals the
+        moment a *vacuously true* `volume > 0` is added to it, against bars
+        that carry volume. Nothing surfaces why -- `POST /backtest` runs the
+        same evaluator over the same context shape, so a validation
+        backtest reports zero trades, indistinguishable from "this history
+        had no setups", and blueprint §77's graduation path cannot catch it
+        at any stage.
+
+        This is the same ruling `_reject_unimplemented_boolean_operators`
+        below already makes for AND/OR/NOT, and `_reject_unknown_entry_types`
+        makes for `entry.type` -- and the worked example in that fix's
+        write-up (docs/ARCHITECTURE.md) is itself an `indicator` condition,
+        rejected only for its operator. Failing loudly at authoring time
+        beats a strategy that looks alive and is not.
+
+        `volume` and `volatility` could be computed from the candle series
+        each caller already holds; `indicator` needs a library; `options_*`
+        additionally needs the option-chain ingestion the docs record as
+        missing. Populating `indicators` at those five sites is the other
+        way to close this, and is what should replace this validator when
+        the data exists -- rejecting is not a claim that these types are
+        unwanted, only that accepting them today is dishonest.
+        """
+        if v in _UNFED_CONDITION_TYPES:
+            raise ValueError(
+                f"condition type={v.value!r} is declared in the schema but nothing populates the data it "
+                "reads (EvaluationContext.indicators has no writer), so a condition using it would "
+                "silently never match on any candle -- and because conditions AND together, it would stop "
+                "the whole strategy from ever firing. Use the structural condition types "
+                f"({', '.join(t.value for t in ConditionType if t not in _UNFED_CONDITION_TYPES)}) instead."
+            )
+        return v
 
     @field_validator("direction")
     @classmethod

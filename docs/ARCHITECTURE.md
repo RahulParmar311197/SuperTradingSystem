@@ -5270,6 +5270,76 @@ coverage anywhere: its only other appearance under `tests/` is the
 never-matching definition above. Shapes (b) and (f) together.
 `tests/smc/test_order_block_mitigation.py` covers it now.
 
+## Options contracts could not be registered through the API (§37-40, §120)
+
+`instruments` is the only table an options contract can live in, and
+`POST /instruments` is the only route that creates one — there is no PUT,
+PATCH or DELETE on instruments, and `Instrument(**payload.model_dump())` in
+`app/api/markets.py` is the only `Instrument(...)` construction anywhere in
+`app/`.
+
+`InstrumentCreateRequest` carried none of `underlying`, `expiry`, `strike` or
+`option_type`, though all four are real columns on the model. Pydantic's
+default `extra="ignore"` therefore discarded them from a caller's body
+without complaint, and `InstrumentResponse` did not expose them either, so
+the loss could not be observed from outside. Measured end to end against a
+database built fresh from migrations:
+
+```
+POST /instruments      -> 201
+  sent          : underlying, expiry, strike and option_type all supplied
+  response keys : active, exchange, id, instrument_type, lot_size, market,
+                  symbol, tick_size          <- none of the four
+  DB row        : market=OPTIONS underlying=None expiry=None strike=None option_type=None
+POST /options/execute  -> 422  "NIFTY...CE is not an options contract"
+```
+
+The write succeeded, four supplied fields vanished, and the row was
+permanently unusable: `app/api/options.py` rejects any leg whose instrument
+has no `option_type` or `strike`, and no endpoint can repair an existing row.
+Multi-leg options execution — the whole `app/options/` and
+`app/risk/options_risk.py` stack, the combined-payoff risk gate, the
+liquidity filter and the per-leg order pipeline, all of which several earlier
+sections above describe hardening — was unreachable through the API for every
+instrument the API itself could create. Reaching it at all required bypassing
+the API and inserting rows with SQL.
+
+The fix adds the four fields to both the request and the response, and
+validates on write the invariant `app/api/options.py` enforces on read: a
+`market=OPTIONS` row must carry `strike` and `option_type`. The mirror rule is
+enforced too — a non-options instrument may not carry them, since an EQUITY
+row with an `option_type` would read as an option to anything that checks
+`is not None` later. After the fix the same script registers the contract and
+`POST /options/execute` returns 201.
+
+**`expiry` is deliberately not required.** Nothing in `app/` reads
+`Instrument.expiry` today — grep finds no consumer — so demanding it would be
+inventing a constraint nothing depends on. It is carried and returned, and
+should become required alongside options-chain ingestion, when something
+finally prices against it. `underlying` is in the same position.
+
+Why the suite could not see this, and why it is the sharpest example of
+fixture-shaped blindness in this codebase. Two test files each look like
+coverage and neither touches the defect:
+
+* `tests/api/test_instruments.py` is *about* this endpoint, with a module
+  docstring on its contract — but its shared `_payload()` helper hardcodes
+  `market="EQUITY", instrument_type="EQ"` and takes only a symbol, so no test
+  ever sent `market="OPTIONS"` to this route.
+* `tests/api/test_options_execute.py` is *about* options execution — but
+  `_make_two_leg_instruments` builds `Instrument(...)` ORM rows directly
+  through `async_session_factory()` with `strike` and `option_type` already
+  filled in, and commits them. It never calls the endpoint.
+
+So the suite proved the execute pipeline works on rows the API could not
+produce, while the endpoint's own tests proved it works for the one market
+type that needs none of the missing fields. `market="OPTIONS"` was a
+user-selectable enum value with no test exercising it on the only route that
+can create one. `docs/PRODUCTION_READINESS.md` has been corrected: its
+"Options execution tested" row claimed the multi-leg path was real and tested
+and disclosed only the missing chain ingestion, which was an overclaim of
+exactly this shape.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

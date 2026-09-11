@@ -6,12 +6,20 @@ from __future__ import annotations
 from app.strategy.context import EvaluationContext
 from app.strategy.dsl import ConditionType
 
+# No "volatility" entry: `ConditionType.VOLATILITY` is rejected at the DSL
+# boundary (`Condition._reject_unfed_condition_types`) because nothing writes
+# `EvaluationContext.indicators`, so it can never appear in
+# `satisfied_condition_types`. While the weight was here, `total_weight` was
+# 100 but the reachable ceiling was 90 -- a strategy satisfying every
+# condition type it *could* satisfy, at target R, scored 90.0 and nothing
+# could ever score higher. Dropping it makes the denominator the reachable
+# maximum again. Ranking is unaffected: every score was divided by the same
+# inflated total, so this rescales them all uniformly.
 DEFAULT_WEIGHTS: dict[str, float] = {
     "htf_alignment": 20.0,
     "structure": 20.0,
     "liquidity": 20.0,
     "fvg": 15.0,
-    "volatility": 10.0,
     "risk_reward": 15.0,
 }
 
@@ -38,6 +46,9 @@ def compute_strategy_score(
         score += weights.get("liquidity", 0.0)
     if ConditionType.FVG in satisfied or ConditionType.ORDER_BLOCK in satisfied:
         score += weights.get("fvg", 0.0)
+    # Inert while `ConditionType.VOLATILITY` is rejected at the DSL boundary,
+    # and kept so that populating `EvaluationContext.indicators` re-enables
+    # scoring by restoring one weight key rather than by re-deriving this.
     if ConditionType.VOLATILITY in satisfied:
         score += weights.get("volatility", 0.0)
     if minimum_rr > 0 and risk_reward >= minimum_rr:

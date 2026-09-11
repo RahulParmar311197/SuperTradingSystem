@@ -134,9 +134,31 @@ def detect_sweeps(candles: list[Candle], pools: list[LiquidityPool]) -> None:
     A sweep occurs when price trades through the pool level after it was
     formed; a rejection additionally requires the candle to close back on
     the origin side, which is the classic "stop hunt then reverse" pattern.
+
+    The scan starts *at* `formed_index` and excludes only the pool's own
+    constituent swings. The invariant being enforced is "a pool cannot be
+    swept by the very swings that define it", and `member_indices` states
+    that directly; `formed_index + 1` was a positional stand-in for it that
+    only happens to coincide for one of the two pool kinds.
+
+    For an equal-highs/lows pool `formed_index` *is* the last member, so it
+    is skipped either way and nothing changes. A previous-day/week level is
+    the opposite case: `detect_session_levels` anchors it at the first candle
+    of the *following* period -- the bar at which the level becomes a resting
+    liquidity target, not a bar that helped form it, since `period_high` and
+    `period_low` are reset only after the pool is emitted. Skipping that bar
+    dropped the single candle most likely to raid the prior session's
+    extreme. A judas swing that takes out the previous-day high on the
+    opening bar and closes back below it -- the platform's headline setup --
+    reported `swept=False`, and where a later bar also traded through the
+    level the sweep was attributed to that bar instead, at its smaller
+    magnitude.
     """
     for pool in pools:
-        for i in range(pool.formed_index + 1, len(candles)):
+        members = set(pool.member_indices)
+        for i in range(pool.formed_index, len(candles)):
+            if i in members:
+                continue
             candle = candles[i]
             if pool.side == LiquiditySide.BUY_SIDE and candle.high > pool.price:
                 pool.swept = True

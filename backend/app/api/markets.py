@@ -1,16 +1,16 @@
 import dataclasses
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.dependencies import get_current_user
 from app.core.redis import get_latest_price
-from app.database.models.instruments import Instrument, MarketType
+from app.database.models.instruments import Instrument, MarketType, OptionType
 from app.database.models.strategy import Setup
 from app.database.models.users import User
 from app.database.session import get_db
@@ -30,6 +30,13 @@ class InstrumentResponse(BaseModel):
     exchange: str
     market: str
     instrument_type: str
+    # Derivative identity. These were absent from both this schema and the
+    # create request, so an options contract could be registered but never
+    # read back as one -- see `InstrumentCreateRequest` below.
+    underlying: str | None = None
+    expiry: date | None = None
+    strike: float | None = None
+    option_type: OptionType | None = None
     lot_size: int
     tick_size: float
     active: bool
@@ -42,9 +49,57 @@ class InstrumentCreateRequest(BaseModel):
     exchange: str
     market: MarketType
     instrument_type: str
+    underlying: str | None = None
+    expiry: date | None = None
+    strike: float | None = None
+    option_type: OptionType | None = None
     lot_size: int = 1
     tick_size: float = 0.05
     currency: str = "INR"
+
+    @model_validator(mode="after")
+    def _derivative_fields_match_the_market(self) -> "InstrumentCreateRequest":
+        """`instruments` is the only table an options contract can be created
+        in, and this is the only endpoint that creates one.
+
+        These four columns exist on the model but were missing from this
+        request schema, and pydantic's default `extra="ignore"` meant a caller
+        supplying them got a 201 with the values silently discarded -- not
+        visible in the response either, since `InstrumentResponse` did not
+        carry them. The row was then permanently unusable:
+        `POST /options/execute` rejects any leg whose instrument has no
+        `option_type` or `strike` ("is not an options contract"), and there is
+        no endpoint that can repair an existing row. Multi-leg options
+        execution was unreachable through the API for every instrument the API
+        itself could create.
+
+        `strike` and `option_type` are required for `OPTIONS` because that is
+        exactly the invariant `app/api/options.py` enforces on read. `expiry`
+        is deliberately *not* required: no code path in `app/` reads
+        `Instrument.expiry` today, so demanding it would be inventing a
+        constraint nothing depends on. It should become required alongside
+        options-chain ingestion, when something finally prices against it.
+        """
+        if self.market is MarketType.OPTIONS:
+            missing = [
+                name for name in ("strike", "option_type") if getattr(self, name) is None
+            ]
+            if missing:
+                raise ValueError(
+                    f"market=OPTIONS requires {' and '.join(missing)}; an options contract "
+                    "without them is rejected by POST /options/execute as \"not an options "
+                    "contract\" and cannot be repaired through the API."
+                )
+        else:
+            present = [
+                name for name in ("strike", "option_type") if getattr(self, name) is not None
+            ]
+            if present:
+                raise ValueError(
+                    f"{' and '.join(present)} is only meaningful for market=OPTIONS, "
+                    f"not {self.market.value}."
+                )
+        return self
 
 
 @router.get("/instruments", response_model=list[InstrumentResponse])

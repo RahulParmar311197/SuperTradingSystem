@@ -5418,6 +5418,87 @@ _paper_account` goes through `POST /orders` (`source_key="manual"`), never a
 paper session. No test in the suite called DELETE with a position open.
 Shapes (b) and (e) together, in the one test named for the contract.
 
+## Cancelling a SUBMITTED order was dead by construction (§57, §101)
+
+`POST /orders/{id}/cancel` decides which statuses may be cancelled:
+
+```python
+if order.status not in (OrderStatus.SUBMITTED, OrderStatus.ACKNOWLEDGED):
+    raise HTTPException(409, ...)
+```
+
+`app.trading.order_manager._ALLOWED_TRANSITIONS` decides which may actually
+move to `CANCELLED`, and its `SUBMITTED` row was
+`{ACKNOWLEDGED, REJECTED, FAILED}`. The two halves of one contract disagreed
+about the same status, so every cancel of a SUBMITTED order raised
+`IllegalTransitionError` at the transition line — which the catch-all handler
+in `app/main.py` turns into a 500. Nothing below that line ran: no
+`persist_order`, no `record_audit`, no websocket publish, and the order's
+status did not move. Measured end to end through the API against a wedged
+order:
+
+```
+before: POST /orders/{id}/cancel -> 500,  status after: SUBMITTED
+after : POST /orders/{id}/cancel -> 200,  status after: CANCELLED
+```
+
+SUBMITTED is also the state most in need of cancelling.
+`ExecutionEngine.submit` transitions to SUBMITTED and *then* awaits
+`broker.place_order`; if that call raises, the order rests there forever.
+`UpstoxBroker.place_order` converts `httpx.HTTPStatusError` and `BrokerError`
+into a REJECTED result — the adapter's own comment explains that letting a
+`BrokerError` propagate would "permanently wedge the order at SUBMITTED: any
+retry with the same order params returns `created=False` and never calls
+`submit()` again" — but an ordinary transport failure against its 10-second
+client (`ConnectError`, `ReadTimeout`, `RemoteProtocolError`, `PoolTimeout`)
+is not caught and still propagates. That earlier fix closed one shape of the
+wedge and left the other open.
+
+Such an order is in the worst possible state. It exists only in the API
+process's `OrderManager`: `place_order` aborted before `persist_order`, so
+there is no `orders` row at all — `GET /orders` shows it, `GET /admin/orders`
+does not. It has no `broker_order_id`, so `reconcile_orders` reports it as
+"SUBMITTED locally but was never submitted to the broker" and
+`ReconciliationWorker` halts the account; an admin
+`POST /admin/accounts/{id}/resume` is undone by the next pass, indefinitely,
+and new entries stay 423-blocked for that account the whole time. The one
+escape hatch was `POST /orders/{id}/cancel`, and it was the single thing that
+could not work. `app/api/orders.py` is the only caller in `app/` that
+transitions to `CANCELLED` at all, so nothing else could clear it either.
+
+The fix adds `CANCELLED` to the `SUBMITTED` row, making the table agree with
+the contract the endpoint already advertised. This is LATENT rather than
+live: `MockBroker.place_order` cannot raise and `DhanBroker` fails earlier
+(`get_quote`/`get_account` raise `NotImplementedError` before an order is
+created), so it needs a connected Upstox account plus a transport-level
+failure — the canonical broker failure mode, on the one path that handles
+real money.
+
+**The mirror mismatch is deliberately left alone.** The table permits
+`PARTIALLY_FILLED → CANCELLED`, but the endpoint's guard refuses
+PARTIALLY_FILLED with a 409, so that entry is reachable from no caller. That
+asymmetry harms nothing — a table edge nobody takes — and admitting it would
+be a decision about partial-fill semantics rather than a repair: cancelling
+there retires the order while the filled portion remains a real open
+position, and nothing on this path reconciles the remainder. Fixing the half
+that crashes and recording the half that merely sits idle is the honest split.
+
+The regression test pins the *relationship* rather than the instance:
+`tests/trading/test_cancel_transitions.py` parametrises over the statuses the
+endpoint admits and asserts each can reach `CANCELLED`, so widening either
+half without the other fails immediately.
+
+Why the suite could not see this.
+`tests/api/test_orders.py::test_cancel_order_broker_failure_is_surfaced_cleanly_and_leaves_status_unchanged`
+is the only test of this endpoint and its docstring claims to cover "a still
+cancelable order" — but its `_NeverFillsBroker` *returns* an ACKNOWLEDGED
+result rather than raising, and `ExecutionEngine.submit` unconditionally
+transitions to ACKNOWLEDGED anyway, which the table always permitted. No test
+double anywhere in the suite raises from `place_order`, so no fixture could
+produce an order resting at SUBMITTED, and the SUBMITTED row of
+`_ALLOWED_TRANSITIONS` had no test of its own. Shape (b) again, with the
+fixture's own docstring naming the contract it could not reach.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

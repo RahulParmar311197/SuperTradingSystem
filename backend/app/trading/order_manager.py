@@ -20,7 +20,29 @@ _ALLOWED_TRANSITIONS: dict[OrderStatus, set[OrderStatus]] = {
     OrderStatus.CREATED: {OrderStatus.VALIDATING, OrderStatus.REJECTED, OrderStatus.FAILED},
     OrderStatus.VALIDATING: {OrderStatus.RISK_APPROVED, OrderStatus.REJECTED},
     OrderStatus.RISK_APPROVED: {OrderStatus.SUBMITTED, OrderStatus.REJECTED, OrderStatus.FAILED},
-    OrderStatus.SUBMITTED: {OrderStatus.ACKNOWLEDGED, OrderStatus.REJECTED, OrderStatus.FAILED},
+    # CANCELLED belongs here because `POST /orders/{id}/cancel` admits a
+    # SUBMITTED order by contract (`app/api/orders.py`), and without it that
+    # branch was dead by construction: every such request raised
+    # `IllegalTransitionError`, which the catch-all handler in `app/main.py`
+    # turns into a 500, so none of the persist / audit / publish work below
+    # the transition ran and the order's status did not move.
+    #
+    # It is also the state most in need of cancelling. `ExecutionEngine.submit`
+    # moves an order to SUBMITTED and *then* awaits `broker.place_order`; if
+    # that call raises, the order rests here forever. `UpstoxBroker.place_order`
+    # converts `HTTPStatusError` and `BrokerError` into a REJECTED result, but
+    # a transport failure (ConnectError, ReadTimeout, RemoteProtocolError,
+    # PoolTimeout) still propagates. Such an order has no `broker_order_id`
+    # and no `orders` row -- `place_order` aborted before `persist_order` --
+    # so `reconcile_orders` reports it as "SUBMITTED locally but never
+    # submitted to the broker" and halts the account every pass. Cancelling is
+    # the only way to clear it, and it was the one thing that could not work.
+    OrderStatus.SUBMITTED: {
+        OrderStatus.ACKNOWLEDGED,
+        OrderStatus.CANCELLED,
+        OrderStatus.REJECTED,
+        OrderStatus.FAILED,
+    },
     OrderStatus.ACKNOWLEDGED: {OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.EXPIRED},
     OrderStatus.PARTIALLY_FILLED: {OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED, OrderStatus.CANCELLED},
     OrderStatus.FILLED: {OrderStatus.MONITORING, OrderStatus.CLOSED},

@@ -20,7 +20,7 @@ def _matched_result() -> StrategyEvaluationResult:
 
 
 def test_valid_proposal_matching_deterministic_result_passes():
-    proposal = {"direction": "bullish", "entry": 100.1, "stop": 98.0, "risk_reward": 2.0, "risk_percent": 0.5}
+    proposal = {"decision": "TRADE", "direction": "bullish", "entry": 100.1, "stop": 98.0, "risk_reward": 2.0, "risk_percent": 0.5}
     result = validate_ai_trade_proposal(proposal, _matched_result(), instrument_tradable=True, max_risk_percent=1.0)
     assert result.valid is True
     assert result.errors == []
@@ -29,7 +29,7 @@ def test_valid_proposal_matching_deterministic_result_passes():
 def test_rejects_when_no_signal_exists():
     no_signal = StrategyEvaluationResult(matched=False, satisfied=[], missing=["fvg"])
     result = validate_ai_trade_proposal(
-        {"direction": "bullish", "entry": 100, "stop": 98, "risk_reward": 2, "risk_percent": 0.5},
+        {"decision": "TRADE", "direction": "bullish", "entry": 100, "stop": 98, "risk_reward": 2, "risk_percent": 0.5},
         no_signal,
         instrument_tradable=True,
         max_risk_percent=1.0,
@@ -39,21 +39,21 @@ def test_rejects_when_no_signal_exists():
 
 
 def test_rejects_hallucinated_entry_price():
-    proposal = {"direction": "bullish", "entry": 150.0, "stop": 98.0, "risk_reward": 2.0, "risk_percent": 0.5}
+    proposal = {"decision": "TRADE", "direction": "bullish", "entry": 150.0, "stop": 98.0, "risk_reward": 2.0, "risk_percent": 0.5}
     result = validate_ai_trade_proposal(proposal, _matched_result(), instrument_tradable=True, max_risk_percent=1.0)
     assert result.valid is False
     assert any("entry" in e for e in result.errors)
 
 
 def test_rejects_excessive_risk_percent():
-    proposal = {"direction": "bullish", "entry": 100.0, "stop": 98.0, "risk_reward": 2.0, "risk_percent": 5.0}
+    proposal = {"decision": "TRADE", "direction": "bullish", "entry": 100.0, "stop": 98.0, "risk_reward": 2.0, "risk_percent": 5.0}
     result = validate_ai_trade_proposal(proposal, _matched_result(), instrument_tradable=True, max_risk_percent=1.0)
     assert result.valid is False
     assert any("risk_percent" in e for e in result.errors)
 
 
 def test_rejects_untradable_instrument():
-    proposal = {"direction": "bullish", "entry": 100.0, "stop": 98.0, "risk_reward": 2.0, "risk_percent": 0.5}
+    proposal = {"decision": "TRADE", "direction": "bullish", "entry": 100.0, "stop": 98.0, "risk_reward": 2.0, "risk_percent": 0.5}
     result = validate_ai_trade_proposal(proposal, _matched_result(), instrument_tradable=False, max_risk_percent=1.0)
     assert result.valid is False
     assert any("not currently tradable" in e for e in result.errors)

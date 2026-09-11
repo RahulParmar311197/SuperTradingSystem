@@ -269,3 +269,105 @@ async def test_propose_trade_flags_a_hallucinated_entry(require_infra, monkeypat
     finally:
         client.__exit__(None, None, None)
         await _cleanup(user_id, instrument_id, strategy_id)
+
+
+async def test_propose_trade_records_a_decision_when_the_ai_states_non_numeric_prices(require_infra, monkeypatch):
+    # Regression test: the AI answering with valid JSON whose numbers are
+    # prose ("N/A", "1,250.50") used to raise ValueError out of
+    # `validate_ai_trade_proposal` -- which runs *after* this endpoint's
+    # try/except around the provider call and *before* it writes the
+    # AIDecision row -- so the caller got a bare 500 and the audit trail
+    # recorded nothing at all about what the AI said. It is a validation
+    # failure like any other hallucination: reported, and recorded.
+    client, token, user_id, instrument_id, strategy_id = await _setup()
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        fake_proposal = {
+            "decision": "NO_TRADE",
+            "direction": "bullish",
+            "entry": "N/A",
+            "stop": "N/A",
+            "risk_reward": "N/A",
+            "risk_percent": "N/A",
+            "reasoning": "Setup invalidated by the last bar.",
+        }
+        monkeypatch.setattr("app.api.ai.get_ai_client", lambda settings: _FakeAIClient(fake_proposal))
+
+        r = client.post(
+            "/ai/propose-trade",
+            json={"strategy_id": str(strategy_id), "instrument_id": str(instrument_id), "timeframe": "15m"},
+            headers=headers,
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["valid"] is False
+        assert any("entry" in e for e in body["errors"]), body["errors"]
+
+        async with async_session_factory() as db:
+            decision = (await db.execute(select(AIDecision).where(AIDecision.user_id == user_id))).scalar_one()
+            assert decision.validated is False
+            assert decision.output["entry"] == "N/A"
+    finally:
+        client.__exit__(None, None, None)
+        await _cleanup(user_id, instrument_id, strategy_id)
+
+
+async def test_propose_trade_rejects_a_declined_proposal_whose_numbers_match(require_infra, monkeypatch):
+    # Regression test: `decision` -- the field the system prompt exists to
+    # elicit -- was read by nothing, so an AI that declined the setup while
+    # dutifully echoing the deterministic entry/stop/RR it was told to
+    # match came back `valid: true`: a refusal presented to the operator as
+    # a validated proposal.
+    client, token, user_id, instrument_id, strategy_id = await _setup()
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        from app.database.session import async_session_factory as factory
+        from app.ict.engine import ICTConfig, ICTEngine
+        from app.market.repository import get_candles
+        from app.smc.engine import SMCConfig, SMCEngine
+        from app.strategy.context import EvaluationContext
+        from app.strategy.dsl import StrategyDefinition
+        from app.strategy.engine import StrategyEngine
+
+        async with factory() as db:
+            strategy_row = await db.get(StrategyRow, strategy_id)
+            strategy = StrategyDefinition.model_validate(strategy_row.definition)
+            candles = await get_candles(db, instrument_id, "15m")
+        context = EvaluationContext(
+            symbol="x",
+            timeframe="15m",
+            timestamp=candles[-1].timestamp,
+            current_price=candles[-1].close,
+            smc=SMCEngine(SMCConfig()).analyze(candles),
+            ict=ICTEngine(ICTConfig()).analyze(candles),
+        )
+        deterministic = StrategyEngine().evaluate(strategy, context)
+        assert deterministic.matched, "fixture strategy must actually match for this test to be meaningful"
+
+        fake_proposal = {
+            "decision": "NO_TRADE",
+            "direction": deterministic.direction,
+            "entry": deterministic.entry,
+            "stop": deterministic.stop,
+            "risk_reward": deterministic.risk_reward,
+            "risk_percent": 0.5,
+            "reasoning": "the numbers check out but I would not take this",
+        }
+        monkeypatch.setattr("app.api.ai.get_ai_client", lambda settings: _FakeAIClient(fake_proposal))
+
+        r = client.post(
+            "/ai/propose-trade",
+            json={"strategy_id": str(strategy_id), "instrument_id": str(instrument_id), "timeframe": "15m", "max_risk_percent": 1.0},
+            headers=headers,
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["valid"] is False, body
+        assert any("NO_TRADE" in e for e in body["errors"]), body["errors"]
+
+        async with async_session_factory() as db:
+            decision = (await db.execute(select(AIDecision).where(AIDecision.user_id == user_id))).scalar_one()
+            assert decision.validated is False
+    finally:
+        client.__exit__(None, None, None)
+        await _cleanup(user_id, instrument_id, strategy_id)

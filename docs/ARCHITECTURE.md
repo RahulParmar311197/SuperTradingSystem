@@ -5596,6 +5596,86 @@ weight sat unnoticed. Shapes (a), (b) and (f) together. The two operator
 tests have been retargeted to a live condition type so each proves the one
 thing it names.
 
+## The AI proposal validator trusted the AI's output shape (§81, §110, §131)
+
+`app/ai/validation.py` exists because the AI is not trusted: §131 "AI ≠ Final
+Authority", §32, §81 "AI Output Validation". Every *value* the model stated
+was cross-checked against the deterministic `StrategyEvaluationResult`. The
+*shape* of what it sent back was not checked at all.
+
+`AIClient.complete_json` is annotated `-> dict`, but the only thing the
+Anthropic adapter actually guarantees is `json.loads` succeeding
+(`_extract_json` in `app/ai/providers/anthropic_client.py`). A bare array, a
+string, a number, or an object whose `entry` is the text `"N/A"` are all
+valid JSON, and nothing between the model and the validator narrowed that.
+The validator then did:
+
+```python
+proposed_direction = str(proposal.get("direction", "")).lower()
+...
+if entry is None or not _within_tolerance(float(entry), deterministic_result.entry):
+```
+
+Measured against the module's own pinned matched setup:
+
+```
+{"entry": "N/A"}          -> ValueError: could not convert string to float: 'N/A'
+{"entry": "1,250.50"}     -> ValueError: could not convert string to float: '1,250.50'
+{"entry": {"value": 100}} -> TypeError: float() argument must be a string or a real number
+{"risk_reward": "2:1"}    -> ValueError
+{"risk_percent": "0.5%"}  -> ValueError
+["no trade"]              -> AttributeError: 'list' object has no attribute 'get'
+"NO_TRADE"                -> AttributeError: 'str' object has no attribute 'get'
+```
+
+None of those are exotic for an LLM writing prose numbers, and every one of
+them escaped as an exception from a function whose entire job is to *return*
+validation errors.
+
+Where it escaped to matters. `POST /ai/propose-trade` wraps the provider call
+in a try/except that records an `AIDecision` row for a failed or unparseable
+response — its docstring promises that audit row (§71, §79: "you can't
+evaluate AI behavior over time without a record of what it actually said").
+`validate_ai_trade_proposal` runs *after* that try/except and *before* the row
+is written, so an exception from it skipped the audit entirely. Measured end
+to end against a clean database, with the AI returning
+`{"decision": "NO_TRADE", "entry": "N/A", ...}`:
+
+```
+before:  HTTP 500,  AIDecision rows written: 0
+after:   HTTP 200,  AIDecision rows written: 1
+         valid=false, errors=["AI decision 'NO_TRADE' is not 'TRADE' — the AI
+         did not propose this trade", "Proposed entry 'N/A' is not a number", ...]
+```
+
+This is the third instance of the same audit hole in this one endpoint: a
+failing provider call and unparseable content were both closed earlier; the
+*parsed but malformed* payload was the half nobody had reached, because no
+test had ever fed the validator anything but well-formed floats.
+
+The second half of the finding is `decision`. `_TRADE_PROPOSAL_SYSTEM_PROMPT`
+demands `"decision": "TRADE"` or `"NO_TRADE"` — it is the one field in the
+response carrying the model's own verdict — and grepping `app/` for a reader
+finds none. Only the prompt writes about it. So a model that declined the
+setup while dutifully echoing the deterministic entry/stop/RR it was
+instructed to match came back `valid: true`: in §87 "Assisted" mode, a refusal
+presented to the operator as a validated proposal. The validator now reads it,
+and treats an absent verdict the same as a decline — a response that never
+states one is not an endorsement (§110 "no AI → no trade").
+
+The fix keeps every coercion inside the validator, where a bad value becomes a
+named error instead of a stack trace: `_as_float` rejects booleans (no
+`float(True) == 1.0` riding into a price) and non-finite values, a numeric
+string like `"100.1"` is still accepted so the check isn't stricter than the
+model needs, and a non-object response is one error rather than seven.
+
+**What this does not change.** Nothing else validates AI output shape:
+`POST /ai/chat` coerces its reply with `str(...)` and is unaffected, and
+`app/ai/strategy_builder.py` runs the response through the Strategy DSL
+schema, which already rejects malformed content. `EvaluationContext.indicators`
+is still unpopulated at this endpoint's construction site, so the structured
+facts handed to the model still carry an empty indicator bag.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

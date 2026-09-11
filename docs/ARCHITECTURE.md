@@ -5179,6 +5179,97 @@ cannot reach the breaking state.
 pinning that session pools never populate `member_indices` — the property the
 fix depends on.
 
+## `order_block_retest` was unfillable by construction (§24)
+
+`OrderBlock.mitigated` had two incompatible meanings. The writer,
+`app/smc/order_blocks.py::update_mitigation`, set it on the first candle whose
+range overlapped the block at all:
+
+```python
+if candle.low <= block.top and candle.high >= block.bottom:
+    block.mitigated = True
+```
+
+Every reader takes it to mean *still available to trade into*.
+`SMCContext.active_order_blocks` filters on `not mitigated`, and through that
+filter it drives `ConditionType.ORDER_BLOCK` (`app/strategy/evaluator.py`),
+the `order_block_retest` entry (`app/strategy/engine.py`), the AI context
+(`app/ai/context_builder.py`) and the chart overlay (`app/api/charts.py`).
+
+For a retest entry those two readings are not merely different, they are
+mutually exclusive. The entry is the block's midpoint, so
+`bottom <= entry <= top`. The fill gate both execution engines apply is
+`candle.low <= entry <= candle.high`. Together those force `candle.low <= top`
+and `candle.high >= bottom` — precisely the old mitigation test. And
+`SMCEngine.analyze` re-runs `detect_order_blocks` (which calls
+`update_mitigation` over the whole visible window, current bar included)
+*before* the strategy is evaluated. So the bar that could fill the retest was
+always the bar that had just removed the block from `active_order_blocks()`.
+The only exempt bar is `caused_event_index` itself, because the scan starts at
+`caused_event_index + 1` — meaning the entry could only ever fill on the
+structure-break candle, never on the retest it is named for.
+
+In practice it died even earlier than that. Measured on the suite's own swing
+fixture, which leaves an unmitigated bearish block at `[102, 107]`
+(midpoint 104.5) created by the break at bar 10, with a rally back into it:
+
+```
+bar | range        | active blocks | entry | fills
+ 11 | ( 95.0, 99.0) |      1       | 104.5 | no
+ 12 | ( 97.0,102.0) |      0       | None  | no   <- merely grazes the 102 edge
+ 13 | (100.0,106.0) |      0       | None  | no   <- the real retest, through 104.5
+```
+
+Bar 12 never reaches the midpoint; it only touches the block's lower edge, and
+that alone retired the zone a full bar before the setup triggered. On the same
+candles `BacktestEngine` booked **0 trades** for `order_block_retest` and **1
+trade** for `fvg_retest` — the same strategy shape, the same data, differing
+only in which zone type it keys on.
+
+The harm is not confined to backtests. `POST /scanner` and `ScannerWorker`
+apply no fill gate, so they do the inverse: they publish and persist a
+`Signal` naming `entry=104.5` on the bars where price is nowhere near it, then
+fall silent on the bar where it is actionable. The signal feed was live
+exactly when it was useless.
+
+The fix gives `OrderBlock` the graded fill its sibling already had.
+`app/smc/fvg.py::update_mitigation` accumulates a `filled_percentage` and only
+sets `mitigated` at full fill or on invalidation; order blocks now do the
+same, with the same direction convention — a bullish block is demand below
+price and fills downward from its top, a bearish block is supply above price
+and fills upward from its bottom. On the fixture above the retest bar grades
+0.8 and the block stays tradable, so the entry resolves and fills at 104.5;
+a later candle that trades fully through it, or engulfs it outright, still
+retires it.
+
+This closes a divergence rather than inventing a convention: two zone types
+that mean the same thing to every consumer were being retired by two
+different rules, and only one of them was compatible with how the entry
+resolution and fill gate work.
+
+One thing worth recording because it reads as a warning sign rather than a
+problem: `tests/workers/test_auto_trade_worker.py` uses `order_block_retest`
+as its `NEVER_MATCHING_DEFINITION`. That helper still never matches — its real
+gate is a *bearish* order-block condition against bullish fixture data, which
+produces no bearish blocks at all, verified directly — but the codebase having
+reached for this entry type as a reliable way to never fire is a fair summary
+of the defect.
+
+Why the suite could not see this. The two tests that look like retest
+coverage — `tests/backtest/test_engine.py::
+test_backtest_only_fills_a_retest_entry_once_price_actually_trades_there` and
+`tests/paper/test_engine.py::
+test_a_retest_entry_fills_at_its_level_not_at_the_candle_close` — assert the
+generic "a retest entry" contract, and the comments they guard name *both*
+retest types, but both fixtures use `EntryConfig(type="fvg_retest")` only.
+Because FVG mitigation is graded, a midpoint touch there is a partial fill and
+the gap stays active, so those fixtures structurally cannot reach the
+order-block branch. `tests/smc/test_order_blocks.py` had a single test that
+never touched `mitigated`. And `order_block_retest` had no positive-path
+coverage anywhere: its only other appearance under `tests/` is the
+never-matching definition above. Shapes (b) and (f) together.
+`tests/smc/test_order_block_mitigation.py` covers it now.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

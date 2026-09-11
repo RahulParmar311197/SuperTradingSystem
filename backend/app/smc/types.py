@@ -130,8 +130,17 @@ class OrderBlock:
     created_at: datetime
     strength: float
     caused_event_index: int
+    # Mirrors `FairValueGap`: `mitigated` means the zone is spent, not merely
+    # touched. `filled_percentage` is how deep price has traded into it, and
+    # `invalidated` means a single candle engulfed it outright.
     mitigated: bool = False
     mitigated_index: int | None = None
+    invalidated: bool = False
+    filled_percentage: float = 0.0
+
+    @property
+    def size(self) -> float:
+        return max(self.top - self.bottom, 0.0)
 
 
 @dataclass(slots=True)

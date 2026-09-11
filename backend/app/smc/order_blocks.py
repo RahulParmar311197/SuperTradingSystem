@@ -92,10 +92,54 @@ def detect_order_blocks(
 
 
 def update_mitigation(candles: list[Candle], blocks: list[OrderBlock]) -> None:
+    """Recomputes fill/mitigation state for each block from the candles after
+    the structure break that created it. Mutates the blocks in place.
+
+    A block is mitigated once price has traded *through* it, not the first
+    time a candle grazes it. The distinction decides whether the zone is still
+    tradable, because every consumer of `mitigated` -- `active_order_blocks`,
+    and through it `ConditionType.ORDER_BLOCK`, the `order_block_retest` entry,
+    the AI context and the chart overlay -- reads it as "still available to
+    trade into", not as "untouched since it formed".
+
+    Tripping on first overlap made those two readings contradict each other
+    and left `order_block_retest` unfillable by construction: the entry is the
+    block's midpoint, so any candle satisfying the engines' fill gate
+    (`low <= entry <= high`) necessarily overlaps the block, and `SMCEngine.
+    analyze` re-runs this function over the current bar before the strategy is
+    evaluated. The bar that could fill the retest was always the bar that had
+    just removed the block from `active_order_blocks()`. A merely adjacent bar
+    killed it even sooner.
+
+    This is the grading `app.smc.fvg.update_mitigation` already applies to the
+    sibling zone type, and the direction convention is the same: a bullish
+    block is demand below price, filled downward from its top; a bearish block
+    is supply above price, filled upward from its bottom.
+    """
     for block in blocks:
+        deepest_fill = 0.0
         for i in range(block.caused_event_index + 1, len(candles)):
             candle = candles[i]
-            if candle.low <= block.top and candle.high >= block.bottom:
-                block.mitigated = True
+            overlap_high = min(candle.high, block.top)
+            overlap_low = max(candle.low, block.bottom)
+            if overlap_high <= overlap_low:
+                continue
+
+            if block.direction == Direction.BULLISH:
+                fill_depth = block.top - overlap_low
+            else:
+                fill_depth = overlap_high - block.bottom
+            deepest_fill = max(deepest_fill, fill_depth)
+
+            if candle.low <= block.bottom and candle.high >= block.top:
+                block.invalidated = True
+
+            if block.mitigated_index is None and (
+                block.invalidated or (block.size and deepest_fill >= block.size)
+            ):
                 block.mitigated_index = i
-                break
+
+        block.filled_percentage = min(deepest_fill / block.size, 1.0) if block.size else 0.0
+        block.mitigated = block.filled_percentage >= 1.0 or block.invalidated
+        if not block.mitigated:
+            block.mitigated_index = None

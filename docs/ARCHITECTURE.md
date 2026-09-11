@@ -5676,6 +5676,62 @@ schema, which already rejects malformed content. `EvaluationContext.indicators`
 is still unpopulated at this endpoint's construction site, so the structured
 facts handed to the model still carry an empty indicator bag.
 
+## The rejection the validator produced could not be delivered (§81, §110)
+
+The section above closed the validator's side: `validate_ai_trade_proposal`
+now turns a response that isn't a JSON object into
+`AIValidationResult(valid=False, errors=["AI response was not a JSON object:
+list"])` instead of raising `AttributeError`. That fix was real but it was
+only half the path. `ProposeTradeResponse` still declared:
+
+```python
+    proposal: dict
+```
+
+So the endpoint computed the verdict correctly, committed the `AIDecision`
+audit row, and then raised `pydantic.ValidationError` constructing its own
+response — falling through to the catch-all handler as a **500**. The one
+error string the new validator branch exists to produce could not be
+observed by any API caller.
+
+Wrapping the object in a list is a routine LLM formatting slip, and
+`_extract_json` passes through whatever `json.loads` returned. Measured end
+to end against a clean database, with the AI answering
+`[{"decision": "TRADE", "entry": 100.0, ...}]`:
+
+```
+before:  HTTP 500  (ValidationError: proposal - Input should be a valid dictionary)
+after:   HTTP 200  {"valid": false,
+                    "errors": ["AI response was not a JSON object: list"],
+                    "proposal": [{...}], "decision_id": "beff963f-..."}
+```
+
+Identical results for a bare string, a bare number and `null` (`str`, `int`,
+`NoneType`). The audit row survives in every case — it is committed before
+the response is built — so the damage is narrower than the crash the
+previous section describes: what the caller loses is the structured
+rejection the endpoint's contract promises, and the `decision_id` of the row
+that was just written, leaving a recorded decision the client cannot
+reference.
+
+`proposal` is now `Any`: it echoes verbatim whatever the model returned, the
+same value already stored in `AIDecision.output` (a `JSON` column, which
+accepts all of these). Narrowing it to `dict` was the assumption under test.
+
+The sibling endpoint in the same file had the guard all along —
+`POST /ai/chat` reads `str(response.get("reply", "")) if isinstance(response,
+dict) else str(response)` — which is what made this an asymmetry rather than
+an open question: the same untrusted payload, two consumers, one control.
+
+**Why the suite missed it.** `_FakeAIClient.__init__` in
+`tests/api/test_ai_propose_trade.py` was annotated `response: dict` and every
+test passed a dict literal, so the fixture structurally could not reach a
+non-object response (blind-spot shape (b) again). The unit tests added with
+the previous fix *do* cover the non-object case, but call the validator
+directly — they asserted the branch worked while its only production caller
+could not deliver its result. The fake client is now typed `object`, the
+annotation that was the assumption in the first place.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

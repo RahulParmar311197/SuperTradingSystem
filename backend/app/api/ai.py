@@ -2,6 +2,7 @@ import dataclasses
 import json
 import uuid
 from datetime import datetime
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
@@ -129,7 +130,19 @@ class ProposeTradeResponse(BaseModel):
     decision_id: uuid.UUID
     valid: bool
     errors: list[str]
-    proposal: dict
+    # Whatever the AI actually returned, echoed verbatim -- the same value
+    # persisted in `AIDecision.output`. Deliberately NOT `dict`:
+    # `complete_json` is annotated `-> dict` but only guarantees that
+    # `json.loads` succeeded, so a model that wrapped its object in a list,
+    # or answered with a bare string, number or `null`, produces a
+    # perfectly ordinary non-object response. `validate_ai_trade_proposal`
+    # reports exactly that as `AI response was not a JSON object: list` --
+    # and declaring `dict` here made that verdict undeliverable, since
+    # constructing this model with the offending value raised
+    # `pydantic.ValidationError` *after* the audit row was committed,
+    # turning the structured 200 rejection into a 500 that also swallowed
+    # the `decision_id` of the row just written.
+    proposal: Any
     deterministic: dict
 
 

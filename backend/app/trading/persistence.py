@@ -104,6 +104,52 @@ async def persist_order(
     return row
 
 
+async def abandon_position_mirror(
+    db: AsyncSession,
+    user_id: uuid.UUID,
+    instrument_id: uuid.UUID,
+    execution_mode: ExecutionMode,
+    *,
+    source_key: str,
+) -> bool:
+    """Marks this source's open `positions` mirror not-open because the
+    engine behind it is gone, not because the position was exited. Returns
+    whether a row was actually found.
+
+    `persist_position` cannot express this: it derives `is_open` from a
+    `PositionRecord`, whose `is_open` is the property `quantity != 0`, so
+    there is no way to hand it "flat but never filled".
+
+    Deliberately journals no `Trade`. Nothing was sold at any price -- the
+    simulation was discarded -- and `GET /portfolio.total_realized_pnl`
+    sums the `trades` journal, so inventing an exit here would put a
+    fabricated P&L into the account's realized total. Leaving the row's
+    quantity and prices intact keeps the record of what the abandoned
+    session held; only its contribution to open exposure goes away.
+
+    The lookup is keyed exactly as `persist_position`'s is, so it can only
+    ever retire the row this source itself wrote.
+    """
+    row = (
+        await db.execute(
+            select(PositionRow).where(
+                PositionRow.user_id == user_id,
+                PositionRow.instrument_id == instrument_id,
+                PositionRow.execution_mode == execution_mode,
+                PositionRow.source_key == source_key,
+                PositionRow.is_open.is_(True),
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        return False
+
+    row.is_open = False
+    row.unrealized_pnl = 0.0
+    await db.commit()
+    return True
+
+
 async def persist_position(
     db: AsyncSession,
     user_id: uuid.UUID,

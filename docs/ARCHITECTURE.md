@@ -5340,6 +5340,84 @@ can create one. `docs/PRODUCTION_READINESS.md` has been corrected: its
 and disclosed only the missing chain ingestion, which was an overclaim of
 exactly this shape.
 
+## Deleting a paper session orphaned its mirrored position row (§49, §86)
+
+`feed_candle` mirrors a paper engine's position into Postgres on every candle
+under `source_key=f"paper:{session_id}"`, `execution_mode=PAPER`,
+`is_open=True` — the fix recorded two sections above, so that a large open
+paper position is visible to `GET /portfolio` rather than appearing only once
+it closes.
+
+`close_paper_session` took no `db` dependency at all. Its whole body was an
+ownership check and `del _SESSIONS[session_id]`, and its docstring claimed
+that "only the live working copy and any still-open position's unrealized
+state are discarded". The open `positions` row was the part that wasn't.
+
+Nothing else could clean it up either. `app/trading/persistence.py` is the
+only writer of `Position.is_open` anywhere in `app/`, and reaching it needs a
+live engine *and* the session's `source_key` — both of which this endpoint is
+in the act of destroying. A new session gets a new UUID and therefore a new
+key, so the row became permanently unaddressable.
+
+`app/risk/portfolio.py::compute_portfolio_exposure` sums exactly those rows.
+Measured on a fresh database, creating a session, feeding it until a LONG
+opened, and deleting it three times for one user on one instrument:
+
+```
+after delete #1: total_exposure=15606.06   open_position_count=0
+after delete #2: total_exposure=31212.12   open_position_count=0
+after delete #3: total_exposure=46818.18   open_position_count=0
+
+positions: 3 rows, all is_open=True, qty=151.5152 @ 103.0
+GET /paper/{id} -> 404 for all three
+```
+
+The account held nothing. Exposure grew by a whole position per cycle and
+never came back down, and `portfolio_snapshots` journaled the same inflation.
+The same orphaning happens to every open paper session lost to an API
+restart, since `_SESSIONS` is in-memory — that half belongs to the broader
+documented in-memory limitation and is not addressed here.
+
+**This was a reporting fault, not a control failure.** `RiskEngine`'s
+`current_exposure` on both `POST /orders` and `POST /options/execute` is
+summed from the in-memory `PositionManager`, never from this table, so
+nothing failed open — the number shown and journaled was wrong, but no gate
+was bypassed. (`open_position_count` reading 0 throughout is the separate,
+still-deferred memory-vs-DB split in `GET /portfolio`.)
+
+The endpoint now retires the mirror before dropping the session, through a
+new `abandon_position_mirror` in `app/trading/persistence.py`. It needs to be
+a distinct function rather than a `persist_position` call: that upsert
+derives `is_open` from a `PositionRecord`, whose `is_open` is the property
+`quantity != 0`, so there is no way to hand it "flat but never filled". The
+lookup is keyed identically to `persist_position`'s, so it can only ever
+retire the row this source itself wrote — deleting one session leaves a
+second session's still-open row untouched.
+
+Two deliberate choices about what *not* to do:
+
+* **No `Trade` is journaled.** Nothing was sold at any price; the simulation
+  was abandoned. `GET /portfolio.total_realized_pnl` sums the `trades`
+  journal, so inventing an exit here would put a fabricated P&L into the
+  account's realized total — a worse fault than the one being fixed.
+* **The row is retired, not deleted,** and keeps its quantity and average
+  price. `unrealized_pnl` is zeroed because an abandoned position has no live
+  mark. What the discarded session held stays on the record; only its
+  contribution to open exposure goes away.
+
+Why the suite could not see this. `tests/api/test_paper.py::
+test_create_get_feed_and_close_paper_session` is the test whose *name*
+asserts this exact contract, but its fixture feeds a single candle and
+`PaperTradingEngine.on_candle` cannot produce a signal from one bar — so no
+`positions` row is ever written and there is nothing to orphan. It asserts
+only 204 then 404. Its sibling `test_paper_trading_persists_the_open_position
+_to_the_database` does reach an open row and does assert `is_open is False`,
+but only via the natural target exit; it never deletes while the position is
+open. `tests/api/test_portfolio.py::test_portfolio_reports_real_exposure_for_a
+_paper_account` goes through `POST /orders` (`source_key="manual"`), never a
+paper session. No test in the suite called DELETE with a position open.
+Shapes (b) and (e) together, in the one test named for the contract.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

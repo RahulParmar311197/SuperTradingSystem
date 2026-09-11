@@ -22,7 +22,7 @@ from app.notifications.service import create_notification
 from app.paper.engine import PaperTradingEngine
 from app.smc.types import Candle
 from app.strategy.dsl import StrategyDefinition
-from app.trading.persistence import persist_position
+from app.trading.persistence import abandon_position_mirror, persist_position
 
 router = APIRouter(prefix="/paper", tags=["paper"])
 
@@ -312,12 +312,45 @@ async def feed_candle(
 
 
 @router.delete("/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def close_paper_session(session_id: uuid.UUID, user: User = Depends(get_current_user)) -> None:
-    """Ends a paper trading session, freeing its in-memory engine.
+async def close_paper_session(
+    session_id: uuid.UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Ends a paper trading session, freeing its in-memory engine and
+    retiring the `positions` row it was mirroring.
+
     `_SESSIONS` has no automatic eviction — every created session stays in
     process memory until this is called or the process restarts. Closed
-    trades are already journaled (see `feed_candle`) by the time this
-    runs; only the live working copy and any still-open position's
-    unrealized state are discarded."""
-    _get_owned_session(session_id, user)
+    trades are already journaled (see `feed_candle`) by the time this runs.
+
+    The mirror has to be retired here because nothing else can. `feed_candle`
+    writes it under `source_key=f"paper:{session_id}"`, and
+    `app/trading/persistence.py` is the only writer of `Position.is_open`
+    anywhere in `app/` — reaching it needs a live engine *and* that
+    `source_key`, both of which this endpoint is in the act of destroying. A
+    new session gets a new UUID and therefore a new key, so a row left open
+    here can never be addressed again by anything. It stayed
+    `is_open=True` forever, and `app/risk/portfolio.py::compute_portfolio_exposure`
+    sums exactly those rows: deleting a session three times with a position
+    open drove `GET /portfolio.total_exposure` to 15606 → 31212 → 46818 for
+    an account holding nothing, and `portfolio_snapshots` journaled the same
+    inflation. (The risk gates are unaffected — `RiskEngine`'s
+    `current_exposure` comes from the in-memory `PositionManager`, not this
+    table — so this was a wrong reported number, never a bypassed control.)
+
+    No `Trade` is journaled: the position was not exited at any price, the
+    simulation was abandoned, and `total_realized_pnl` sums the `trades`
+    table."""
+    session = _get_owned_session(session_id, user)
+    engine = session.engine
+    position = engine.position_manager.get(engine.account_id, engine.symbol)
+    if position is not None and position.is_open:
+        await abandon_position_mirror(
+            db,
+            user.id,
+            session.instrument_id,
+            ExecutionMode.PAPER,
+            source_key=f"paper:{session_id}",
+        )
     del _SESSIONS[session_id]

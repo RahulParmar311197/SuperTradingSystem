@@ -35,7 +35,12 @@ _UNIT = [
 
 
 class _FakeAIClient(AIClient):
-    def __init__(self, response: dict) -> None:
+    # `response` is deliberately typed `object`, not `dict`: the base
+    # method's `-> dict` annotation is exactly the assumption that broke
+    # these paths, since a real provider only guarantees that `json.loads`
+    # succeeded. Every test in this file used to pass a dict literal, so
+    # the fixture itself could not reach a non-object response.
+    def __init__(self, response: object) -> None:
         self.response = response
 
     async def complete_json(self, prompt: str, system: str | None = None) -> dict:
@@ -368,6 +373,52 @@ async def test_propose_trade_rejects_a_declined_proposal_whose_numbers_match(req
         async with async_session_factory() as db:
             decision = (await db.execute(select(AIDecision).where(AIDecision.user_id == user_id))).scalar_one()
             assert decision.validated is False
+    finally:
+        client.__exit__(None, None, None)
+        await _cleanup(user_id, instrument_id, strategy_id)
+
+
+@pytest.mark.parametrize(
+    ("response", "type_name"),
+    [
+        ([{"decision": "TRADE", "direction": "bullish", "entry": 100.0}], "list"),
+        ("I would not take this trade.", "str"),
+        (0, "int"),
+        (None, "NoneType"),
+    ],
+)
+async def test_propose_trade_reports_a_non_object_ai_response_instead_of_500ing(
+    require_infra, monkeypatch, response, type_name
+):
+    # Regression test: `validate_ai_trade_proposal` reports a response that
+    # isn't a JSON object as `AI response was not a JSON object: list`, but
+    # `ProposeTradeResponse.proposal` was declared `dict`, so constructing
+    # the response with the offending value raised `pydantic.ValidationError`
+    # -- after the AIDecision row was committed. The caller got a 500 and
+    # lost the `decision_id` of the row that had just been written, and the
+    # validator branch could never be observed through the API at all.
+    # Wrapping the object in a list is a routine LLM formatting slip.
+    client, token, user_id, instrument_id, strategy_id = await _setup()
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        monkeypatch.setattr("app.api.ai.get_ai_client", lambda settings: _FakeAIClient(response))
+
+        r = client.post(
+            "/ai/propose-trade",
+            json={"strategy_id": str(strategy_id), "instrument_id": str(instrument_id), "timeframe": "15m"},
+            headers=headers,
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["valid"] is False
+        assert any(type_name in e for e in body["errors"]), body["errors"]
+        assert body["proposal"] == response
+        assert body["decision_id"]
+
+        async with async_session_factory() as db:
+            decision = (await db.execute(select(AIDecision).where(AIDecision.user_id == user_id))).scalar_one()
+            assert decision.validated is False
+            assert str(decision.id) == body["decision_id"]
     finally:
         client.__exit__(None, None, None)
         await _cleanup(user_id, instrument_id, strategy_id)

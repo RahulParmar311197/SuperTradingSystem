@@ -1,6 +1,6 @@
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import service as auth_service
@@ -22,6 +22,38 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 _login_rate_limit = rate_limit(limit=10, window_seconds=60, key_prefix="auth:login")
 _register_rate_limit = rate_limit(limit=5, window_seconds=60, key_prefix="auth:register")
 
+# `UserSession.device_info` is `String(500)`, and a User-Agent is arbitrary
+# client-supplied text with no length bound. Postgres does not silently
+# truncate an over-long value into a VARCHAR(n) -- it raises
+# `StringDataRightTruncation` (measured: 500 chars insert fine, 501 fails),
+# which would turn a login into a 500 for whoever sent the long header. The
+# truncation happens here rather than in the column so what is stored is a
+# deliberate prefix rather than a failed insert.
+_MAX_DEVICE_INFO = 500
+
+
+def _device_info(request: Request) -> str | None:
+    """The calling device, as the only thing that distinguishes one live
+    session from another in `GET /auth/sessions` (blueprint §69 "Device
+    tracking").
+
+    `_issue_tokens` has accepted a `device_info` argument since the
+    beginning and `refresh()` faithfully carries it across every token
+    rotation -- but no caller ever supplied one, so every row's column held
+    `NULL` and the session list showed a user N indistinguishable entries.
+    That makes `POST /auth/sessions/{id}/revoke` unusable for its actual
+    purpose: picking out the session that isn't yours.
+
+    The User-Agent is the only device signal available here -- it is
+    unverified client input and is treated purely as a display label,
+    never as identity. A request without the header (a bare API client)
+    stores `NULL`, as before.
+    """
+    user_agent = request.headers.get("user-agent")
+    if not user_agent:
+        return None
+    return user_agent[:_MAX_DEVICE_INFO]
+
 
 @router.post(
     "/register",
@@ -37,9 +69,13 @@ async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db))
 
 
 @router.post("/login", response_model=TokenResponse, dependencies=[Depends(_login_rate_limit)])
-async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)) -> TokenResponse:
+async def login(
+    payload: LoginRequest, request: Request, db: AsyncSession = Depends(get_db)
+) -> TokenResponse:
     try:
-        access_token, refresh_token = await auth_service.login(db, payload.email, payload.password)
+        access_token, refresh_token = await auth_service.login(
+            db, payload.email, payload.password, device_info=_device_info(request)
+        )
     except auth_service.AuthError as exc:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(exc)) from exc
     return TokenResponse(access_token=access_token, refresh_token=refresh_token)

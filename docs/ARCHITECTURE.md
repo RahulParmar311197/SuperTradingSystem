@@ -810,9 +810,10 @@ token. No user action — logging out, revoking a specific device, reacting
 to a suspected compromise — could set it. A stolen refresh token, or a
 forgotten logged-in shared computer, stayed valid until its multi-day
 natural expiry (`refresh_token_expire_days`) with zero self-service
-remediation. `device_info` was written at every login and never read back
-by anything — collected, but write-only, making "device tracking" nothing
-more than an unused column.
+remediation. `device_info` was believed at the time to be "written at
+every login and never read back — collected, but write-only". That
+diagnosis was exactly inverted, and the section near the end of this
+document on device tracking records what was actually true.
 
 Fixed by adding three endpoints to `app/api/auth.py`:
 - **`POST /auth/logout`** — takes a `refresh_token` (same shape as
@@ -825,8 +826,9 @@ Fixed by adding three endpoints to `app/api/auth.py`:
   are. Same "a kill switch must never be harder to reach" principle
   already applied to `POST /auto-trading/disable`.
 - **`GET /auth/sessions`** — lists the caller's currently-active sessions
-  (not revoked, not expired), finally surfacing `device_info`. This is
-  the first code in the repository that ever reads that column back.
+  (not revoked, not expired), surfacing `device_info`. This is the first
+  code in the repository that ever reads that column back — though, as it
+  turned out, it had nothing to read.
 - **`POST /auth/sessions/{id}/revoke`** — revokes a specific session by
   id, ownership-checked the same way `/paper/*` and `/replay/*` sessions
   are: a non-owner gets `404`, never a `403` that would confirm the
@@ -835,8 +837,9 @@ Fixed by adding three endpoints to `app/api/auth.py`:
 `tests/api/test_auth_sessions.py` proves: logging out actually invalidates
 the refresh token (a subsequent `/auth/refresh` with the same token
 returns `401`); logout is idempotent for an already-revoked session and
-tolerates a garbage token without raising; `GET /auth/sessions` reflects
-`device_info` and shrinks once a listed session is revoked; a non-owner
+tolerates a garbage token without raising; `GET /auth/sessions` shrinks
+once a listed session is revoked (it was claimed to prove that the
+endpoint "reflects `device_info`", which it did not — see below); a non-owner
 revoking someone else's session gets `404` and the session stays
 un-revoked. Reverting `logout()`'s body to a no-op reproduces the original
 gap immediately — the refresh token keeps working after "logout" (verified
@@ -5731,6 +5734,74 @@ the previous fix *do* cover the non-object case, but call the validator
 directly — they asserted the branch worked while its only production caller
 could not deliver its result. The fake client is now typed `object`, the
 annotation that was the assumption in the first place.
+
+## "Device tracking" tracked nothing: `device_info` had no writer (§69)
+
+`UserSession.device_info` is `String(500)`. `_issue_tokens` has taken a
+`device_info` argument since the first commit, `refresh()` faithfully
+carries it across every token rotation, `SessionResponse` exposes it, and
+`GET /auth/sessions` returns it. Every layer was in place except one:
+
+```python
+async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)):
+    access_token, refresh_token = await auth_service.login(db, payload.email, payload.password)
+```
+
+`POST /auth/login` took no `Request` and called the service with three
+positional arguments, so `device_info` fell back to its `None` default —
+on every login, of every user, forever. `UserSession(...)` is constructed
+in exactly one place in the repository, so there was no other path by
+which a non-`NULL` value could reach that column, and `grep -rn
+"user_agent" app/` returned nothing at all.
+
+Two logins from genuinely different devices, measured end to end:
+
+```
+User-Agent: Mozilla/5.0 (Macintosh) Chrome/120.0.0.0 Safari/537.36
+User-Agent: SuperTradingSystem-Android/1.4 (Pixel 8)
+
+GET /auth/sessions ->
+   device_info=None  id=729b7f7d
+   device_info=None  id=63611e8e
+```
+
+The SQL log shows both `INSERT INTO sessions` statements binding `None`
+for `device_info`. A user with five live sessions saw five identical rows,
+which makes `POST /auth/sessions/{id}/revoke` unusable for the thing it
+exists to do: pick out the session that isn't yours. That endpoint, the
+reuse-detection revoke-everything path in `refresh()`, and this column were
+all added together as §69's account-security story; the column being empty
+is what left that story half-built.
+
+The section above on logout and session management says `device_info` "was
+written at every login and never read back by anything — collected, but
+write-only". That was the inverse of the truth, and the docstring on
+`list_sessions` repeated it ("has been collected at login since the
+beginning, but nothing ever read it back"). The reader was the part that
+existed. Both have been corrected.
+
+`POST /auth/login` now takes the `Request` and stores the caller's
+User-Agent. Two details are load-bearing:
+
+- **It is truncated to 500 characters.** A User-Agent is unbounded
+  client-supplied text and Postgres does not silently truncate into a
+  `VARCHAR(n)` — measured, a 500-character value inserts and a
+  501-character value raises `StringDataRightTruncation`. Storing the
+  header unguarded would have converted this fix into a 500 on the login
+  of whoever sent a long one.
+- **It is a display label, never identity.** The value is unverified
+  client input; nothing authenticates or authorizes on it. A request with
+  no User-Agent (a bare API client) still stores `NULL`.
+
+**What this does not do.** There is no IP address, no geolocation, and no
+attempt to canonicalize a User-Agent into "Chrome on macOS" — the raw
+header is what is stored and shown. Sessions created before this change
+keep their `NULL`, and rotate with it, until the user logs in again.
+`tests/api/test_auth_sessions.py::test_sessions_lists_device_info_and_revoke_removes_it`
+had set a `User-Agent` header and named itself after `device_info` while
+asserting only on the session count and id — blind-spot shape (e), a test
+whose name claims a contract its assertions never reach. It now asserts
+the value.
 
 ## Multi-leg options execution (§37-40)
 

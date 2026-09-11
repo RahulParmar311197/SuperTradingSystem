@@ -157,11 +157,19 @@ async def logout(db: AsyncSession, refresh_token: str) -> None:
 
 
 async def list_sessions(db: AsyncSession, user_id: uuid.UUID) -> list[UserSession]:
-    """Blueprint §69 "Device tracking": `device_info` has been collected at
-    login since the beginning, but nothing ever read it back -- this is
-    the first endpoint that actually surfaces it. Only currently-active
-    sessions (not revoked, not yet expired) are worth showing; a long
-    history of dead sessions isn't "device tracking", it's noise."""
+    """Blueprint §69 "Device tracking": the sessions a user currently has
+    open, so they can spot one that isn't theirs and revoke it.
+
+    An earlier version of this docstring claimed `device_info` "has been
+    collected at login since the beginning" and merely lacked a reader.
+    That was backwards: `_issue_tokens` accepted the argument and nothing
+    ever passed one, so every row held `NULL` and this endpoint returned a
+    list of indistinguishable sessions. `POST /auth/login` now supplies the
+    caller's User-Agent (see `_device_info` in app/api/auth.py).
+
+    Only currently-active sessions (not revoked, not yet expired) are worth
+    showing; a long history of dead sessions isn't "device tracking", it's
+    noise."""
     result = await db.execute(
         select(UserSession)
         .where(

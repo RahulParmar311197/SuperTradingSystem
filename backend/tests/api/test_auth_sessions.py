@@ -117,12 +117,14 @@ async def test_refresh_token_reuse_revokes_every_session_and_audits(require_infr
 
 
 async def test_sessions_lists_device_info_and_revoke_removes_it(require_infra):
-    # Regression test: UserSession.device_info has been written at every
-    # login since the beginning, but nothing ever read it back --
-    # write-only data, making "device tracking" (blueprint §69)
-    # nonfunctional. This proves GET /auth/sessions actually surfaces it,
-    # and that POST /auth/sessions/{id}/revoke removes a session from that
-    # list (via the account-holder's own action, distinct from /logout's
+    # This test set a User-Agent header and named itself after
+    # device_info, but asserted only on len(sessions) and the session id --
+    # so it passed for years while every row's device_info was NULL,
+    # because POST /auth/login never passed one to _issue_tokens at all.
+    # The assertion its name always implied is now here; see also
+    # test_login_records_the_calling_device below. It still proves the
+    # other half: POST /auth/sessions/{id}/revoke removes a session from
+    # the list (the account-holder's own action, distinct from /logout's
     # "revoke the session I'm currently using").
     with TestClient(app) as client:
         email = f"sessionslist-{uuid.uuid4().hex[:8]}@example.com"
@@ -143,6 +145,7 @@ async def test_sessions_lists_device_info_and_revoke_removes_it(require_infra):
             assert r.status_code == 200, r.text
             sessions = r.json()
             assert len(sessions) == 1
+            assert sessions[0]["device_info"] == "pytest-device-a"
             session_id = sessions[0]["id"]
 
             r = client.post(f"/auth/sessions/{session_id}/revoke", headers=headers)
@@ -179,3 +182,128 @@ async def test_user_cannot_revoke_another_users_session(require_infra):
         finally:
             await _cleanup(owner_id)
             await _cleanup(other_id)
+
+
+async def test_login_records_the_calling_device_so_sessions_are_distinguishable(require_infra):
+    # Regression test: `_issue_tokens` has accepted `device_info` since the
+    # beginning and `refresh()` carries it across rotations, but POST
+    # /auth/login never supplied one -- it took no `Request` and called the
+    # service with three positional arguments, so the parameter fell back
+    # to its `None` default on every login of every user. GET
+    # /auth/sessions therefore listed N indistinguishable rows, and
+    # "which of these is the attacker's session?" -- the question
+    # POST /auth/sessions/{id}/revoke exists to answer -- was unanswerable.
+    desktop = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/120.0.0.0 Safari/537.36"
+    phone = "SuperTradingSystem-Android/1.4 (Pixel 8)"
+    with TestClient(app) as client:
+        email = f"devicetrack-{uuid.uuid4().hex[:8]}@example.com"
+        r = client.post("/auth/register", json={"email": email, "password": "testpass123", "name": "Device"})
+        assert r.status_code == 201, r.text
+        user_id = uuid.UUID(r.json()["id"])
+        try:
+            r = client.post(
+                "/auth/login",
+                json={"email": email, "password": "testpass123"},
+                headers={"User-Agent": desktop},
+            )
+            assert r.status_code == 200, r.text
+            headers = {"Authorization": f"Bearer {r.json()['access_token']}"}
+
+            r = client.post(
+                "/auth/login",
+                json={"email": email, "password": "testpass123"},
+                headers={"User-Agent": phone},
+            )
+            assert r.status_code == 200, r.text
+
+            r = client.get("/auth/sessions", headers=headers)
+            assert r.status_code == 200, r.text
+            devices = sorted(s["device_info"] for s in r.json())
+            assert devices == sorted([desktop, phone]), devices
+        finally:
+            await _cleanup(user_id)
+
+
+async def test_an_over_long_user_agent_is_truncated_rather_than_failing_the_login(require_infra):
+    # `device_info` is String(500) and a User-Agent is unbounded client
+    # input. Postgres raises StringDataRightTruncation rather than
+    # silently truncating (measured: 500 chars inserts, 501 does not), so
+    # an unguarded header would turn someone's login into a 500.
+    long_agent = "Mozilla/5.0 " + "X" * 900
+    with TestClient(app) as client:
+        email = f"devicelong-{uuid.uuid4().hex[:8]}@example.com"
+        r = client.post("/auth/register", json={"email": email, "password": "testpass123", "name": "Long"})
+        assert r.status_code == 201, r.text
+        user_id = uuid.UUID(r.json()["id"])
+        try:
+            r = client.post(
+                "/auth/login",
+                json={"email": email, "password": "testpass123"},
+                headers={"User-Agent": long_agent},
+            )
+            assert r.status_code == 200, r.text
+            headers = {"Authorization": f"Bearer {r.json()['access_token']}"}
+
+            r = client.get("/auth/sessions", headers=headers)
+            assert r.status_code == 200, r.text
+            stored = r.json()[0]["device_info"]
+            assert len(stored) == 500
+            assert stored == long_agent[:500]
+        finally:
+            await _cleanup(user_id)
+
+
+async def test_a_login_with_no_user_agent_stores_no_device(require_infra):
+    # A bare API client sends no User-Agent; that is not an error, it just
+    # leaves the column NULL as it always was.
+    with TestClient(app) as client:
+        email = f"devicenone-{uuid.uuid4().hex[:8]}@example.com"
+        r = client.post("/auth/register", json={"email": email, "password": "testpass123", "name": "None"})
+        assert r.status_code == 201, r.text
+        user_id = uuid.UUID(r.json()["id"])
+        try:
+            r = client.post(
+                "/auth/login",
+                json={"email": email, "password": "testpass123"},
+                headers={"User-Agent": ""},
+            )
+            assert r.status_code == 200, r.text
+            headers = {"Authorization": f"Bearer {r.json()['access_token']}"}
+
+            r = client.get("/auth/sessions", headers=headers)
+            assert r.status_code == 200, r.text
+            assert r.json()[0]["device_info"] is None
+        finally:
+            await _cleanup(user_id)
+
+
+async def test_the_device_survives_a_refresh_token_rotation(require_infra):
+    # `refresh()` re-issues with `device_info=session.device_info`, which
+    # was only ever propagating None. Now that a real value exists, a
+    # rotated session must keep naming the same device -- otherwise a
+    # long-lived session would lose its label the first time its token
+    # rotated.
+    agent = "SuperTradingSystem-iOS/2.0 (iPhone 15)"
+    with TestClient(app) as client:
+        email = f"devicerotate-{uuid.uuid4().hex[:8]}@example.com"
+        r = client.post("/auth/register", json={"email": email, "password": "testpass123", "name": "Rotate"})
+        assert r.status_code == 201, r.text
+        user_id = uuid.UUID(r.json()["id"])
+        try:
+            r = client.post(
+                "/auth/login",
+                json={"email": email, "password": "testpass123"},
+                headers={"User-Agent": agent},
+            )
+            assert r.status_code == 200, r.text
+            refresh_token = r.json()["refresh_token"]
+
+            r = client.post("/auth/refresh", json={"refresh_token": refresh_token})
+            assert r.status_code == 200, r.text
+            headers = {"Authorization": f"Bearer {r.json()['access_token']}"}
+
+            r = client.get("/auth/sessions", headers=headers)
+            assert r.status_code == 200, r.text
+            assert [s["device_info"] for s in r.json()] == [agent]
+        finally:
+            await _cleanup(user_id)

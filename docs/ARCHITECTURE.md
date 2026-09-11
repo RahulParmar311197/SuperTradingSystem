@@ -5099,6 +5099,86 @@ is fake-coverage shape (b) again: a fixture that structurally cannot reach
 the breaking state. `tests/options/test_payoff_put_side.py` covers it now,
 including the unbounded-loss controls that pin the second half of the fix.
 
+## Previous-day/week levels could not be swept by the session's opening bar (§22)
+
+`detect_sweeps` (`app/smc/liquidity.py`) scanned `range(pool.formed_index + 1,
+len(candles))` for every pool it was handed. But `formed_index` does not mean
+the same thing for the two kinds of pool that reach it, and the two writers
+disagree with the one reader:
+
+* `detect_equal_levels` anchors a pool at its **last member swing**. That
+  candle helped form the level, so it must be excluded — otherwise the pool
+  sweeps itself, which is exactly the fault recorded in the equal-levels
+  section above.
+* `detect_session_levels` anchors a previous-day/week level at the **first
+  candle of the following period**, which its own docstring describes as
+  "when the level becomes a resting liquidity target rather than an
+  in-progress extreme". `period_high` and `period_low` are reset only *after*
+  the pool is emitted, so that candle contributed nothing to the level it is
+  being measured against, and must be included.
+
+Applying the equal-levels rule to both meant every PREVIOUS_DAY_HIGH/LOW and
+PREVIOUS_WEEK_HIGH/LOW pool skipped the single candle most likely to raid the
+prior session's extreme — the opening bar.
+
+Two measured consequences, on 15m bars with day 1 spanning 99..110:
+
+```
+day 2 bar 0 = (o=104 h=115 l=103 c=106)   -- 5 points through the PDH, closes below
+  PREVIOUS_DAY_HIGH price=110 formed_index=3  swept=False  swept_index=None
+  SMCContext.recent_sweeps() -> []
+```
+
+The raid is lost outright. And where a later bar also trades through the
+level, the sweep is recorded against the wrong candle:
+
+```
+day 2 highs [115, 109, 111]  -- the genuine raid is bar 3 (115), bar 5 only nicks 111
+  swept_index=5   (two bars, 30 minutes late; 1 point through instead of 5)
+```
+
+`swept_index` is not cosmetic. `app/strategy/evaluator.py`'s
+`ConditionType.LIQUIDITY_SWEEP` gates on `current_index - p.swept_index <
+condition.lookback`, so a late index shifts the whole window in which a
+strategy may act on the sweep, and `rejected` is decided by a different bar's
+close. These pools are produced by `SMCEngine.analyze` under default config,
+so the effect reaches `ScannerWorker` (persisted `Signal` rows and
+`/ws/signals`), `POST /scanner`, `BacktestEngine`, `PaperTradingEngine`,
+`AutoTradeSupervisor` and the `GET /charts/{id}/smc` overlay. The setup it
+silently suppresses is the platform's headline one: a judas swing that takes
+out the previous-day high on the opening bar and reverses.
+
+The fix scans from `formed_index` and skips `pool.member_indices`. That
+states the invariant the `+ 1` was standing in for — *a pool cannot be swept
+by the swings that define it* — rather than a positional proxy that happens
+to coincide for one pool kind. Equal-level pools are unaffected byte for
+byte: `formed_index` is their last member, so it is skipped either way.
+Session-level pools carry no members at all, so their anchoring bar is now
+examined.
+
+The anchor itself was deliberately left alone. Moving
+`detect_session_levels` to `formed_index = i - 1` would also have made the
+`+ 1` land correctly, but `formed_index` and `formed_timestamp` carry a
+separate meaning — when the level came into existence — and `i - 1` is the
+last bar of the *previous* period, which would falsify both and contradict
+the docstring. The disagreement was in the reader, so the reader is where it
+is resolved.
+
+Why the suite could not see this. Every sweep assertion in
+`tests/smc/test_liquidity.py` builds candles with `conftest.make_candles`,
+which emits them one minute apart from a single `2026-01-05 09:15Z` start;
+the two fixtures span 8 and 9 minutes on one date, so `detect_session_levels`
+returns `[]` for both "day" and "week" and only equal-level pools are ever
+swept. `detect_session_levels` had no direct test anywhere in the suite —
+its only mentions in `tests/` were comments in
+`tests/workers/test_auto_trade_history.py` and `tests/market/test_aggregation.py`
+noting that it returns `[]`. All 16 `tests/smc` tests passed against the
+broken code. Fake-coverage shape (b) again: a fixture that structurally
+cannot reach the breaking state.
+`tests/smc/test_session_level_sweeps.py` covers it now, including a control
+pinning that session pools never populate `member_indices` — the property the
+fix depends on.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

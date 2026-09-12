@@ -6888,6 +6888,62 @@ the docstring says, so the fix belongs entirely in the caller.
   options-chain ingestion exists; adding a gate that can never fire is
   the kind of change the previous rounds were written to avoid.
 
+## A restarted process no longer starts flat (round 107)
+
+`OrderManager` and `PositionManager` live in one process's memory. Every
+fill was mirrored into `positions`, and nothing ever read that mirror
+back. The note above framed this as a multi-replica concern; it was also,
+and more immediately, a **restart** concern on a single replica, and it
+reached the risk gates rather than just a stale read.
+
+`current_exposure` and `max_open_positions` are computed by summing the
+in-memory book. `correlated_exposure` reads it. `is_reducing` — the
+exemption that guarantees a position can always be closed — decides by
+looking the position up in it. An empty book makes every one of those
+read zero.
+
+Measured end to end on one open position of 100 @ 100, by placing a real
+order and then clearing `_STACKS` (which is exactly what a restart does):
+
+| | before | after |
+|---|---|---|
+| `GET /positions` | `[]` | the position |
+| in-memory open positions | 0 | 1 |
+| exposure the gates sum | **0.00** | 10000.00 |
+| the row in Postgres | open, 100 @ 100 | unchanged |
+
+So a restarted process would have let an account re-take exposure it
+already held, and would have treated an exit as a fresh entry.
+
+`app.trading.persistence.load_open_positions` is the inverse of
+`persist_position` and is called from `_stack_for` before the stack is
+used for anything, and from `AutoTradeSupervisor` when it first builds a
+user's manager — that worker had the same gap, with its own
+`source_key="auto"` rows. `source_key` is required by the loader for the
+same reason `persist_position` requires it: three unrelated managers
+mirror into this table and all default to `ExecutionMode.PAPER`, so
+loading without it would hand one engine another engine's positions.
+
+### The `Decimal` half, which is a separate failure
+
+The `positions` columns are `Numeric(18, 6)`. SQLAlchemy returns those as
+`Decimal` whatever the `Mapped[float]` annotation says, while
+`PositionRecord` is float throughout. Restoring raw column values would
+put `Decimal` into the book, and the next fill would raise `TypeError:
+unsupported operand type(s) for *: 'decimal.Decimal' and 'float'` inside
+`apply_fill`'s `average_price * quantity + price * signed_qty`. Hence the
+explicit `float()` casts in the loader, and a test that asserts the
+restored types directly so those casts are not tidied away later.
+`app.risk.portfolio.compute_exposure` already cast at its own read of
+these columns for exactly this reason — it was the only place that had
+met the problem.
+
+### What this does not fix
+
+Open **orders** are still not rehydrated, so the multi-replica caveat
+above stands for the order state machine. A restart still loses in-flight
+order state; it no longer loses the position book.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via
@@ -6980,14 +7036,15 @@ worth remembering: "we already checked for this" is not the same claim as
   "Cross-process design" below), but there's no leader election, so
   running more than one `worker` replica would double-process everything.
 - **Multiple API replicas for the manual `/orders` path** — every fill is
-  durably mirrored into Postgres now (see Stage 9), but the order state
-  machine and position math themselves (`OrderManager`/`PositionManager`,
-  held in `app/api/orders.py`'s `_STACKS`) still live in one API
-  process's memory. A second API replica would start its own empty
-  `_STACKS` and could place a conflicting order for the same user instead
-  of seeing the first replica's in-flight state. Rehydrating that state
-  from Postgres on startup (or moving it into Redis, like the trading
-  halt) is what closes this gap — not attempted here.
+  durably mirrored into Postgres now (see Stage 9), and *positions* are
+  now rebuilt from that mirror when a stack is first built (see "A
+  restarted process no longer starts flat" below). What is still
+  process-local is the **order** state machine (`OrderManager`, held in
+  `app/api/orders.py`'s `_STACKS`): a second API replica starts with no
+  knowledge of the first's in-flight orders and could place a conflicting
+  one. Rehydrating open orders too, or moving that state into Redis like
+  the trading halt, is what closes the remaining gap — not attempted
+  here.
 
 ## Cross-process design
 

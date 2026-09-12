@@ -23,6 +23,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models.strategy import Direction
+from app.database.models.instruments import Instrument as InstrumentRow
 from app.database.models.trading import ExecutionMode
 from app.database.models.trading import Order as OrderRow
 from app.database.models.trading import OrderEvent as OrderEventRow
@@ -261,3 +262,67 @@ async def record_trade(
     await db.commit()
     await db.refresh(row)
     return row
+
+
+async def load_open_positions(
+    db: AsyncSession,
+    user_id: uuid.UUID,
+    execution_mode: ExecutionMode,
+    *,
+    source_key: str,
+) -> list[PositionRecord]:
+    """Rebuild an engine's in-memory positions from their DB mirror — the
+    inverse of `persist_position`, and the reason that mirror exists.
+
+    `OrderManager`/`PositionManager` live in one process's memory. Every
+    fill is written here, but nothing ever read it back, so a restart left
+    the manager empty while the account's real positions sat in
+    `positions`. That is not merely a stale read: `current_exposure`,
+    `max_open_positions` and `correlated_exposure` are all computed by
+    summing the in-memory book, and `is_reducing` — the exemption that
+    lets a position always be closed — is decided by looking the position
+    up in it. An empty book makes every one of those read zero, so a
+    restarted process would let an account re-take its whole exposure and
+    would treat an exit as a fresh entry.
+
+    `source_key` is required for the same reason `persist_position`
+    requires it: three unrelated managers mirror into this table and all
+    of them default to `ExecutionMode.PAPER`, so loading without it would
+    hand one engine another engine's positions.
+
+    Note the explicit `float()` casts. The columns are `Numeric(18, 6)`,
+    which SQLAlchemy hands back as `Decimal` regardless of the `Mapped[float]`
+    annotation, while `PositionRecord` is float throughout. Without the
+    cast the first arithmetic mixing a rehydrated value with a float —
+    `apply_fill`'s `average_price * quantity + price * signed_qty`, say —
+    raises `TypeError`. `app.risk.portfolio.compute_exposure` already
+    casts at its own read of these columns for exactly this reason.
+    """
+    rows = (
+        await db.execute(
+            select(PositionRow, InstrumentRow.symbol)
+            .join(InstrumentRow, InstrumentRow.id == PositionRow.instrument_id)
+            .where(
+                PositionRow.user_id == user_id,
+                PositionRow.execution_mode == execution_mode,
+                PositionRow.source_key == source_key,
+                PositionRow.is_open.is_(True),
+            )
+        )
+    ).all()
+
+    account_id = str(user_id)
+    return [
+        PositionRecord(
+            account_id=account_id,
+            symbol=symbol,
+            quantity=float(row.quantity),
+            average_price=float(row.average_price),
+            realized_pnl=float(row.realized_pnl),
+            unrealized_pnl=float(row.unrealized_pnl),
+            stop=float(row.stop) if row.stop is not None else None,
+            target=float(row.target) if row.target is not None else None,
+            protective_order_id=row.protective_order_id,
+        )
+        for row, symbol in rows
+    ]

@@ -47,6 +47,21 @@ class PositionManager:
     def __init__(self) -> None:
         self._positions: dict[tuple[str, str], PositionRecord] = {}
 
+    def restore(self, positions: list[PositionRecord]) -> None:
+        """Seed the book from durable storage, replacing anything held for
+        the accounts named in `positions`.
+
+        This exists because the book is process memory and the `positions`
+        table is its only durable copy; see
+        `app.trading.persistence.load_open_positions` for what an empty
+        book does to the risk gates after a restart. It is a *restore*,
+        not a merge: it is called once, before any fill is applied to a
+        freshly-built manager, and silently merging would be the wrong
+        behaviour if it were ever called twice.
+        """
+        for position in positions:
+            self._positions[(position.account_id, position.symbol)] = position
+
     def get(self, account_id: str, symbol: str) -> PositionRecord | None:
         return self._positions.get((account_id, symbol))
 

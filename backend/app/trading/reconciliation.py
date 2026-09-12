@@ -27,7 +27,37 @@ class ReconciliationReport:
         return not self.order_mismatches and not self.position_mismatches
 
 
-def reconcile_orders(local_orders: list[OrderRecord], broker_orders: list[BrokerOrder]) -> list[str]:
+def reconcile_orders(
+    local_orders: list[OrderRecord],
+    broker_orders: list[BrokerOrder],
+    protective_order_ids: frozenset[str] = frozenset(),
+) -> list[str]:
+    """`protective_order_ids` are broker orders this system placed that
+    deliberately have no `OrderRecord`.
+
+    `app/trading/protective_stops.py` places a position's resting stop by
+    calling `broker.place_order` directly rather than going through
+    `OrderManager`: it is not an order anyone submitted, it carries no
+    idempotency key of its own, and its lifecycle is the position's, not
+    the order journal's. The position holds the only reference to it, in
+    `PositionRecord.protective_order_id`.
+
+    Without this exemption the unknown-order check below flagged every one
+    of them. A resting stop reports ACKNOWLEDGED, which is in the set that
+    check treats as a live order nobody knows about, so
+    `ReconciliationWorker` halted the account and raised
+    RECONCILIATION_REQUIRED within 60 seconds of *every* live entry that
+    carried a stop -- and resuming is a deliberate manual admin action.
+    The stop-loss feature and the reconciliation loop, each correct alone,
+    between them made live trading unusable.
+
+    The exemption is exactly these ids and nothing else: a broker order
+    this system did not place is still a mismatch, and so is a stop whose
+    position no longer references it. Nor does it hide a stop that
+    *fired* -- that shows up in `reconcile_positions` as the position
+    being open locally and gone (or reversed) at the broker, which is the
+    consequence that actually matters.
+    """
     mismatches: list[str] = []
     broker_by_id = {o.broker_order_id: o for o in broker_orders}
 
@@ -51,7 +81,7 @@ def reconcile_orders(local_orders: list[OrderRecord], broker_orders: list[Broker
                 f"local={local.filled_quantity} broker={broker_order.filled_quantity}"
             )
 
-    local_broker_ids = {o.broker_order_id for o in local_orders if o.broker_order_id}
+    local_broker_ids = {o.broker_order_id for o in local_orders if o.broker_order_id} | set(protective_order_ids)
     for broker_order in broker_orders:
         if broker_order.broker_order_id not in local_broker_ids and broker_order.status in (
             OrderStatus.SUBMITTED,
@@ -89,7 +119,15 @@ def reconcile(
     local_positions: list[PositionRecord],
     broker_positions: list[BrokerPosition],
 ) -> ReconciliationReport:
+    # The resting protective stops belong to the positions, not to the
+    # order journal -- see `reconcile_orders`. Taken from every local
+    # position, not just the open ones: a position that has just gone flat
+    # can still be holding the id of a stop the broker has not finished
+    # retiring.
+    protective_order_ids = frozenset(
+        position.protective_order_id for position in local_positions if position.protective_order_id
+    )
     return ReconciliationReport(
-        order_mismatches=reconcile_orders(local_orders, broker_orders),
+        order_mismatches=reconcile_orders(local_orders, broker_orders, protective_order_ids),
         position_mismatches=reconcile_positions(local_positions, broker_positions),
     )

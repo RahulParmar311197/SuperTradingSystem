@@ -6516,6 +6516,73 @@ then replaces non-finite floats with their `repr` so the offending value
 is still reported, just printably. Fixed once, centrally, rather than
 per-field, so no future bounded field has to remember.
 
+## An options leg had no price or size bounds at all (round 102)
+
+`POST /orders` got its price bounds in the previous round. `POST
+/options/execute` — the *other* endpoint that reaches a broker and writes
+to `orders`, `trades` and `positions` — did not, and its request schema
+carried no `Field` constraints whatsoever:
+
+```python
+class ExecuteOptionLegRequest(BaseModel):
+    symbol: str
+    direction: Direction
+    quantity: float   # unbounded
+    premium: float    # unbounded
+```
+
+Probing a two-leg spread with a pathological value in one leg, against
+unmodified code, gave:
+
+| leg value | result |
+|---|---|
+| `premium=-100` | **HTTP 201, executed**, `max_profit: 17500` |
+| `premium=1e308` | 403, "Projected exposure inf% vs limit 100.0%" |
+| `premium=1e400` | 403, same |
+| `quantity=-5` | 403, "Projected exposure 3797.50% vs limit 100.0%" |
+| `quantity=0` | 403, "Projected exposure 627.50% vs limit 100.0%" |
+
+Only the first row is a genuine defect, and the other four deserve to be
+described accurately rather than claimed as working validation:
+
+- The `inf` rows are refused because **every** comparison against `inf`
+  is False, so `projected_exposure <= limit` fails. That is the risk
+  engine failing closed on a value it was never given a name for, not the
+  engine recognising a bad premium.
+- The negative- and zero-quantity rows are refused by an exposure
+  percentage computed largely from the *other*, well-formed leg. Change
+  the sibling leg and the same malformed input can pass.
+
+The real failure is the first one. A negative premium is not a price; it
+is a credit dressed as a debit. The strategy priced and executed with a
+`max_profit` of 17500 on a spread whose true payoff is nothing of the
+sort, and both legs reached the broker.
+
+The fix mirrors `PlaceOrderRequest` exactly, for the same reason — every
+price and quantity column in `app/database/models/trading.py` is
+`Numeric(18, 6)`, which holds at most `999999999999.999999`:
+
+```python
+_MAX_PREMIUM = 1e12
+
+class ExecuteOptionLegRequest(BaseModel):
+    symbol: str
+    direction: Direction
+    quantity: float = Field(gt=0, lt=_MAX_PREMIUM)  # number of lots
+    premium: float = Field(gt=0, lt=_MAX_PREMIUM)
+```
+
+All five probes now return 422 naming the offending field, before any
+risk evaluation, broker call or database write. The central
+`RequestValidationError` handler added in round 101 is what lets the
+`1e400` case return a 422 rather than a 500.
+
+This still leaves unbounded numeric body fields elsewhere —
+`BuildStrategyRequest.quantity` / `lot_size`, replay
+`CreateReplayRequest.starting_balance` / `swing_length`, and backtest
+`starting_capital`. None of those reach a broker, which is why the two
+execution endpoints came first; they remain open.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

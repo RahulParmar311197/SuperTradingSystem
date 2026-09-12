@@ -1075,3 +1075,82 @@ async def test_a_leg_that_flips_a_position_unwinds_only_the_new_exposure(require
             await resume_account(str(user_id))
             orders_module._STACKS.pop(user_id, None)
             await _cleanup(user_id, [short_leg.id, long_leg.id])
+
+
+# --- a leg's premium and quantity are untrusted input ----------------------
+#
+# `premium` and `quantity` were unbounded floats on an endpoint that
+# executes. A negative premium was *approved and executed*:
+# `evaluate_options_risk` scored the combination on a payoff built from it
+# (a -100 premium reported max_profit 17500), the batch went to the
+# broker, and only then did `MockBroker._resolve_fill_price` refuse the
+# negative price -- leaving one leg filled and one rejected, which trips
+# `_remediate_partial_batch` and halts the account.
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("premium", -100.0),   # the one that used to execute
+        ("premium", 1e308),    # overflows Numeric(18, 6)
+        ("premium", 1e400),    # inf; the 422 must still serialise
+        ("quantity", -5.0),
+        ("quantity", 0.0),
+        ("quantity", 1e308),
+    ],
+)
+async def test_a_leg_value_that_is_not_a_price_or_a_size_is_refused(require_infra, field, value):
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+        long_leg, short_leg = await _make_two_leg_instruments(f"LB{uuid.uuid4().hex[:5].upper()}")
+        try:
+            leg = {"symbol": long_leg.symbol, "direction": "LONG", "quantity": 1.0, "premium": 120.0}
+            leg[field] = value
+            r = client.post(
+                "/options/execute",
+                json={
+                    "strategy_name": "bounds_probe",
+                    "legs": [leg, {"symbol": short_leg.symbol, "direction": "SHORT", "quantity": 1.0, "premium": 50.0}],
+                },
+                headers=headers,
+            )
+
+            assert r.status_code == 422, r.text
+            assert any(d["loc"][-1] == field for d in r.json()["detail"])
+
+            # Nothing executed, so nothing to remediate and no halt.
+            assert await account_halt_reason(str(user_id)) is None
+            async with async_session_factory() as db:
+                orders = (await db.execute(select(Order).where(Order.user_id == user_id))).scalars().all()
+                assert orders == []
+        finally:
+            await resume_account(str(user_id))
+            orders_module._STACKS.pop(user_id, None)
+            await _cleanup(user_id, [long_leg.id, short_leg.id])
+
+
+async def test_an_ordinary_two_leg_spread_still_executes(require_infra):
+    """Control: the new bounds must not reject a normal strategy."""
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+        long_leg, short_leg = await _make_two_leg_instruments(f"LO{uuid.uuid4().hex[:5].upper()}")
+        try:
+            r = client.post(
+                "/options/execute",
+                json={
+                    "strategy_name": "bull_call_spread",
+                    "legs": [
+                        {"symbol": long_leg.symbol, "direction": "LONG", "quantity": 1, "premium": 120.0},
+                        {"symbol": short_leg.symbol, "direction": "SHORT", "quantity": 1, "premium": 50.0},
+                    ],
+                },
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+            assert r.json()["strategy_intact"] is True
+        finally:
+            await resume_account(str(user_id))
+            orders_module._STACKS.pop(user_id, None)
+            await _cleanup(user_id, [long_leg.id, short_leg.id])

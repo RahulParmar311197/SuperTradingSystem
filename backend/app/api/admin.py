@@ -57,7 +57,7 @@ class AdminUserResponse(BaseModel):
 
 @router.get("/users", response_model=list[AdminUserResponse])
 async def list_users(
-    limit: int = Query(default=100, le=500),
+    limit: int = Query(default=100, ge=1, le=500),
     user: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ) -> list[User]:
@@ -77,7 +77,7 @@ class AdminBrokerConnectionResponse(BaseModel):
 
 @router.get("/broker-connections", response_model=list[AdminBrokerConnectionResponse])
 async def list_broker_connections(
-    limit: int = Query(default=100, le=500),
+    limit: int = Query(default=100, ge=1, le=500),
     user: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ) -> list[BrokerAccount]:
@@ -110,7 +110,7 @@ class AdminOrderResponse(BaseModel):
 
 @router.get("/orders", response_model=list[AdminOrderResponse])
 async def list_orders(
-    limit: int = Query(default=100, le=500),
+    limit: int = Query(default=100, ge=1, le=500),
     user: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ) -> list[Order]:
@@ -130,7 +130,7 @@ class AdminRiskEventResponse(BaseModel):
 
 @router.get("/risk-events", response_model=list[AdminRiskEventResponse])
 async def list_risk_events(
-    limit: int = Query(default=100, le=500),
+    limit: int = Query(default=100, ge=1, le=500),
     user: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ) -> list[RiskEvent]:
@@ -152,7 +152,7 @@ class AdminAIDecisionResponse(BaseModel):
 
 @router.get("/ai-decisions", response_model=list[AdminAIDecisionResponse])
 async def list_ai_decisions(
-    limit: int = Query(default=100, le=500),
+    limit: int = Query(default=100, ge=1, le=500),
     user: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ) -> list[AIDecision]:

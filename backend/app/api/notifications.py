@@ -38,7 +38,7 @@ class NotificationResponse(BaseModel):
 @router.get("", response_model=list[NotificationResponse])
 async def list_notifications(
     unread_only: bool = False,
-    limit: int = Query(default=50, le=200),
+    limit: int = Query(default=50, ge=1, le=200),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> list[Notification]:

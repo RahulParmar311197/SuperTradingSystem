@@ -5,12 +5,17 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import delete, select
 
+import app.api.orders as orders_module
+from app.brokers.base import OrderResult
+from app.brokers.mock import MockBroker
+from app.core.redis import account_halt_reason, resume_account
+from app.database.models.strategy import Direction
 from app.core.encryption import encrypt_credentials
 from app.database.models.instruments import Instrument, MarketType, OptionType
 from app.database.models.notifications import Notification, NotificationType
 from app.database.models.options import OptionChainSnapshot, OptionContract, OptionSnapshot
 from app.database.models.risk import AuditLog, RiskEvent
-from app.database.models.trading import ExecutionMode, Order, OrderEvent, Position, Trade
+from app.database.models.trading import ExecutionMode, Order, OrderEvent, OrderStatus, Position, Trade
 from app.database.models.users import BrokerAccount, BrokerAccountStatus, BrokerName, User, UserSession
 from app.database.session import async_session_factory
 from app.main import app
@@ -786,3 +791,287 @@ async def test_a_reducing_options_order_cannot_open_a_leg(require_infra):
             assert rows[0].is_open is False
         finally:
             await _cleanup(user_id, [long_leg.id, short_leg.id])
+
+
+# --- Partial multi-leg execution (blueprint §37-40) -----------------------
+#
+# Each leg is a separate order and nothing at the exchange enforces the
+# combination, so a strategy the risk engine approved on its *combined*
+# payoff can end up half-established. Measured on a 25200/25000 bull put
+# spread: the short put fills, the protective long put is rejected, and
+# what was approved with a 6,500 max loss becomes a naked short put whose
+# real max loss is 1,254,000 on a 100,000 account.
+
+
+class _LegOutcomeBroker(MockBroker):
+    """A MockBroker that gives one symbol a fixed non-fill outcome, the
+    way a real broker rejects a single leg (insufficient margin, a freeze
+    quantity, a contract that isn't tradable) or never answers one at all
+    (see UpstoxBroker.place_order's FAILED result)."""
+
+    def __init__(self, symbol: str, outcome: OrderStatus, reason: str) -> None:
+        super().__init__()
+        self._symbol = symbol
+        self._outcome = outcome
+        self._reason = reason
+
+    async def place_order(self, request):
+        if request.symbol == self._symbol:
+            return OrderResult(broker_order_id="", status=self._outcome, rejection_reason=self._reason)
+        return await super().place_order(request)
+
+
+class _UnwindRejectingBroker(MockBroker):
+    """Rejects one leg and then rejects the unwind order too -- a broker
+    that has stopped accepting orders for this account mid-strategy."""
+
+    def __init__(self, reject_symbol: str) -> None:
+        super().__init__()
+        self._reject_symbol = reject_symbol
+
+    async def place_order(self, request):
+        if request.symbol == self._reject_symbol or request.idempotency_key.startswith("unwind:"):
+            return OrderResult(broker_order_id="", status=OrderStatus.REJECTED, rejection_reason="Broker refused")
+        return await super().place_order(request)
+
+
+def _install_stack(user_id: uuid.UUID, broker) -> object:
+    """Puts a stack carrying `broker` where `_stack_for` will find it, so
+    a leg outcome is chosen rather than waited for."""
+    stack = orders_module._UserTradingStack(broker)
+    orders_module._STACKS[user_id] = stack
+    return stack
+
+
+async def _bull_put_spread(client: TestClient, headers: dict, short_leg, long_leg) -> dict:
+    r = client.post(
+        "/options/execute",
+        json={
+            "strategy_name": "bull_put_spread",
+            "legs": [
+                {"symbol": short_leg.symbol, "direction": "SHORT", "quantity": 1, "premium": 120.0},
+                {"symbol": long_leg.symbol, "direction": "LONG", "quantity": 1, "premium": 50.0},
+            ],
+        },
+        headers=headers,
+    )
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+async def _make_put_spread_instruments(prefix: str) -> tuple[Instrument, Instrument]:
+    """(short leg at 25200, protective long leg at 25000) -- a bull put
+    spread, where losing the long leg is what leaves a naked short."""
+    expiry = date.today() + timedelta(days=7)
+    async with async_session_factory() as db:
+        short_leg = Instrument(
+            symbol=f"{prefix}25200PE", exchange="NSE", market=MarketType.OPTIONS, instrument_type="OPTION",
+            underlying="NIFTY", expiry=expiry, strike=25200.0, option_type=OptionType.PUT, lot_size=50,
+        )
+        long_leg = Instrument(
+            symbol=f"{prefix}25000PE", exchange="NSE", market=MarketType.OPTIONS, instrument_type="OPTION",
+            underlying="NIFTY", expiry=expiry, strike=25000.0, option_type=OptionType.PUT, lot_size=50,
+        )
+        db.add_all([short_leg, long_leg])
+        await db.commit()
+        await db.refresh(short_leg)
+        await db.refresh(long_leg)
+        return short_leg, long_leg
+
+
+async def test_rejected_protective_leg_is_unwound_and_the_account_is_halted(require_infra):
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+        short_leg, long_leg = await _make_put_spread_instruments(f"PU{uuid.uuid4().hex[:5].upper()}")
+        stack = _install_stack(user_id, _LegOutcomeBroker(long_leg.symbol, OrderStatus.REJECTED, "Insufficient margin"))
+
+        try:
+            body = await _bull_put_spread(client, headers, short_leg, long_leg)
+
+            # The combination was approved on a bounded loss...
+            assert body["max_loss"] == pytest.approx(-6500.0, rel=1e-3)
+            # ...but only the short leg established.
+            statuses = {leg["symbol"]: leg["status"] for leg in body["legs"]}
+            assert statuses[short_leg.symbol] in ("FILLED", "MONITORING")
+            assert statuses[long_leg.symbol] == "REJECTED"
+
+            assert body["strategy_intact"] is False
+            assert any("unwound" in line for line in body["remediation"])
+
+            # The naked short put must not survive the call.
+            assert stack.position_manager.get(str(user_id), short_leg.symbol).quantity == 0
+
+            assert await account_halt_reason(str(user_id)) is not None
+
+            async with async_session_factory() as db:
+                notifications = (
+                    await db.execute(
+                        select(Notification).where(
+                            Notification.user_id == user_id,
+                            Notification.type == NotificationType.RECONCILIATION_REQUIRED,
+                        )
+                    )
+                ).scalars().all()
+                assert len(notifications) == 1
+                audits = (
+                    await db.execute(
+                        select(AuditLog).where(
+                            AuditLog.user_id == user_id, AuditLog.action == "options_strategy.leg_unwound"
+                        )
+                    )
+                ).scalars().all()
+                assert len(audits) == 1
+        finally:
+            await resume_account(str(user_id))
+            orders_module._STACKS.pop(user_id, None)
+            await _cleanup(user_id, [short_leg.id, long_leg.id])
+
+
+async def test_an_unanswered_leg_is_never_unwound(require_infra):
+    """`FAILED` means the broker never answered -- the leg may or may not
+    exist at the exchange. An opposing order against a maybe-position is
+    not a reversal, it is a new position half the time, so the filled leg
+    is deliberately left alone for reconciliation to resolve."""
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+        short_leg, long_leg = await _make_put_spread_instruments(f"PF{uuid.uuid4().hex[:5].upper()}")
+        stack = _install_stack(
+            user_id, _LegOutcomeBroker(long_leg.symbol, OrderStatus.FAILED, "Upstox did not answer this order")
+        )
+
+        try:
+            body = await _bull_put_spread(client, headers, short_leg, long_leg)
+
+            statuses = {leg["symbol"]: leg["status"] for leg in body["legs"]}
+            assert statuses[long_leg.symbol] == "FAILED"
+            assert body["strategy_intact"] is False
+            assert any("NOT unwound" in line for line in body["remediation"])
+
+            # Still open, on purpose.
+            assert stack.position_manager.get(str(user_id), short_leg.symbol).quantity == -50.0
+            assert await account_halt_reason(str(user_id)) is not None
+
+            async with async_session_factory() as db:
+                unwinds = (
+                    await db.execute(
+                        select(AuditLog).where(
+                            AuditLog.user_id == user_id, AuditLog.action == "options_strategy.leg_unwound"
+                        )
+                    )
+                ).scalars().all()
+                assert unwinds == []
+        finally:
+            await resume_account(str(user_id))
+            orders_module._STACKS.pop(user_id, None)
+            await _cleanup(user_id, [short_leg.id, long_leg.id])
+
+
+async def test_a_fully_executed_strategy_is_intact_and_leaves_the_account_open(require_infra):
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+        short_leg, long_leg = await _make_put_spread_instruments(f"PO{uuid.uuid4().hex[:5].upper()}")
+        stack = _install_stack(user_id, MockBroker())
+
+        try:
+            body = await _bull_put_spread(client, headers, short_leg, long_leg)
+
+            assert body["strategy_intact"] is True
+            assert body["remediation"] == []
+            assert stack.position_manager.get(str(user_id), short_leg.symbol).quantity == -50.0
+            assert stack.position_manager.get(str(user_id), long_leg.symbol).quantity == 50.0
+            assert await account_halt_reason(str(user_id)) is None
+        finally:
+            await resume_account(str(user_id))
+            orders_module._STACKS.pop(user_id, None)
+            await _cleanup(user_id, [short_leg.id, long_leg.id])
+
+
+async def test_a_batch_where_no_leg_reached_the_exchange_does_not_halt(require_infra):
+    """Nothing executed, so there is no imbalance -- halting here would
+    lock an account out over an order the exchange never saw."""
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+        short_leg, long_leg = await _make_put_spread_instruments(f"PN{uuid.uuid4().hex[:5].upper()}")
+        broker = MockBroker()
+        broker.reject_probability = 1.0
+        stack = _install_stack(user_id, broker)
+
+        try:
+            body = await _bull_put_spread(client, headers, short_leg, long_leg)
+
+            assert all(leg["status"] == "REJECTED" for leg in body["legs"])
+            assert body["strategy_intact"] is False
+            assert any("No leg reached the exchange" in line for line in body["remediation"])
+            assert stack.position_manager.open_positions(str(user_id)) == []
+            assert await account_halt_reason(str(user_id)) is None
+        finally:
+            await resume_account(str(user_id))
+            orders_module._STACKS.pop(user_id, None)
+            await _cleanup(user_id, [short_leg.id, long_leg.id])
+
+
+async def test_an_unwind_the_broker_also_rejects_is_reported_not_hidden(require_infra):
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+        short_leg, long_leg = await _make_put_spread_instruments(f"PX{uuid.uuid4().hex[:5].upper()}")
+        stack = _install_stack(user_id, _UnwindRejectingBroker(long_leg.symbol))
+
+        try:
+            body = await _bull_put_spread(client, headers, short_leg, long_leg)
+
+            assert body["strategy_intact"] is False
+            assert any("still open" in line for line in body["remediation"])
+            # The exposure really is still there -- the response must not
+            # claim otherwise.
+            assert stack.position_manager.get(str(user_id), short_leg.symbol).quantity == -50.0
+            assert await account_halt_reason(str(user_id)) is not None
+        finally:
+            await resume_account(str(user_id))
+            orders_module._STACKS.pop(user_id, None)
+            await _cleanup(user_id, [short_leg.id, long_leg.id])
+
+
+async def test_a_leg_that_flips_a_position_unwinds_only_the_new_exposure(require_infra):
+    """The quantity to give back is what the position *gained*, not what
+    the order filled. A fill that closes 50 long and opens 50 short
+    opened 50, not 100 -- unwinding 100 would leave the account long
+    again, opening a position out of a remediation."""
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+        short_leg, long_leg = await _make_put_spread_instruments(f"PZ{uuid.uuid4().hex[:5].upper()}")
+        stack = _install_stack(user_id, _LegOutcomeBroker(long_leg.symbol, OrderStatus.REJECTED, "Insufficient margin"))
+        # An existing long 50 in the leg this batch sells 100 of.
+        stack.position_manager.apply_fill(str(user_id), short_leg.symbol, Direction.LONG, 50.0, 100.0)
+        # Both legs 2 lots, so the combination stays the defined-risk
+        # spread the exposure limit approves -- only the pre-existing
+        # position makes one leg a flip.
+
+        try:
+            r = client.post(
+                "/options/execute",
+                json={
+                    "strategy_name": "bull_put_spread",
+                    "legs": [
+                        {"symbol": short_leg.symbol, "direction": "SHORT", "quantity": 2, "premium": 120.0},
+                        {"symbol": long_leg.symbol, "direction": "LONG", "quantity": 2, "premium": 50.0},
+                    ],
+                },
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+            body = r.json()
+            assert body["strategy_intact"] is False
+
+            # Flat: the 50 of new short exposure was given back, and the
+            # pre-existing long was not re-opened by the unwind.
+            assert stack.position_manager.get(str(user_id), short_leg.symbol).quantity == 0
+        finally:
+            await resume_account(str(user_id))
+            orders_module._STACKS.pop(user_id, None)
+            await _cleanup(user_id, [short_leg.id, long_leg.id])

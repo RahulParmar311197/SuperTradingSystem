@@ -11,7 +11,7 @@ from app.api.orders import _execution_mode_for, _stack_for
 from app.auth.dependencies import get_current_user, require_permission
 from app.brokers.mock import MockBroker
 from app.core.audit import record_audit
-from app.core.redis import account_halt_reason
+from app.core.redis import account_halt_reason, halt_account
 from app.database.models.instruments import Instrument
 from app.database.models.instruments import MarketType as InstrumentMarketType
 from app.database.models.notifications import NotificationType
@@ -19,7 +19,7 @@ from app.database.models.options import OptionContract, OptionSnapshot
 from app.database.models.risk import RiskDecision as RiskEventDecision
 from app.database.models.risk import RiskEvent
 from app.database.models.strategy import Direction
-from app.database.models.trading import OrderStatus, OrderType
+from app.database.models.trading import ExecutionMode, OrderStatus, OrderType
 from app.database.models.users import TradingPermission, User
 from app.database.session import get_db
 from app.notifications.service import create_notification
@@ -29,6 +29,7 @@ from app.options.payoff import OptionLeg, compute_payoff_summary
 from app.options.strategies import BIAS_STRATEGIES, build_strategy
 from app.risk.kill_switch import load_kill_switch_state
 from app.risk.options_risk import OptionsRiskProposal, evaluate_options_risk
+from app.trading.order_manager import OrderRecord
 from app.trading.persistence import persist_order, persist_position, record_trade
 
 router = APIRouter(prefix="/options", tags=["options"])
@@ -168,6 +169,14 @@ class ExecuteOptionsStrategyResponse(BaseModel):
     capital_requirement: float
     liquidity_warnings: list[str]
     legs: list[LegExecutionResult]
+    # Does the combination the risk engine approved actually exist at the
+    # broker now? False whenever any leg failed to establish -- see
+    # `_remediate_partial_batch`. A client that ignores this and reads
+    # only `max_loss` is reading the risk of a strategy that isn't there.
+    strategy_intact: bool = True
+    # What was done about it, in the order it was done. Empty when the
+    # strategy is intact.
+    remediation: list[str] = []
 
 
 async def _latest_option_snapshot(db: AsyncSession, instrument_id: uuid.UUID) -> OptionSnapshot | None:
@@ -186,6 +195,302 @@ async def _latest_option_snapshot(db: AsyncSession, instrument_id: uuid.UUID) ->
     ).scalar_one_or_none()
 
 
+# A leg counts as established only when it is completely filled. Anything
+# else -- rejected, unanswered, partially filled, acknowledged but never
+# filled -- means the combination the risk engine approved does not exist
+# at the broker, and the numbers in this response describe a strategy
+# nobody is actually holding.
+_ESTABLISHED_LEG_STATUSES = (OrderStatus.FILLED.value, OrderStatus.MONITORING.value)
+
+
+async def _submit_leg(
+    db: AsyncSession,
+    stack,
+    user: User,
+    *,
+    instrument: Instrument,
+    symbol: str,
+    direction: Direction,
+    premium: float,
+    total_quantity: float,
+    idempotency_key: str,
+    batch_id: uuid.UUID,
+    strategy_name: str,
+    execution_mode: ExecutionMode,
+    transition_reason: str,
+    audit_action: str,
+) -> tuple[OrderRecord, float]:
+    """Submits one leg as a real order and mirrors everything it did into
+    Postgres (order row, position row, trade journal, notifications,
+    audit), exactly as `POST /orders` does for a single trade.
+
+    Returns that leg's final order and the quantity of *brand-new*
+    exposure it opened -- 0.0 when it only reduced an existing position,
+    was rejected, or never answered. That number is what
+    `_remediate_partial_batch` has to give back when the rest of the
+    combination fails to establish, so it is measured from the position's
+    own before/after quantities rather than from the fill size: a fill
+    that closes 30 and opens 20 the other way opened 20, not 50, and
+    unwinding 50 would open a fresh position of its own.
+    """
+    if isinstance(stack.broker, MockBroker):
+        stack.broker.set_quote(symbol, ltp=premium)
+
+    existing_position = stack.position_manager.get(str(user.id), symbol)
+    realized_pnl_before = existing_position.realized_pnl if existing_position is not None else 0.0
+    position_before = (
+        {
+            "is_long": existing_position.is_long,
+            "average_price": existing_position.average_price,
+            "quantity": existing_position.quantity,
+        }
+        if existing_position is not None
+        else None
+    )
+
+    order, created = stack.order_manager.create_order(
+        idempotency_key, str(user.id), symbol, direction, OrderType.MARKET, total_quantity
+    )
+    if created:
+        stack.order_manager.transition(order.id, OrderStatus.VALIDATING)
+        stack.order_manager.transition(order.id, OrderStatus.RISK_APPROVED, transition_reason)
+        await stack.execution_engine.submit(order.id)
+        stack.trades_today += 1
+
+    final_order = stack.order_manager.get(order.id)
+    if created:
+        # Same "Repeated order rejection" tracking as app/api/orders.py's
+        # place_order -- each leg is its own real order submitted to the
+        # broker, so a run of consecutive broker-level rejections across
+        # legs/strategies must trip `no_repeated_rejections` here too,
+        # not just on the single-order path.
+        stack.repeated_rejections = stack.repeated_rejections + 1 if final_order.status == OrderStatus.REJECTED else 0
+    await persist_order(
+        db, final_order, user.id, instrument.id, execution_mode=execution_mode, broker_account_id=stack.broker_account_id
+    )
+
+    opened_quantity = 0.0
+    position_after = stack.position_manager.get(str(user.id), symbol)
+    if position_after is not None:
+        # Same "did a real fill actually happen" guard as
+        # app/api/orders.py's place_order -- a broker-rejected leg
+        # leaves `position_after` reflecting whatever existed before
+        # this call, unchanged.
+        just_filled = created and final_order.status in (
+            OrderStatus.FILLED,
+            OrderStatus.PARTIALLY_FILLED,
+            OrderStatus.MONITORING,
+        )
+        opened_or_added = (
+            just_filled and position_after.is_open and position_after.is_long == (direction == Direction.LONG)
+        )
+        if just_filled:
+            before_quantity = position_before["quantity"] if position_before is not None else 0.0
+            after_quantity = position_after.quantity
+            if after_quantity == 0:
+                opened_quantity = 0.0
+            elif before_quantity == 0 or (before_quantity > 0) != (after_quantity > 0):
+                # Opened from flat, or flipped -- everything held now is new.
+                opened_quantity = abs(after_quantity)
+            else:
+                opened_quantity = max(0.0, abs(after_quantity) - abs(before_quantity))
+        position_row = await persist_position(
+            db, user.id, instrument.id, position_after, execution_mode=execution_mode, source_key="manual"
+        )
+        realized_delta = position_after.realized_pnl - realized_pnl_before
+        if realized_delta != 0 and position_before is not None:
+            # Same fix as app/api/orders.py's place_order -- without
+            # this, stack.daily_pnl/weekly_pnl never reflect a loss
+            # realized by closing an options leg, so the
+            # daily_loss_limit/weekly_loss_limit checks (both wired
+            # into evaluate_options_risk above) could never fail no
+            # matter how much this specific path lost.
+            stack.daily_pnl += realized_delta
+            stack.weekly_pnl += realized_delta
+            await record_trade(
+                db,
+                user_id=user.id,
+                instrument_id=instrument.id,
+                direction=Direction.LONG if position_before["is_long"] else Direction.SHORT,
+                entry_price=position_before["average_price"],
+                # Same fix as app/api/orders.py's record_trade call --
+                # the real broker fill price, not the client-supplied
+                # `leg.premium`, which `pnl` above was actually computed
+                # from (via PositionManager.apply_fill).
+                exit_price=final_order.average_fill_price,
+                # Same fix as app/api/orders.py's record_trade call --
+                # the quantity this fill actually closed, not the whole
+                # pre-fill position, which on a partial reduce left the
+                # journal row disagreeing with its own `pnl`.
+                quantity=min(final_order.filled_quantity, abs(position_before["quantity"])),
+                pnl=realized_delta,
+                position_id=position_row.id,
+                execution_mode=execution_mode,
+            )
+            # Blueprint §63/§104 parity with app/api/orders.py's
+            # identical fix -- this endpoint places real orders
+            # through the same broker/risk/persistence pipeline (its
+            # own docstring says so) but used to only notify on
+            # rejection, never on an actual closing fill.
+            await create_notification(
+                db,
+                user_id=user.id,
+                notification_type=NotificationType.POSITION_CLOSED,
+                title=f"{symbol} position closed",
+                body=f"Realized P&L: {realized_delta:.2f}",
+                data={"symbol": symbol, "pnl": realized_delta},
+            )
+        if opened_or_added:
+            await create_notification(
+                db,
+                user_id=user.id,
+                notification_type=NotificationType.TRADE_EXECUTED,
+                title=f"{symbol} order executed",
+                body=f"Opened {direction.value} position in {symbol}",
+                data={"symbol": symbol, "direction": direction.value, "strategy_name": strategy_name},
+            )
+
+    await record_audit(
+        db,
+        actor="user",
+        action=audit_action,
+        user_id=user.id,
+        details={
+            "batch_id": str(batch_id),
+            "strategy_name": strategy_name,
+            "symbol": symbol,
+            "direction": direction.value,
+            "status": final_order.status.value,
+        },
+    )
+    return final_order, opened_quantity
+
+
+async def _remediate_partial_batch(
+    db: AsyncSession,
+    stack,
+    user: User,
+    *,
+    batch_id: uuid.UUID,
+    strategy_name: str,
+    execution_mode: ExecutionMode,
+    leg_results: list[LegExecutionResult],
+    opened: list[tuple[str, Instrument, Direction, float, float]],
+) -> tuple[bool, list[str]]:
+    """Deals with a multi-leg strategy that only partly executed.
+
+    Blueprint §37-40 gates a combination on its *combined* payoff: a bull
+    put spread's approved max loss is the width of the spread because the
+    long put caps the short one. Nothing at the exchange enforces that
+    pairing -- each leg is a separate order, and neither Upstox nor Dhan
+    offers an atomic multi-leg submission this codebase can use. So when
+    the short leg fills and the protective long leg is rejected, the
+    account is left holding a naked short option whose real risk is the
+    strike, not the spread width: measured on a 25200/25000 put spread,
+    an approved max loss of 6,500 became an actual 1,254,000 on a 100,000
+    account, reported as `201 Created` with no halt and a "position
+    opened" notification. The risk engine's approval was conditional on a
+    combination that no longer exists.
+
+    Two rules, and the difference between them matters:
+
+    * A leg whose fate is **unknown** (`FAILED` -- the broker never
+      answered; see `UpstoxBroker.place_order`) is never unwound. An
+      opposing order for a leg that may or may not exist at the exchange
+      is not a reversal, it is a coin flip that can open a fresh position
+      of its own. Those go to reconciliation, not to remediation.
+    * Otherwise every leg's fate is known, so the exposure this call
+      newly opened is given back with opposing market orders -- the only
+      state the risk engine actually approved is the one before the call.
+
+    Either way the account is halted (blueprint §73-75) whenever anything
+    executed, because an unwind is best effort: it can be rejected in
+    turn, it does not restore a leg this batch merely *reduced*, and the
+    condition that rejected a leg (margin, a freeze quantity, a
+    non-tradable contract) is likely to reject the next order too. The
+    halt exempts reducing orders, so the holder can still get out; what
+    it stops is piling more on top of a position nobody approved.
+
+    Returns `(strategy_intact, remediation_lines)`.
+    """
+    established = [r for r in leg_results if r.status in _ESTABLISHED_LEG_STATUSES]
+    unknown = [r for r in leg_results if r.status == OrderStatus.FAILED.value]
+    if not unknown and len(established) == len(leg_results):
+        return True, []
+    if not established and not unknown:
+        # Every leg was rejected outright: nothing reached the exchange,
+        # so there is no imbalance to remediate and nothing to halt over.
+        return False, ["No leg reached the exchange -- nothing was opened, so nothing needed unwinding."]
+
+    remediation: list[str] = []
+    if unknown:
+        remediation.append(
+            f"{len(unknown)} leg(s) went unanswered by the broker; their fate is unknown. Filled legs were "
+            "deliberately NOT unwound -- an opposing order for a leg that may already exist at the exchange "
+            "would open a position of its own. Reconcile against the broker."
+        )
+    else:
+        for symbol, instrument, direction, quantity, premium in opened:
+            position = stack.position_manager.get(str(user.id), symbol)
+            closable = min(quantity, abs(position.quantity)) if position is not None else 0.0
+            if closable <= 0:
+                remediation.append(f"{symbol}: nothing left to unwind.")
+                continue
+            exit_direction = Direction.SHORT if direction == Direction.LONG else Direction.LONG
+            unwind_order, _ = await _submit_leg(
+                db,
+                stack,
+                user,
+                instrument=instrument,
+                symbol=symbol,
+                direction=exit_direction,
+                premium=premium,
+                total_quantity=closable,
+                idempotency_key=f"unwind:{user.id}:{batch_id}:{symbol}",
+                batch_id=batch_id,
+                strategy_name=strategy_name,
+                execution_mode=execution_mode,
+                transition_reason=f"unwinding partially executed options batch {batch_id}",
+                audit_action="options_strategy.leg_unwound",
+            )
+            if unwind_order.status.value in _ESTABLISHED_LEG_STATUSES:
+                remediation.append(f"{symbol}: unwound {closable} of newly opened exposure.")
+            else:
+                remediation.append(
+                    f"{symbol}: unwind order came back {unwind_order.status.value} "
+                    f"({unwind_order.rejection_reason or 'no reason given'}) -- exposure is still open."
+                )
+        if not opened:
+            remediation.append(
+                "No leg opened new exposure, so there was nothing to unwind -- the incomplete legs left an "
+                "existing position only partly closed."
+            )
+
+    reason = f"Multi-leg options strategy '{strategy_name}' (batch {batch_id}) only partly executed"
+    await halt_account(str(user.id), reason)
+    await create_notification(
+        db,
+        user_id=user.id,
+        notification_type=NotificationType.RECONCILIATION_REQUIRED,
+        title=f"{strategy_name} did not execute as approved",
+        body="; ".join(remediation)[:1000],
+        data={
+            "batch_id": str(batch_id),
+            "strategy_name": strategy_name,
+            "legs": [{"symbol": r.symbol, "status": r.status} for r in leg_results],
+        },
+    )
+    await record_audit(
+        db,
+        actor="system",
+        action="options_strategy.partial_execution",
+        user_id=user.id,
+        details={"batch_id": str(batch_id), "strategy_name": strategy_name, "remediation": remediation},
+    )
+    remediation.append(f"New entries are halted for this account: {reason}")
+    return False, remediation
+
+
 @router.post("/execute", response_model=ExecuteOptionsStrategyResponse, status_code=status.HTTP_201_CREATED)
 async def execute_options_strategy(
     payload: ExecuteOptionsStrategyRequest,
@@ -201,9 +506,14 @@ async def execute_options_strategy(
 
     Each leg is still a *separate* order once submitted — neither this
     codebase nor (as far as it's been verified) Upstox/Dhan guarantee
-    exchange-level atomic multi-leg fills, so a later leg's rejection
-    does not undo an earlier leg's fill. Every leg's own outcome is
-    reported in the response; nothing here pretends this is atomic.
+    exchange-level atomic multi-leg fills. This is not atomic and does
+    not pretend to be; what it does guarantee is that a batch which only
+    partly executes never quietly leaves the account holding something
+    the risk engine did not approve. `_remediate_partial_batch` unwinds
+    the exposure this call newly opened (never a leg whose fate is
+    unknown) and halts the account. `strategy_intact` in the response
+    says whether the approved combination actually exists at the broker;
+    `remediation` says what was done when it doesn't.
     """
     if not payload.legs:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "At least one leg is required")
@@ -368,24 +678,14 @@ async def execute_options_strategy(
     batch_id = uuid.uuid4()
     execution_mode = _execution_mode_for(stack)
     leg_results: list[LegExecutionResult] = []
+    # Everything this call newly opened, in submission order:
+    # (symbol, instrument, direction, quantity opened, premium). This is
+    # what has to be given back if a later leg fails to establish -- see
+    # `_remediate_partial_batch`.
+    opened: list[tuple[str, Instrument, Direction, float, float]] = []
     for leg in payload.legs:
         instrument = instruments[leg.symbol]
-        if isinstance(stack.broker, MockBroker):
-            stack.broker.set_quote(leg.symbol, ltp=leg.premium)
-
         existing_position = stack.position_manager.get(str(user.id), leg.symbol)
-        realized_pnl_before = existing_position.realized_pnl if existing_position is not None else 0.0
-        position_before = (
-            {
-                "is_long": existing_position.is_long,
-                "average_price": existing_position.average_price,
-                "quantity": existing_position.quantity,
-            }
-            if existing_position is not None
-            else None
-        )
-
-        idempotency_key = f"{user.id}:{batch_id}:{leg.symbol}"
         total_quantity = leg.quantity * instrument.lot_size
         if is_reducing and existing_position is not None:
             # What makes the exemption above safe rather than a hole: an
@@ -394,115 +694,44 @@ async def execute_options_strategy(
             # client could clear every limit by sending an oversized
             # opposing leg and calling it a close.
             total_quantity = min(total_quantity, abs(existing_position.quantity))
-        order, created = stack.order_manager.create_order(
-            idempotency_key, str(user.id), leg.symbol, leg.direction, OrderType.MARKET, total_quantity
-        )
-        if created:
-            stack.order_manager.transition(order.id, OrderStatus.VALIDATING)
-            stack.order_manager.transition(order.id, OrderStatus.RISK_APPROVED, f"options strategy batch {batch_id}")
-            await stack.execution_engine.submit(order.id)
-            stack.trades_today += 1
 
-        final_order = stack.order_manager.get(order.id)
-        if created:
-            # Same "Repeated order rejection" tracking as app/api/orders.py's
-            # place_order -- each leg is its own real order submitted to the
-            # broker, so a run of consecutive broker-level rejections across
-            # legs/strategies must trip `no_repeated_rejections` here too,
-            # not just on the single-order path.
-            stack.repeated_rejections = stack.repeated_rejections + 1 if final_order.status == OrderStatus.REJECTED else 0
-        await persist_order(
-            db, final_order, user.id, instrument.id, execution_mode=execution_mode, broker_account_id=stack.broker_account_id
-        )
-
-        position_after = stack.position_manager.get(str(user.id), leg.symbol)
-        if position_after is not None:
-            # Same "did a real fill actually happen" guard as
-            # app/api/orders.py's place_order -- a broker-rejected leg
-            # leaves `position_after` reflecting whatever existed before
-            # this call, unchanged.
-            just_filled = created and final_order.status in (
-                OrderStatus.FILLED,
-                OrderStatus.PARTIALLY_FILLED,
-                OrderStatus.MONITORING,
-            )
-            opened_or_added = (
-                just_filled and position_after.is_open and position_after.is_long == (leg.direction == Direction.LONG)
-            )
-            position_row = await persist_position(
-                db, user.id, instrument.id, position_after, execution_mode=execution_mode, source_key="manual"
-            )
-            realized_delta = position_after.realized_pnl - realized_pnl_before
-            if realized_delta != 0 and position_before is not None:
-                # Same fix as app/api/orders.py's place_order -- without
-                # this, stack.daily_pnl/weekly_pnl never reflect a loss
-                # realized by closing an options leg, so the
-                # daily_loss_limit/weekly_loss_limit checks (both wired
-                # into evaluate_options_risk above) could never fail no
-                # matter how much this specific path lost.
-                stack.daily_pnl += realized_delta
-                stack.weekly_pnl += realized_delta
-                await record_trade(
-                    db,
-                    user_id=user.id,
-                    instrument_id=instrument.id,
-                    direction=Direction.LONG if position_before["is_long"] else Direction.SHORT,
-                    entry_price=position_before["average_price"],
-                    # Same fix as app/api/orders.py's record_trade call --
-                    # the real broker fill price, not the client-supplied
-                    # `leg.premium`, which `pnl` above was actually computed
-                    # from (via PositionManager.apply_fill).
-                    exit_price=final_order.average_fill_price,
-                    # Same fix as app/api/orders.py's record_trade call --
-                    # the quantity this fill actually closed, not the whole
-                    # pre-fill position, which on a partial reduce left the
-                    # journal row disagreeing with its own `pnl`.
-                    quantity=min(final_order.filled_quantity, abs(position_before["quantity"])),
-                    pnl=realized_delta,
-                    position_id=position_row.id,
-                    execution_mode=execution_mode,
-                )
-                # Blueprint §63/§104 parity with app/api/orders.py's
-                # identical fix -- this endpoint places real orders
-                # through the same broker/risk/persistence pipeline (its
-                # own docstring says so) but used to only notify on
-                # rejection, never on an actual closing fill.
-                await create_notification(
-                    db,
-                    user_id=user.id,
-                    notification_type=NotificationType.POSITION_CLOSED,
-                    title=f"{leg.symbol} position closed",
-                    body=f"Realized P&L: {realized_delta:.2f}",
-                    data={"symbol": leg.symbol, "pnl": realized_delta},
-                )
-            if opened_or_added:
-                await create_notification(
-                    db,
-                    user_id=user.id,
-                    notification_type=NotificationType.TRADE_EXECUTED,
-                    title=f"{leg.symbol} order executed",
-                    body=f"Opened {leg.direction.value} position in {leg.symbol}",
-                    data={"symbol": leg.symbol, "direction": leg.direction.value, "strategy_name": payload.strategy_name},
-                )
-
-        await record_audit(
+        final_order, opened_quantity = await _submit_leg(
             db,
-            actor="user",
-            action="options_strategy.leg_placed",
-            user_id=user.id,
-            details={
-                "batch_id": str(batch_id),
-                "strategy_name": payload.strategy_name,
-                "symbol": leg.symbol,
-                "direction": leg.direction.value,
-                "status": final_order.status.value,
-            },
+            stack,
+            user,
+            instrument=instrument,
+            symbol=leg.symbol,
+            direction=leg.direction,
+            premium=leg.premium,
+            total_quantity=total_quantity,
+            idempotency_key=f"{user.id}:{batch_id}:{leg.symbol}",
+            batch_id=batch_id,
+            strategy_name=payload.strategy_name,
+            execution_mode=execution_mode,
+            transition_reason=f"options strategy batch {batch_id}",
+            audit_action="options_strategy.leg_placed",
         )
+        if opened_quantity > 0:
+            opened.append((leg.symbol, instrument, leg.direction, opened_quantity, leg.premium))
         leg_results.append(
             LegExecutionResult(
                 symbol=leg.symbol, order_id=final_order.id, status=final_order.status.value, rejection_reason=final_order.rejection_reason
             )
         )
+
+    # Each leg is a separate order and nothing at the exchange enforces
+    # the combination -- so before answering, check that the combination
+    # the risk engine approved actually exists, and deal with it if not.
+    strategy_intact, remediation = await _remediate_partial_batch(
+        db,
+        stack,
+        user,
+        batch_id=batch_id,
+        strategy_name=payload.strategy_name,
+        execution_mode=execution_mode,
+        leg_results=leg_results,
+        opened=opened,
+    )
 
     return ExecuteOptionsStrategyResponse(
         batch_id=batch_id,
@@ -512,4 +741,6 @@ async def execute_options_strategy(
         capital_requirement=payoff.capital_requirement,
         liquidity_warnings=liquidity_warnings,
         legs=leg_results,
+        strategy_intact=strategy_intact,
+        remediation=remediation,
     )

@@ -7043,6 +7043,69 @@ were measured against injected faults rather than assumed — removing the
 `user_id` clause from the lookup fails the first, removing the fallback 404
 fails both.
 
+## Client-supplied money has to be money
+
+`POST /replay` bounds its `starting_balance` (`gt=0, lt=1e12`). Its two
+siblings did not: `POST /paper`'s `starting_balance` and both
+`starting_capital` fields in `app/api/backtest.py` were bare `float`
+defaults. A bare `float` in Pydantic accepts `NaN`, `Infinity` and any
+magnitude, and `json.loads` accepts the bare `NaN` / `Infinity` tokens, so
+no unusual client is needed to send them. The OHLC fields of
+`POST /paper/{id}/candle` had the same gap.
+
+Measured on the real endpoints:
+
+* `POST /backtest` and `POST /backtest/validate` with `starting_capital`
+  of `1e30`, `Infinity` or `NaN` answered **500** — the `backtests` row
+  will not go into `Numeric(18, 6)`. With `-5` or `0` they answered 200 and
+  produced a return-on-capital report against an account that cannot
+  exist.
+* `POST /paper` with `Infinity` or `NaN` answered **500** at session
+  creation.
+* `POST /paper` with `1e15` answered 200, and the *ninth* candle then
+  500ed: the strategy sized the position at 1.5e12 units, `persist_position`
+  could not write that, and the session was left with an open position in
+  the engine and **zero rows in the journal** — `GET /paper/{id}` showing
+  the position while `GET /portfolio.total_exposure` read 0.00, for the
+  life of the session. That is the same engine/journal divergence the
+  bounds on `PlaceOrderRequest` were added to close.
+* `POST /paper/{id}/candle` with a `NaN` close, with a position open,
+  answered 200 and left a literal `Decimal('NaN')` in
+  `positions.unrealized_pnl` (Postgres `NUMERIC` accepts NaN); the API
+  serialised it back as `null`. With `Infinity` it answered **500**.
+
+All of these now answer **422**. The fix is one ceiling, `_MAX_MONEY = 1e12`,
+applied the way `POST /replay` already applies it: `Numeric(18, 6)` holds at
+most 999999999999.999999, and every number derived from an account balance
+here — position quantity, notional, mark-to-market P&L — lands in a column
+of that type. `gt=0` does the rest of the work, including on NaN: every
+comparison against NaN is False, so a NaN fails the *upper* bound and is
+refused. No separate `allow_inf_nan` switch is needed.
+
+A manual paper session's candles come from the client **by design** — the
+endpoint is the user driving a simulation, and inventing prices is the
+point. The bounds assert only that the numbers are prices at all. Two
+things were checked and deliberately left alone: an internally incoherent
+candle (`high` below `low`) is inert in this engine — `_maybe_exit`
+compares the stop against `low` and the target against `high`, and an
+inverted candle satisfies neither — and the retest gate
+`candle.low <= entry <= candle.high` already refuses to open on one. No
+coherence validator was added for a defect that could not be demonstrated.
+
+**What the ceiling does not do.** It bounds the inputs, not the products.
+A balance just under the ceiling with a small enough stop distance still
+sizes a position whose mark-to-market P&L overflows `Numeric(18, 6)`. The
+control test pins the top of the range that does work (9.99e11 opens,
+trades a full round trip, and journals a position of ~1.5e10 units), which
+is what keeps the bound from being quietly tightened into uselessness; it
+does not prove the column can never overflow.
+
+The tick-to-candle path (`CandleWorker`) has no equivalent guard, and did
+not get one here: `normalize_tick` — the function that would validate a
+broker's payload — has zero callers in `app/`, and the only feed wired to
+the worker is `SimulatedFeed`. There is no live feed to harden yet, and
+inventing one to guard it would be speculative.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

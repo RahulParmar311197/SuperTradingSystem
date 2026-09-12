@@ -6257,6 +6257,66 @@ Two things deliberately left alone:
   every leg would block rather than degrade — a different situation with
   its own documented reasoning.
 
+## The engine got slower every bar it ran (§23, §54)
+
+`SMCEngine.analyze` was quadratic in history length, and the autonomous
+loop calls it on the whole history every pass.
+
+`update_mitigation`, in both `app/smc/fvg.py` and
+`app/smc/order_blocks.py`, recomputed each zone's fill state by scanning
+*every* later candle — and the number of zones grows with the series. So
+the work per call grew as zones × candles. `PaperTradingEngine.on_candle`
+calls `analyze` over its entire accumulated history once per bar,
+`AutoTradeSupervisor` drives that on a 60-second loop, and
+`auto_trade_worker.py` seeds `engine.candles` once from an unbounded
+`get_candles` and appends to it forever after.
+
+Measured, one `analyze` pass over a random walk:
+
+```
+   bars   before    after
+    500   11.2ms    5.4ms
+   2000  136.6ms   30.0ms
+   8000  1988ms     214ms
+  16000  7560ms     657ms     (11.5x)
+```
+
+16 000 bars is about eleven days of one-minute data for **one** instrument
+on **one** strategy. At 7.5 seconds per pair per pass, a handful of pairs
+already exceeded the 60-second interval — and the overrun grew with every
+bar stored, so the loop fell progressively further behind rather than
+settling at a steady lag.
+
+`cProfile` put 4.1s of an 8 000-bar pass in `fvg.update_mitigation` and
+1.5s in the order-block twin, with 9 million `max()` and 8.8 million
+`min()` calls. Note what this is *not*: the candle list itself is 1.4 MB
+at 16 000 bars. This was never a memory problem, and the earlier
+"unbounded growth" framing of it was wrong — the list is small, the
+re-analysis is what costs.
+
+The fix is to stop each scan once the outcome can no longer change. Both
+fields anyone reads are monotone: `filled_percentage` is
+`min(deepest_fill / size, 1.0)`, so it is pinned once `deepest_fill`
+reaches `size`, and `mitigated` is sticky-true from that same point. Order
+blocks already computed `mitigated_index`, so their exact stopping
+condition was sitting there unused.
+
+One divergence, stated rather than buried: `FairValueGap.invalidated` can
+now be left `False` where a full scan would eventually have set it — a gap
+filled gradually and engulfed only much later. Nothing outside `fvg.py`
+reads it (`SMCEngine.active_fvgs`, the chart overlay and the AI context
+all read `mitigated`/`filled_percentage`), and an engulfing candle fills a
+gap completely in the same iteration it invalidates it, so invalidation
+never arrives before the fill that ends the scan anyway.
+
+A faster analysis that produced different zones would be worse than a slow
+one, so `tests/smc/test_mitigation_equivalence.py` carries the
+pre-optimisation full-scan loop as a reference implementation and asserts
+the real one agrees on every consumed field across 25 randomised walks.
+A stash-verify proves nothing for a change like this — the old code is
+also correct — so the test's own credibility is established by injecting a
+plausible-but-wrong early exit (break on first overlap), which it catches.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

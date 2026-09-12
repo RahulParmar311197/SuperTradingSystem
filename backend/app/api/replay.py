@@ -9,6 +9,7 @@ from app.auth.dependencies import get_current_user
 from app.core.redis import channel_name, publish
 from app.database.session import get_db
 from app.database.models.users import User
+from app.api.charts import _serialize_ict, _serialize_smc
 from app.market.repository import get_candles
 from app.replay.engine import ReplayEngine, ReplayError
 from app.replay.persistence import create_replay_session_row, get_owned_replay_session, reset_replay_session, sync_replay_session
@@ -131,6 +132,41 @@ async def step_replay(
     engine.advance(steps)
     await sync_replay_session(db, session_id, engine)
     return await _publish_state(session_id, engine)
+
+
+@router.get("/{session_id}/analysis")
+async def get_replay_analysis(
+    session_id: uuid.UUID, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
+) -> dict:
+    """SMC/ICT structure as of the replay cursor (blueprint §41).
+
+    The blueprint's replay flow is Clock -> Current Timestamp -> only
+    historical information available so far -> SMC/ICT -> Strategy -> AI
+    -> Virtual Execution, and studying structure as it forms is the point
+    of stepping bar by bar. `ReplayEngine.analyze` implemented that stage
+    correctly and look-ahead-safely from the day it was written, and had
+    no caller anywhere in `app/` -- this route is the missing one.
+
+    That absence had a second cost. `ReplayClock.visible_candles`, whose
+    docstring calls itself "the single rule that matters here" and which
+    is what blueprint §45 requires, had exactly one consumer:
+    `ReplayEngine.analyze`. With nothing calling that, the mandatory
+    look-ahead guarantee was protecting nothing reachable and no test
+    exercised it end to end. `tests/replay/test_replay_analysis.py` now
+    asserts through this endpoint that no returned structure carries a
+    timestamp later than the candle the cursor is sitting on.
+
+    The payload reuses the chart overlay serialisers so the replay and
+    chart views of the same structure cannot drift apart.
+    """
+    engine = await _get_owned_session(session_id, user, db)
+    smc_context, ict_context = engine.analyze()
+    return {
+        "cursor": engine.clock.cursor,
+        "as_of": engine.clock.current_candle.timestamp.isoformat(),
+        "smc": _serialize_smc(smc_context),
+        "ict": _serialize_ict(ict_context),
+    }
 
 
 @router.post("/{session_id}/reset", response_model=ReplayStateResponse)

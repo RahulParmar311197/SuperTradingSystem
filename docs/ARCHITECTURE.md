@@ -6738,6 +6738,72 @@ guarantee was described as mandatory in the blueprint and had no test
 before this. The library's numbers above are quoted in its docstring only
 as the contrasting case.
 
+## Replay could not show you the structure it was replaying (round 105)
+
+Blueprint §41 states the replay flow explicitly:
+
+```text
+Replay Clock -> Current Timestamp -> Only historical information
+available so far -> SMC/ICT -> Strategy -> AI -> Virtual Execution
+```
+
+`ReplayEngine.analyze` implements the SMC/ICT stage, correctly and
+look-ahead-safely, and had **zero callers anywhere in `app/`**. No
+endpoint, no worker; `/ws/replay` only relays `_state_response`, which
+carries cursor, balance and open trade and no structure at all. A user
+could step through a replay bar by bar and never see the swings, gaps,
+order blocks or structure breaks forming — which is the entire point of
+stepping.
+
+This is a missing endpoint completing a specified feature, not a crash
+being fixed, and it is described that way rather than dressed up as a bug.
+
+`GET /replay/{session_id}/analysis` is that endpoint. It goes through
+`_get_owned_session` like every other `/replay/*` route, so an unowned
+session answers 404 rather than confirming it exists, and it reuses
+`_serialize_smc` / `_serialize_ict` from `app/api/charts.py` so the replay
+and chart views of the same structure cannot drift apart.
+
+### The absence had a second cost
+
+`ReplayClock.visible_candles` — the property whose own docstring says "the
+single rule that matters here", and which is what blueprint §45 calls
+mandatory — had exactly one consumer: `ReplayEngine.analyze`. With nothing
+calling that, the guarantee was protecting nothing reachable, and no test
+exercised it end to end. Substituting `self.clock.candles` for `visible`
+would have left the whole suite green.
+
+`tests/api/test_replay_analysis.py` now asserts it through the API: step
+the cursor, fetch the analysis, and require that nothing in the payload is
+dated later than the candle the cursor sits on. With that substitution
+injected, the test reports the exact leak — at cursor 12 the analysis
+carried structure dated from ten later candles.
+
+Note this is a *different* failure from the one
+`tests/smc/test_reference_agreement.py` pins. That test proves the
+detectors never revise a past verdict. This one proves the layer above
+hands them the truncated slice. A perfectly look-ahead-safe detector fed
+the entire history leaks the future just as thoroughly, and only this
+failure is reachable by a user stepping through a replay.
+
+### A vacuous assertion, caught before it shipped
+
+The first version of this test also asserted that swept liquidity pools
+never decrease. It passed — and it was worthless: the fixture produced
+**zero** swept pools at every cursor, so the assertion never evaluated
+anything. `liquidity_pools` is the one section the date bound cannot
+check, because the chart serialiser emits side, source, price, swept and
+rejected for a pool and no timestamp at all, and `swept` is exactly the
+field a full-series leak inflates, since `detect_sweeps` scans the candles
+*after* a pool forms.
+
+The fixture now carries a tail that takes out the 130 equal-highs level
+partway through, so a sweep genuinely occurs during the replay: the
+sequence measured across cursors 12, 18, 24, 29, 33, 39 is
+`0, 0, 0, 0, 1, 1`. The test requires it to start at zero, end above zero,
+and never decrease — which a full-series leak fails on the first of those,
+because it would report the sweep from the very first request.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

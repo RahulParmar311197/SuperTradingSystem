@@ -30,7 +30,7 @@ from app.risk.portfolio import compute_correlated_exposure
 from app.trading.broker_resolver import resolve_broker
 from app.trading.execution import ExecutionEngine
 from app.trading.order_manager import OrderManager
-from app.trading.persistence import persist_order, persist_position, record_trade
+from app.trading.persistence import load_open_positions, persist_order, persist_position, record_trade
 from app.trading.position_manager import PositionManager, PositionRecord
 
 router = APIRouter(tags=["trading"])
@@ -131,7 +131,23 @@ async def _stack_for(user: User, db: AsyncSession) -> _UserTradingStack:
         async with lock:
             if user.id not in _STACKS:
                 broker, broker_account_id = await resolve_broker(db, user)
-                _STACKS[user.id] = _UserTradingStack(broker, broker_account_id)
+                stack = _UserTradingStack(broker, broker_account_id)
+                # Rebuild the position book from its DB mirror before this
+                # stack is used for anything. Without it a restarted
+                # process starts flat: `current_exposure` and
+                # `max_open_positions` below sum an empty book to zero, so
+                # an account could re-take exposure it already holds, and
+                # `is_reducing` could not recognise an exit as an exit.
+                # Measured on a single open position of 100 @ 100: before
+                # this, a restart reported exposure 0.00 and `GET
+                # /positions` returned `[]` while the row sat open in
+                # Postgres.
+                stack.position_manager.restore(
+                    await load_open_positions(
+                        db, user.id, _execution_mode_for(stack), source_key="manual"
+                    )
+                )
+                _STACKS[user.id] = stack
     return _STACKS[user.id]
 
 

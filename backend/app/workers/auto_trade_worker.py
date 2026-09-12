@@ -49,7 +49,7 @@ from app.notifications.service import create_notification
 from app.paper.engine import PaperTradingEngine, RiskWindow
 from app.risk.limits import RiskLimits
 from app.strategy.dsl import StrategyDefinition
-from app.trading.persistence import persist_position
+from app.trading.persistence import load_open_positions, persist_position
 from app.trading.position_manager import PositionManager
 
 logger = logging.getLogger("workers.autotrade")
@@ -127,7 +127,22 @@ class AutoTradeSupervisor:
         key = (str(user.id), str(strategy_row.id), str(instrument.id))
         engine = self._engines.get(key)
         if engine is None:
-            position_manager = self._position_managers.setdefault(str(user.id), PositionManager())
+            position_manager = self._position_managers.get(str(user.id))
+            if position_manager is None:
+                # Same restart gap the manual stack had: this worker's
+                # book is process memory, mirrored into `positions` and
+                # never read back, so a worker restart started flat and
+                # `max_open_positions` / `current_exposure` both saw zero
+                # while the account's auto-traded positions sat open in
+                # Postgres. Rebuilt once per user, before any candle is
+                # fed to an engine sharing this manager.
+                position_manager = PositionManager()
+                position_manager.restore(
+                    await load_open_positions(
+                        db, user.id, ExecutionMode.PAPER, source_key="auto"
+                    )
+                )
+                self._position_managers[str(user.id)] = position_manager
             risk_window = self._risk_windows.setdefault(str(user.id), RiskWindow())
             engine = PaperTradingEngine(
                 strategy,

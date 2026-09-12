@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class ConditionType(StrEnum):
@@ -91,6 +91,42 @@ _UNFED_CONDITION_TYPES = frozenset(
 )
 
 
+# How many bars back an event of each type still counts as "recent".
+#
+# These are not taste. An FVG is three candles wide and exists the moment
+# it prints, so a short window is right for it. A market-structure shift is
+# a *sequence*: a CHoCH breaking a confirmed swing, then a same-direction
+# BOS breaking a later confirmed swing, each waiting `swing_length` bars
+# for its swing to confirm (app/smc/structure.py, app/smc/swings.py). It
+# cannot exist within a few bars of the sweep that caused it.
+#
+# One default of 5 for everything made exactly the sequence this platform
+# is built around -- sweep, then structure shift, then FVG, then retest,
+# the blueprint's own §34 example -- effectively unexpressible: by the time
+# an MSS confirmed, the sweep that caused it had aged out of its window.
+# Measured over 3120 bar-evaluations of 60 random walks, counting bars
+# where the §34 conjunction holds:
+#
+#     lookback   sweep+mss   all three
+#            5           1           1
+#           10           9           7
+#           20          62          45
+#           40         376         288
+#           80         996         804
+#
+# A strategy that fires on 0.03% of bars is not a strategy. 30 puts the
+# multi-bar structure events in the range where the sequence they describe
+# can actually complete, while leaving single-print events short.
+_DEFAULT_LOOKBACK_BY_TYPE: dict[ConditionType, int] = {
+    ConditionType.MSS: 30,
+    ConditionType.CHOCH: 30,
+    ConditionType.BOS: 30,
+    ConditionType.LIQUIDITY_SWEEP: 30,
+    ConditionType.ORDER_BLOCK: 20,
+}
+_DEFAULT_LOOKBACK = 5
+
+
 class Condition(BaseModel):
     """A single leaf condition. `type` selects which evaluator handles it;
     the remaining fields are interpreted by that evaluator (see
@@ -105,7 +141,26 @@ class Condition(BaseModel):
     value: float | None = None
     min_value: float | None = None
     max_value: float | None = None
-    lookback: int = 5  # how many recent candles/events count as "recent" for event-type conditions
+    # How many recent candles count as "recent" for event-type conditions.
+    # Left unset, it is filled per condition type by
+    # `_default_lookback_per_condition_type` below -- a single scalar cannot
+    # serve every type, because the events differ by an order of magnitude
+    # in how long they take to form.
+    lookback: int | None = None
+
+    @model_validator(mode="after")
+    def _default_lookback_per_condition_type(self) -> "Condition":
+        """Fills `lookback` from the event's own formation time when the
+        author did not state one.
+
+        Kept as a post-validation fill rather than a plain field default so
+        the evaluator never sees `None` and no caller has to know the
+        table. An explicit `lookback` is always honoured, including one
+        that is shorter than the default.
+        """
+        if self.lookback is None:
+            self.lookback = _DEFAULT_LOOKBACK_BY_TYPE.get(self.type, _DEFAULT_LOOKBACK)
+        return self
 
     @field_validator("type")
     @classmethod

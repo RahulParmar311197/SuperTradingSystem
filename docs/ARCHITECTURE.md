@@ -6015,6 +6015,84 @@ And this is tested against `httpx.MockTransport`, not against Upstox's
 real servers, so it proves the adapter's behaviour on a transport failure,
 not that Upstox fails in exactly these ways.
 
+## The blueprint's own flagship strategy could not fire (§34, §17)
+
+Blueprint §34 prints one worked strategy — "Bullish Liquidity Sweep":
+sell-side liquidity swept, market structure shifts bullish, a bullish FVG
+forms, enter on the retest. It is the platform's thesis in five lines of
+JSON. It appeared nowhere in the codebase, was never executed by anything,
+and when finally run, it did not work.
+
+Written exactly as the blueprint prints it and evaluated over 120 seeded
+random walks of 160 bars — roughly 9,600 bar-evaluations — it matched
+**twice**. Not rarely. Effectively never.
+
+The cause is a single default. `Condition.lookback` was `5` for every
+condition type, and both the sweep and the MSS check
+`current_index - event_index < lookback`. But those two events cannot be
+five bars apart. An MSS is a *sequence*: a CHoCH breaking a confirmed
+swing, then a same-direction BOS breaking a later confirmed swing, each
+waiting `swing_length` bars for its swing to confirm
+(`app/smc/structure.py`, `app/smc/swings.py`). By the time the structure
+shift exists, the sweep that caused it has aged out of its own window. The
+strategy asks for a sequence and the DSL only ever looked at an instant.
+
+Measured across 3,120 bar-evaluations, varying only the window:
+
+```
+lookback   sweep+mss   all three
+       5           1           1
+      10           9           7
+      20          62          45
+      40         376         288
+      80         996         804
+```
+
+`_DEFAULT_LOOKBACK_BY_TYPE` in `app/strategy/dsl.py` now defaults the
+window from the event's own formation time: 30 bars for the multi-bar
+structure events (MSS, CHoCH, BOS, liquidity sweep), 20 for order blocks,
+5 for single-print events like an FVG. The same §34 JSON now matches 374
+times over the original corpus, up from 2. An explicit `lookback` is still
+always honoured, including one shorter than the default — the table is a
+default, not a floor.
+
+### A strategy library that is proven to fire
+
+`app/strategy/library.py` ships five strategies —  the §34 example, its
+bearish mirror, bullish and bearish order-block retests, and a
+discount-zone FVG long — exposed through `GET /strategies/library` and
+copied into a user's own strategies by `POST /strategies/library/{key}`.
+A copy, not a reference: later edits to the shipped library never silently
+alter a strategy someone is trading.
+
+The point of the accompanying test is not that these are good strategies.
+It is that each one **matches at least once** on a varied corpus, with an
+entry and stop that actually resolve. Before this, nothing in the
+repository demonstrated that any complete strategy produced a signal end
+to end, which is exactly how the flagship example stayed broken. Observed
+hit rates over 2,080 bar-evaluations:
+
+```
+bullish_liquidity_sweep         4.7%
+bearish_liquidity_sweep         4.5%
+bullish_order_block_retest     34.2%
+bearish_order_block_retest     27.7%
+discount_fvg_long              25.1%
+```
+
+The spread is the design: the sweep strategies demand a reversal sequence
+and are selective; the retests take no view on exhaustion and fire far
+more often.
+
+**What this does not establish.** The corpus is seeded random walks, not
+market data. It is a lower bound on *expressibility* — price action varied
+enough that a setup which can occur, does — and says nothing whatever
+about profitability. No library strategy has been validated on real data;
+`POST /backtest/validate` exists for exactly that and remains unrun against
+a real feed. The hit rates above are a property of the corpus, not an edge.
+Two of the five strategies fire on a quarter to a third of all bars, which
+is a frequency to be suspicious of, not proud of.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

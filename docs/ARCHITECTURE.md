@@ -6658,6 +6658,86 @@ empty range, and the loop breaks on `clock.is_finished`, so a huge value
 stops at the end of the series rather than spinning. Bounding it would be
 tidiness, not a fix.
 
+## A second opinion on the SMC detectors (round 104)
+
+`app/smc` is hand-written, and every correctness claim about it so far has
+been checked against tests we also wrote. `app/smc/reference.py` adds an
+independent implementation to check it against: the `smartmoneyconcepts`
+package (MIT), wrapped so its detectors can be run over the same
+`list[Candle]` and the two compared.
+
+It is a **development dependency** (`requirements-dev.txt`, which CI now
+installs) and is imported lazily inside each adapter function, so neither
+it nor its numba/llvmlite dependency (~64MB) enters the production image
+or the application's import graph.
+
+### Why it is barred from the live path
+
+The obvious thing to do with a maintained library is to adopt it outright.
+That was measured before it was decided, and the measurement says no.
+Blueprint §45 makes look-ahead prevention mandatory. Feeding each engine
+one more candle at a time, over 249 arrivals:
+
+| | verdict revised on an already-visible bar | swings retracted |
+|---|---|---|
+| `smartmoneyconcepts` | 37 (FVG) | **253** |
+| `app.smc` | 0 | **0** |
+
+`smc.fvg` decides row `i` with `.shift(-1)` — candle `i + 1`.
+`smc.swing_highs_lows` post-filters into a strictly alternating HIGH/LOW
+sequence, recomputed globally on each call, so a swing it has already
+reported can stop existing. A retraction means a level handed to a live
+consumer later ceased to have happened; that is acceptable for offline
+analysis and disqualifying for anything that places an order.
+
+Our own detectors are monotone: over the same arrivals `app.smc` added 49
+swings and retracted none, and every addition landed on the single bar
+that had just become confirmable — exactly the relationship
+`Swing.confirmed_index` encodes.
+
+### What the two engines agree on, and what they do not
+
+The engines differ by design, and the tests encode which differences are
+understood rather than papering over them:
+
+* **FVG** — the library additionally requires the middle candle to close
+  in the gap's direction; we apply the plain three-candle imbalance. So it
+  finds strictly fewer gaps (roughly half), and **every gap it finds is
+  one we find, with the same direction**, on all ten test series. That
+  subset relation is the assertion: if our detector ever stops seeing a
+  gap an independent implementation still sees, the test fails.
+* **Swings** — the alternation filter discards intermediate pivots, so the
+  sets differ. Where both engines report a swing on the same bar, the
+  HIGH/LOW classification has never conflicted.
+* **Index convention** — the library anchors a gap at the middle candle;
+  `FairValueGap.created_index` anchors at the third, the first bar on
+  which the gap is knowable. The adapter normalises to ours, which is why
+  `reference_fvgs` adds one.
+* **Boundary artefact** — the library emits a swing at index 0 on every
+  series tested, although bar 0 has no left window. The adapter drops it.
+
+### An outside bar is both a swing high and a swing low
+
+Writing the comparison surfaced this, and it is worth recording because
+the first version of the test got it wrong. A bar whose high is the unique
+maximum of its window *and* whose low is the unique minimum — an outside
+bar that engulfs its neighbours — satisfies both pivot tests, and
+`detect_swings` correctly emits two swings for it. Keying swings by bar
+index collapses the pair and silently keeps one, which manufactures a
+disagreement with the library that is not real. The test compares
+`(index, type)` pairs for that reason. Seed 3 bar 28 of the fixture is
+such a bar.
+
+### The look-ahead test stands on its own
+
+The third test in `tests/smc/test_reference_agreement.py` does not use the
+library at all in its assertions. It pins the §45 guarantee directly —
+feed one candle at a time, nothing already reported may be withdrawn, and
+a new swing must land on the bar that has just become confirmable. That
+guarantee was described as mandatory in the blueprint and had no test
+before this. The library's numbers above are quoted in its docstring only
+as the contrasting case.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

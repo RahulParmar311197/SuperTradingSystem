@@ -121,6 +121,24 @@ class OrderManager:
         self._by_idempotency_key[idempotency_key] = order.id
         return order, True
 
+    def restore(self, orders: list[OrderRecord]) -> None:
+        """Seed the book and its idempotency index from durable storage.
+
+        The index is the point: `create_order` dedupes on it, and
+        `app.trading.persistence.persist_order` is idempotent on
+        `idempotency_key` because it assumes one key means one order. A
+        process that has forgotten its keys breaks that assumption --
+        `create_order` mints a second order, `persist_order` updates the
+        first one's row, and the second fill exists at the broker with no
+        journal entry. See `load_recent_orders` for the measurement.
+
+        Orders are restored with their events, which `persist_order`
+        counts against when appending new ones.
+        """
+        for order in orders:
+            self._orders[order.id] = order
+            self._by_idempotency_key[order.idempotency_key] = order.id
+
     def get(self, order_id: uuid.UUID) -> OrderRecord | None:
         return self._orders.get(order_id)
 

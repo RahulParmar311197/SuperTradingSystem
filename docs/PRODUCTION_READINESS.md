@@ -84,10 +84,16 @@ For real deployment:
 - **Set `ENVIRONMENT=production`.** It's `development` by default, which
   is what lets local dev and the test suite run with zero configuration.
   Setting it to `production` makes the app refuse to start
-  (`app/core/config.py`'s `Settings._refuse_default_secrets_in_production`)
+  (`app/core/config.py`'s `Settings._refuse_unsafe_defaults_in_production`)
   if `JWT_SECRET` or `CREDENTIALS_ENCRYPTION_KEY` is still blank or a
   repo default — this is the enforcement mechanism for the next bullet,
   not just documentation of intent.
+- **Set `DEBUG=false`.** It defaults to `true`, and the same startup check
+  refuses `ENVIRONMENT=production` while it is on. With debug enabled the
+  unhandled-exception handler returns `str(exc)` to the client on every
+  500 — which includes the failing SQL statement — and SQLAlchemy echoes
+  every statement it runs to the logs. `.env.example` now carries a
+  `DEBUG=` line so this is visible rather than inherited silently.
 - **Generate real values**, don't ship the repo's dev defaults:
   - `JWT_SECRET`: any high-entropy random string.
   - `CREDENTIALS_ENCRYPTION_KEY`: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`.

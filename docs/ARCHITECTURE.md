@@ -6583,6 +6583,81 @@ This still leaves unbounded numeric body fields elsewhere —
 `starting_capital`. None of those reach a broker, which is why the two
 execution endpoints came first; they remain open.
 
+## An analysis knob is a cost knob too (round 103)
+
+The bounds added in the previous rounds all landed on a parameter called
+`limit`, or on a price. `swing_length` is the same class of mistake one
+name over: a client-supplied integer handed to an engine that has its own
+opinion about what is valid, with nothing in between.
+
+`GET /charts/{instrument_id}/smc` declared it a bare `int`:
+
+```python
+swing_length: int = 3,
+...
+context = SMCEngine(SMCConfig(swing_length=swing_length)).analyze(candles)
+```
+
+and `app/smc/swings.py` opens with
+
+```python
+if swing_length < 1:
+    raise ValueError("swing_length must be >= 1")
+```
+
+That `ValueError` had nothing to catch it, so it reached the catch-all
+handler. Probed against unmodified code on an instrument with 200 candles:
+
+| `?swing_length=` | result |
+|---|---|
+| `3` (default) | 200 |
+| `0` | **500** |
+| `-1` | **500** |
+| `-100` | **500** |
+| `95` | 200 |
+| `10^9` | 200 |
+
+A 500 for what is purely a malformed request, on a GET any authenticated
+user can issue.
+
+The upper bound added alongside it is a **cost** bound, not a correctness
+one, and worth stating separately because nothing about it looks wrong
+from the outside. `detect_swings` builds and scans a `2 * swing_length + 1`
+window per bar, so the parameter multiplies the work per request. Measured
+directly over 16000 candles:
+
+| `swing_length` | `detect_swings` |
+|---|---|
+| 3 (default) | 26 ms |
+| 100 | 250 ms |
+| 1000 | 1818 ms |
+| 4000 | 3976 ms |
+
+A value large enough to empty `range(swing_length, n - swing_length)`
+returns 200 immediately — which is why `10^9` looked harmless in the table
+above. The expensive region is the one just below that, and it is reached
+with a single integer in a query string on the event loop every other
+request shares. A pivot with more than 100 bars either side is not a
+structural swing anyone reads, so the parameter is now
+`Query(default=3, ge=1, le=100)`.
+
+`POST /replay` takes the same two knobs in its body, and they are bounded
+here too — but honestly labelled: that one did **not** 500. `SMCConfig` is
+built there and stored on the engine, yet `ReplayEngine.analyze` has no
+caller anywhere in `app/`, so the value is never used. The bound closes a
+trap before it is stepped in rather than fixing a live crash, and the
+request model says so at the field. `starting_balance` gained `gt=0` on
+the same pass; a replay session starting from zero or negative capital is
+not a scenario, and every statistic `compute_statistics` returns is a
+ratio against it.
+
+One sibling was checked and deliberately left alone: `POST
+/replay/{id}/step?steps=` is also an unbounded `int`, and it is genuinely
+harmless. `ReplayEngine.advance` iterates `range(steps)` — negative is an
+empty range, and the loop breaks on `clock.is_finished`, so a huge value
+stops at the end of the series rather than spinning. Bounding it would be
+tidiness, not a fix.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

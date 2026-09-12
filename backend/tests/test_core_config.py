@@ -54,6 +54,34 @@ def test_production_with_blank_encryption_key_refuses_to_start():
 
 
 def test_production_with_real_secrets_starts_normally():
-    settings = _settings(environment="production")
+    # `debug=False` is now part of what a valid production config means --
+    # see test_production_with_debug_enabled_refuses_to_start below. This
+    # test previously omitted it because nothing checked it.
+    settings = _settings(environment="production", debug=False)
     assert settings.jwt_secret == _REAL_JWT_SECRET
     assert settings.credentials_encryption_key == _REAL_ENCRYPTION_KEY
+    assert settings.debug is False
+
+
+def test_production_with_debug_enabled_refuses_to_start():
+    """`debug` defaults to True and has two readers that make that unsafe:
+    `app/main.py`'s unhandled-exception handler returns `str(exc)` to the
+    client when it is set, and `create_async_engine` passes it as `echo`.
+    A deployment that overrode both secrets but left DEBUG at its default
+    answered every 500 with raw exception text -- including the failing
+    SQL -- and logged every statement it ran."""
+    with pytest.raises(ValueError, match="DEBUG"):
+        _settings(environment="production")
+
+
+def test_production_debug_check_names_the_variable_to_set():
+    # The whole value of a startup refusal is that it tells an operator
+    # what to do; a bare "invalid configuration" would not.
+    with pytest.raises(ValueError, match="Set DEBUG=false"):
+        _settings(environment="production", debug=True)
+
+
+def test_development_still_defaults_to_debug_on():
+    # The guard must not leak into local dev, where debug-by-default is
+    # the point.
+    assert _settings().debug is True

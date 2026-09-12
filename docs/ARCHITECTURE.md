@@ -771,7 +771,7 @@ and serve traffic indefinitely with a publicly-known secret protecting
 every user's broker credentials.
 
 Fixed with a `pydantic` `model_validator(mode="after")` on `Settings`
-(`_refuse_default_secrets_in_production`) that raises a clear `ValueError`
+(`_refuse_unsafe_defaults_in_production`) that raises a clear `ValueError`
 at construction time — meaning at process startup, since `get_settings()`
 constructs `Settings()` eagerly — whenever `environment == "production"`
 and either `jwt_secret` or `credentials_encryption_key` is blank or still
@@ -6411,6 +6411,49 @@ Two things worth stating rather than leaving implicit:
   that leaves `DEBUG` true serves tracebacks and echoes every SQL
   statement. That is a deployment-configuration concern, separate from
   this fix and not addressed by it.
+
+## The production guard did not cover `debug`
+
+`Settings._refuse_unsafe_defaults_in_production` makes `ENVIRONMENT=production`
+a hard startup failure when `JWT_SECRET` or `CREDENTIALS_ENCRYPTION_KEY` is
+still a repo default. It did not check `debug`, which defaults to `True`:
+
+```
+ENVIRONMENT=production started fine with debug=True
+```
+
+Two readers already in the tree make that unsafe:
+
+```
+app/main.py:107             detail = str(exc) if settings.debug else "Internal server error"
+app/database/session.py:32  create_async_engine(..., echo=settings.debug, ...)
+```
+
+So a deployment that correctly overrode both secrets but never set
+`DEBUG=false` answers every 500 with raw exception text — including the
+failing SQL statement — to unauthenticated clients, and logs every
+statement it runs. The `?limit=-1` bug above is a worked example of what
+that leaks: the asyncpg error *plus* `[SQL: SELECT notifications.id, ...]`.
+
+This is the same failure mode the guard already existed to catch — an
+operator not overriding a development default — so it is now refused the
+same way, and the validator is renamed from
+`_refuse_default_secrets_in_production` to reflect that it guards more
+than secrets.
+
+**Refused rather than silently forced to `False`.** The alternative was to
+override the value and log a warning. An operator who set `DEBUG=true`
+deliberately should find out at startup rather than discover later that
+the setting was ignored — and a refusal cannot be missed in a log. It is
+stricter than it needs to be for safety alone, which is the point.
+
+Two supporting changes, without which the guard would be a trap rather
+than a check: `.env.example` had **no `DEBUG` line at all**, so an
+operator following `PRODUCTION_READINESS.md` would set
+`ENVIRONMENT=production`, inherit `debug=True` invisibly, and meet a
+startup failure with nothing in their config to point at. It now ships a
+documented `DEBUG=` line, and the production checklist gained the matching
+bullet.
 
 ## Multi-leg options execution (§37-40)
 

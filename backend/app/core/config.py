@@ -57,7 +57,7 @@ class Settings(BaseSettings):
     rate_limit_enabled: bool = True
 
     @model_validator(mode="after")
-    def _refuse_default_secrets_in_production(self) -> "Settings":
+    def _refuse_unsafe_defaults_in_production(self) -> "Settings":
         """`credentials_encryption_key`'s default isn't an obviously-invalid
         placeholder the way `jwt_secret`'s is — it's a real, working Fernet
         key, committed to this source tree, that encrypts every connected
@@ -69,6 +69,19 @@ class Settings(BaseSettings):
         `ENVIRONMENT=production` (see docs/PRODUCTION_READINESS.md) to
         turn this into a hard startup failure instead of a silent,
         publicly-known secret in production.
+
+        `debug` belongs to the same family and was missed: it defaults to
+        `True`, and two readers act on it --
+        `app/main.py`'s unhandled-exception handler returns `str(exc)` to
+        the client when it is set, and `create_async_engine` passes it as
+        `echo`. A deployment that correctly overrode both secrets but
+        never set `DEBUG=false` therefore answers every 500 with raw
+        exception text (including the failing SQL) and logs every
+        statement it runs. Same failure mode as the two above -- an
+        operator not overriding a development default -- so it is refused
+        the same way rather than fixed up silently: an operator who set
+        `DEBUG=true` deliberately should find out at startup, not discover
+        later that the value was ignored.
         """
         if self.environment == "production":
             # Blank counts as unset too -- .env.example ships
@@ -90,6 +103,13 @@ class Settings(BaseSettings):
                     "Fernet key committed to source, so it is not a secret. Generate a real one "
                     '(python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())") '
                     "and set it via the CREDENTIALS_ENCRYPTION_KEY environment variable before running with "
+                    "ENVIRONMENT=production."
+                )
+            if self.debug:
+                raise ValueError(
+                    "DEBUG is enabled (its default) while ENVIRONMENT=production. That returns raw exception "
+                    "text -- including the failing SQL statement -- to unauthenticated clients on every 500, "
+                    "and echoes every SQL statement to the logs. Set DEBUG=false before running with "
                     "ENVIRONMENT=production."
                 )
         return self

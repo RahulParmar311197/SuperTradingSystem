@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -138,15 +138,34 @@ async def build_option_strategy(payload: BuildStrategyRequest, user: User = Depe
     )
 
 
+# Same ceiling as `POST /orders`: every price and quantity column is
+# `Numeric(18, 6)`, which holds at most 999999999999.999999.
+_MAX_PREMIUM = 1e12
+
+
 class ExecuteOptionLegRequest(BaseModel):
     symbol: str
     direction: Direction
-    quantity: float  # number of lots
+    # Bounded for the same reason as `POST /orders`'s prices: untrusted
+    # client input that is executed. A negative premium used to be
+    # *approved and executed* -- `evaluate_options_risk` scored the
+    # combination on a payoff built from it (a -100 premium reported
+    # max_profit 17500), the batch went to the broker, and only then did
+    # `MockBroker._resolve_fill_price` refuse the negative price. That
+    # left one leg filled and one rejected: a partly executed batch, which
+    # trips `_remediate_partial_batch` and halts the account. Malformed
+    # input cost the caller a halt and an unwind.
+    #
+    # Zero and negative quantities, and non-finite values, were rejected
+    # too -- but incidentally, by an exposure limit computed from the
+    # *other* leg, or because every comparison against `inf`/NaN is False.
+    # Neither is validation; both would stop protecting if a limit moved.
+    quantity: float = Field(gt=0, lt=_MAX_PREMIUM)  # number of lots
     # Current market price per unit for this leg — no live options feed
     # exists in this environment (see docs/ARCHITECTURE.md), so this
     # mirrors POST /orders's `entry` field: MockBroker is fed this price
     # directly; a real broker ignores it and prices its own fill.
-    premium: float
+    premium: float = Field(gt=0, lt=_MAX_PREMIUM)
 
 
 class ExecuteOptionsStrategyRequest(BaseModel):

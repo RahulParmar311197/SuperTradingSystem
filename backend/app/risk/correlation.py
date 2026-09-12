@@ -27,6 +27,38 @@ def close_returns(candles: list[Candle]) -> list[float]:
     return _returns([c.close for c in candles])
 
 
+def _paired_returns(
+    closes_a: dict[datetime, float], closes_b: dict[datetime, float], shared: list[datetime]
+) -> tuple[list[float], list[float]]:
+    """Close-to-close returns for two instruments over the bars they share,
+    emitted strictly in pairs.
+
+    `_returns` drops a return whose previous close is zero, which is right
+    for a single series and wrong for two: a zero close in one instrument
+    and not the other leaves the two lists different lengths, and
+    `pearson_correlation`'s tail truncation then pairs one instrument's
+    bars against the other's *neighbouring* bars. That is precisely the
+    positional misalignment `build_correlation_matrix` intersects
+    timestamps to prevent, reintroduced one step later.
+
+    A zero close is not hypothetical: nothing in `upsert_candles`
+    validates it, and an option contract that expires worthless prints
+    exactly that. Dropping the bar from *both* series keeps every
+    surviving pair a genuine same-interval observation, and the lengths
+    equal by construction rather than by luck.
+    """
+    returns_a: list[float] = []
+    returns_b: list[float] = []
+    for i in range(1, len(shared)):
+        previous_a = closes_a[shared[i - 1]]
+        previous_b = closes_b[shared[i - 1]]
+        if previous_a == 0 or previous_b == 0:
+            continue
+        returns_a.append((closes_a[shared[i]] - previous_a) / previous_a)
+        returns_b.append((closes_b[shared[i]] - previous_b) / previous_b)
+    return returns_a, returns_b
+
+
 def closes_by_timestamp(candles: list[Candle]) -> dict[datetime, float]:
     """Closes keyed by candle timestamp, so two instruments' series can be
     aligned on the bars they actually share before being correlated."""
@@ -81,9 +113,8 @@ def build_correlation_matrix(closes_by_symbol: dict[str, dict[datetime, float]])
             shared = sorted(set(closes_a) & set(closes_b))
             if len(shared) < 3:  # need >= 3 closes to get >= 2 returns
                 continue
-            corr = pearson_correlation(
-                _returns([closes_a[t] for t in shared]), _returns([closes_b[t] for t in shared])
-            )
+            returns_a, returns_b = _paired_returns(closes_a, closes_b, shared)
+            corr = pearson_correlation(returns_a, returns_b)
             if corr is not None:
                 matrix[frozenset((sym_a, sym_b))] = corr
     return matrix

@@ -130,3 +130,60 @@ def test_correlated_exposure_ignores_pairs_with_no_computed_correlation():
         threshold=0.7,
     )
     assert total == 1000.0
+
+
+def test_a_zero_close_in_one_series_does_not_desynchronise_the_pair():
+    """Behavioural proof. `_returns` drops a return whose previous close is
+    zero. That is right for one series and wrong for two: the two lists
+    come back different lengths, and `pearson_correlation`'s tail
+    truncation then pairs one instrument's bars against the other's
+    *neighbouring* bars -- reintroducing, one step later, exactly the
+    positional misalignment `build_correlation_matrix` intersects
+    timestamps to prevent.
+
+    Both symbols here follow the *identical* path at the *identical*
+    timestamps. The only difference is a single zero close in CORRUPT, near
+    the end. With the pairing bug the matrix reported **-0.5224** for two
+    instruments that move together; paired returns report **+0.5224**. The
+    magnitude is unchanged and the sign is inverted -- the signature of a
+    one-bar shift on an alternating series.
+
+    A zero close is not hypothetical: nothing in `upsert_candles` validates
+    it, and an options contract that expires worthless prints exactly that.
+
+    Note what is *not* claimed: at the default `correlation_threshold` of
+    0.7 neither value trips the gate, so this fixture does not demonstrate
+    a changed risk verdict. What it demonstrates is a meaningless number
+    where the module's whole purpose is a meaningful one -- whether that
+    number crosses a given threshold depends on the data.
+    """
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    path = [100.0 + (i % 2) * 6 for i in range(60)]
+    stamps = [start + timedelta(minutes=i) for i in range(60)]
+
+    clean = {t: p for t, p in zip(stamps, path)}
+    corrupt = dict(clean)
+    corrupt[stamps[58]] = 0.0
+
+    matrix = build_correlation_matrix({"CLEAN": clean, "CORRUPT": corrupt})
+    corr = matrix[frozenset(("CLEAN", "CORRUPT"))]
+
+    assert corr > 0, (
+        f"two instruments on an identical path were reported as anti-correlated "
+        f"({corr:.4f}); the zero close desynchronised the two return series"
+    )
+    assert corr == pytest.approx(0.5224, abs=1e-3)
+
+
+def test_a_clean_pair_is_unaffected_by_the_pairing_change():
+    """Control. The pairing must only drop bars a zero close makes
+    uncomputable -- on data with no zero close it must change nothing, and
+    two identical series must still correlate at exactly 1.0.
+    """
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    path = [100.0 + (i % 2) * 6 for i in range(60)]
+    stamps = [start + timedelta(minutes=i) for i in range(60)]
+    series = {t: p for t, p in zip(stamps, path)}
+
+    matrix = build_correlation_matrix({"A": series, "B": dict(series)})
+    assert matrix[frozenset(("A", "B"))] == pytest.approx(1.0)

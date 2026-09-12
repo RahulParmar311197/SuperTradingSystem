@@ -2,7 +2,7 @@ import uuid
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 
 from app.database.models.risk import AuditLog
 from app.database.models.strategy import Strategy as StrategyRow
@@ -178,3 +178,50 @@ async def test_creating_or_updating_a_strategy_rejects_an_unresolvable_entry_typ
             assert r.status_code == 422, r.text
         finally:
             await _cleanup([user_id], [uuid.UUID(strategy_id)] if strategy_id else [])
+
+
+async def test_library_endpoints_list_and_install_shipped_strategies(require_infra):
+    # The library is only useful if a user can actually get one. Declared
+    # before `/{strategy_id}`, so GET /strategies/library must resolve to
+    # the literal route rather than being parsed as a UUID.
+    with TestClient(app) as client:
+        email = f"lib-{uuid.uuid4().hex[:8]}@example.com"
+        r = client.post("/auth/register", json={"email": email, "password": "testpass123", "name": "Lib"})
+        assert r.status_code == 201, r.text
+        user_id = uuid.UUID(r.json()["id"])
+        token = client.post("/auth/login", json={"email": email, "password": "testpass123"}).json()["access_token"]
+        headers = {"Authorization": f"Bearer {token}"}
+        try:
+            r = client.get("/strategies/library", headers=headers)
+            assert r.status_code == 200, r.text
+            entries = r.json()
+            assert len(entries) >= 5
+            keys = {e["key"] for e in entries}
+            assert "bullish_liquidity_sweep" in keys
+
+            r = client.post("/strategies/library/bullish_liquidity_sweep", headers=headers)
+            assert r.status_code == 201, r.text
+            installed = r.json()
+            assert installed["name"] == "Bullish Liquidity Sweep"
+
+            # It is a copy the user owns, and it shows up as theirs.
+            r = client.get("/strategies", headers=headers)
+            assert r.status_code == 200, r.text
+            assert any(s["id"] == installed["id"] for s in r.json())
+
+            r = client.post("/strategies/library/no_such_strategy", headers=headers)
+            assert r.status_code == 404, r.text
+        finally:
+            async with async_session_factory() as db:
+                from app.database.models.strategy import Strategy as SRow
+                from app.database.models.strategy import StrategyVersion as SVRow
+                from app.database.models.users import UserSession
+
+                ids = (await db.execute(select(SRow.id).where(SRow.user_id == user_id))).scalars().all()
+                for sid in ids:
+                    await db.execute(delete(SVRow).where(SVRow.strategy_id == sid))
+                await db.execute(delete(SRow).where(SRow.user_id == user_id))
+                await db.execute(delete(AuditLog).where(AuditLog.user_id == user_id))
+                await db.execute(delete(UserSession).where(UserSession.user_id == user_id))
+                await db.execute(delete(User).where(User.id == user_id))
+                await db.commit()

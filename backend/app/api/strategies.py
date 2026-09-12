@@ -13,6 +13,7 @@ from app.database.models.strategy import StrategyVersion as StrategyVersionRow
 from app.database.models.users import TradingPermission, User
 from app.database.session import get_db
 from app.strategy.dsl import StrategyDefinition
+from app.strategy.library import load, load_all
 
 router = APIRouter(prefix="/strategies", tags=["strategies"])
 
@@ -43,6 +44,60 @@ async def _snapshot_version(db: AsyncSession, row: StrategyRow) -> None:
     Called once, at the moment that version comes into existence — never
     to correct or replace an existing snapshot."""
     db.add(StrategyVersionRow(strategy_id=row.id, version=row.version, name=row.name, definition=row.definition))
+
+
+class LibraryEntryResponse(BaseModel):
+    key: str
+    name: str
+    direction: str | None
+    timeframe: str
+    definition: dict
+
+
+@router.get("/library", response_model=list[LibraryEntryResponse])
+async def list_library_strategies(user: User = Depends(get_current_user)) -> list[LibraryEntryResponse]:
+    """The strategies shipped with the platform (blueprint §34).
+
+    Declared before `/{strategy_id}` so the literal path wins: FastAPI
+    matches in definition order, and a UUID path parameter would otherwise
+    swallow "library" and answer 422.
+    """
+    return [
+        LibraryEntryResponse(
+            key=key,
+            name=strategy.name,
+            direction=strategy.direction,
+            timeframe=strategy.timeframe,
+            definition=strategy.model_dump(mode="json"),
+        )
+        for key, strategy in sorted(load_all().items())
+    ]
+
+
+@router.post("/library/{key}", response_model=StrategyResponse, status_code=status.HTTP_201_CREATED)
+async def install_library_strategy(
+    key: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
+) -> StrategyRow:
+    """Copies a library strategy into the caller's own strategies.
+
+    A copy, not a reference: the user owns it from here, can edit it, and
+    its versions are snapshotted like any other. Later changes to the
+    shipped library never silently alter a strategy someone is trading.
+    """
+    try:
+        strategy = load(key)
+    except KeyError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+
+    row = StrategyRow(
+        user_id=user.id, name=strategy.name, version=1, definition=strategy.model_dump(mode="json")
+    )
+    db.add(row)
+    await db.flush()
+    await _snapshot_version(db, row)
+    await db.commit()
+    await db.refresh(row)
+    return row
 
 
 @router.post("", response_model=StrategyResponse, status_code=status.HTTP_201_CREATED)

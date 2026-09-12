@@ -34,7 +34,13 @@ def test_bos_condition_expires_after_its_lookback_window():
     bos = next(e for e in smc.structure_events if e.event_type.value == "BOS")
     assert bos.index == 7  # pinned by tests/smc/test_structure.py
 
-    condition = Condition(type=ConditionType.BOS, direction="bullish")  # lookback defaults to 5
+    # Explicit, so this tests the expiry *mechanism* rather than whatever
+    # the default happens to be. `Condition.lookback` now defaults per
+    # condition type (30 for a structure event like BOS, since an MSS
+    # cannot form within a few bars of the sweep that caused it -- see
+    # `_DEFAULT_LOOKBACK_BY_TYPE` in app/strategy/dsl.py), and pinning the
+    # old flat 5 here would just re-test that table.
+    condition = Condition(type=ConditionType.BOS, direction="bullish", lookback=5)
 
     # Evaluated shortly after the break fired -- still within the window.
     fresh = _context(candles, smc, current_index=bos.index + 4)
@@ -52,7 +58,7 @@ def test_liquidity_sweep_condition_expires_after_its_lookback_window():
     pool = next(p for p in smc.liquidity_pools if p.swept)
     assert pool.swept_index is not None
 
-    condition = Condition(type=ConditionType.LIQUIDITY_SWEEP, side="buy")  # lookback defaults to 5
+    condition = Condition(type=ConditionType.LIQUIDITY_SWEEP, side="buy", lookback=5)
 
     fresh = _context(candles, smc, current_index=pool.swept_index + 4)
     assert evaluate_condition(condition, fresh) is True

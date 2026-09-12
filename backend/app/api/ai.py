@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -334,7 +334,12 @@ async def chat(
 
 @router.get("/chat/history", response_model=list[ChatMessageResponse])
 async def chat_history(
-    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db), limit: int = 50
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    # Bounded at both ends: a negative limit reached Postgres as
+    # `LIMIT -1` and came back a 500, and an unbounded one let a
+    # client ask for the whole table.
+    limit: int = Query(default=50, ge=1, le=500),
 ) -> list[AIMessage]:
     stmt = select(AIMessage).where(AIMessage.user_id == user.id).order_by(AIMessage.created_at).limit(limit)
     return (await db.execute(stmt)).scalars().all()

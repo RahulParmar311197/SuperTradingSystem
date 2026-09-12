@@ -206,7 +206,7 @@ class SetupResponse(BaseModel):
 async def list_setups(
     instrument_id: uuid.UUID,
     timeframe: str,
-    limit: int = 50,
+    limit: int = Query(default=50, ge=1, le=500),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> list[Setup]:

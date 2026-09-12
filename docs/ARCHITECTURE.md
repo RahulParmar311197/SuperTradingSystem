@@ -6377,6 +6377,41 @@ run against one given no gaps recovers whether the lookup found an adjacent
 gap. That version does catch the injected off-by-one, as does the
 equal-levels test when the bisect window is deliberately mis-set.
 
+## `?limit=-1` was a 500 (§116)
+
+`limit` was declared `int` on every listing endpoint, with an upper cap on
+some and none at all on others — but with **no lower bound anywhere**. A
+negative value went straight into `.limit(...)`, which Postgres rejects:
+
+```
+GET /notifications?limit=-1     -> HTTP 500  (asyncpg InvalidRowCountInLimitClauseError)
+GET /ai/chat/history?limit=-1   -> HTTP 500  (same)
+GET /ai/chat/history?limit=1000000000 -> HTTP 200
+```
+
+A server error for what is purely a bad request. This is the same shape as
+the AI-proposal validator (§ above): input whose shape the code does not
+admit, reaching a layer that raises on it. Two endpoints — `GET
+/ai/chat/history` and `GET /setups` — additionally had no upper bound, so
+one request could ask for an entire table.
+
+All eight numeric query parameters now carry `ge=1`, and the two uncapped
+ones carry `le=500`. FastAPI rejects out-of-range values with a `422`
+naming the parameter, before any query is built.
+
+Two things worth stating rather than leaving implicit:
+
+- **`ge=1` also changes `?limit=0`** from `200` with `[]` to `422`. `ge=0`
+  would have fixed the 500 on its own. "Return me at most zero rows" is a
+  client error rather than a request worth serving, so the stricter bound
+  is deliberate — but it is a behaviour change, not a pure bug fix.
+- **The traceback in that 500 body is not a code defect.**
+  `app/core/config.py` has `debug: bool = True` by default and
+  `main.py`'s handler returns `str(exc)` when debug is on, so a deployment
+  that leaves `DEBUG` true serves tracebacks and echoes every SQL
+  statement. That is a deployment-configuration concern, separate from
+  this fix and not addressed by it.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

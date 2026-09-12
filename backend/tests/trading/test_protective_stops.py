@@ -16,7 +16,7 @@ import uuid
 
 import pytest
 
-from app.brokers.base import OrderRequest
+from app.brokers.base import OrderRequest, OrderResult
 from app.brokers.mock import MockBroker
 from app.database.models.strategy import Direction
 from app.database.models.trading import OrderStatus, OrderType
@@ -151,7 +151,7 @@ async def test_cancelling_a_resting_stop_stops_it_firing():
 async def test_cancelling_an_already_filled_stop_does_not_unfill_it():
     broker = MockBroker()
     position = await _long_position(broker)
-    order_id = await ensure_protective_stop(broker, position)
+    order_id = (await ensure_protective_stop(broker, position)).order_id
     broker.set_quote("ACME", ltp=80.0)
 
     result = await broker.cancel_order(order_id)
@@ -166,10 +166,10 @@ async def test_cancelling_an_already_filled_stop_does_not_unfill_it():
 async def test_the_protective_order_is_replaced_when_the_position_grows():
     broker = MockBroker()
     position = await _long_position(broker)
-    first = await ensure_protective_stop(broker, position)
+    first = (await ensure_protective_stop(broker, position)).order_id
 
     position.quantity = 25.0
-    second = await ensure_protective_stop(broker, position)
+    second = (await ensure_protective_stop(broker, position)).order_id
 
     assert second is not None and second != first
     live = [o for o in await broker.get_orders() if o.order_type == OrderType.SL_M and o.status == OrderStatus.ACKNOWLEDGED]
@@ -195,7 +195,9 @@ async def test_closing_the_position_leaves_no_stop_resting():
         )
     )
     position.quantity = 0.0
-    assert await ensure_protective_stop(broker, position) is None
+    result = await ensure_protective_stop(broker, position)
+    # No stop was wanted -- which must not read as "a stop was refused".
+    assert result.order_id is None and not result.is_unprotected
     assert position.protective_order_id is None
 
     # Price runs through where the stop used to be. Nothing may open.
@@ -212,5 +214,65 @@ async def test_a_position_with_no_stop_gets_no_protective_order():
     position = await _long_position(broker)
     position.stop = None
 
-    assert await ensure_protective_stop(broker, position) is None
+    result = await ensure_protective_stop(broker, position)
+    assert result.order_id is None and not result.is_unprotected
     assert [o for o in await broker.get_orders() if o.order_type == OrderType.SL_M] == []
+
+
+# --- reporting a stop the broker would not take ----------------------------
+#
+# `ensure_protective_stop` used to return `str | None`, spelling "no stop
+# was wanted" and "a stop was wanted and refused" the same way -- and its
+# only caller discarded the value, so a refused stop was an ERROR in a log
+# and nothing else.
+
+
+class _NoStopOrdersBroker(MockBroker):
+    """A broker that will not take stop orders. Routine in real life: a
+    trigger too close to the last price, a freeze quantity, or stop orders
+    simply not accepted for this segment right now."""
+
+    def __init__(self, outcome: OrderStatus = OrderStatus.REJECTED) -> None:
+        super().__init__()
+        self._outcome = outcome
+
+    async def place_order(self, request):
+        if request.order_type in (OrderType.SL, OrderType.SL_M):
+            return OrderResult(broker_order_id="", status=self._outcome, rejection_reason="Stop orders not accepted")
+        return await super().place_order(request)
+
+
+async def test_a_refused_stop_is_reported_as_unprotected_not_as_no_stop_wanted():
+    broker = _NoStopOrdersBroker()
+    position = await _long_position(broker)
+
+    result = await ensure_protective_stop(broker, position)
+
+    assert result.is_unprotected
+    assert result.order_id is None
+    assert not result.fate_unknown
+    assert "Stop orders not accepted" in result.problem
+    assert position.protective_order_id is None
+
+
+async def test_an_unanswered_stop_is_flagged_fate_unknown():
+    # A broker that never answered may or may not have a stop resting.
+    # That is not the same as knowing there is none, and a caller must be
+    # able to tell the two apart.
+    broker = _NoStopOrdersBroker(OrderStatus.FAILED)
+    position = await _long_position(broker)
+
+    result = await ensure_protective_stop(broker, position)
+
+    assert result.is_unprotected
+    assert result.fate_unknown
+
+
+async def test_a_placed_stop_reports_no_problem():
+    broker = MockBroker()
+    position = await _long_position(broker)
+
+    result = await ensure_protective_stop(broker, position)
+
+    assert not result.is_unprotected
+    assert result.order_id == position.protective_order_id

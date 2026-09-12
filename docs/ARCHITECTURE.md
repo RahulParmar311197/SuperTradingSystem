@@ -6143,6 +6143,62 @@ exists. It says nothing about *whether the strategy was a good idea* —
 only whether the thing the risk engine approved is the thing the account
 is holding.
 
+## A protective stop the broker refuses (§57, §60, §73-75)
+
+Resting the stop at the broker (above) only helps if the broker takes the
+order. `ensure_protective_stop` returned `str | None` and its single
+caller, in `POST /orders`, discarded the value entirely — so a broker that
+refused the stop produced an `ERROR` in a log file and nothing else:
+
+```
+HTTP 201  status MONITORING
+position qty=100.0  stop=95.0  protective_order_id=None
+resting stop orders at the broker: 0
+Account halted? None
+notifications: ['TRADE_EXECUTED']
+```
+
+The order genuinely filled. The position genuinely exists. It carries the
+stop price it was *sized from* — `calculate_position_size` divides the
+risk budget by the entry-to-stop distance, so the approved risk is
+explicitly conditional on that stop — and nothing at the broker will ever
+act on it. The only thing the account holder was told is "position
+opened". Brokers refuse stop orders routinely: a trigger too close to the
+last traded price, a freeze quantity, stop orders not accepted for a
+segment at that moment.
+
+The `str | None` return is what hid it. `None` spelled two different
+things — "no stop was wanted here" (the position closed, or carries no
+stop price) and "a stop was wanted and the broker refused it" — so there
+was nothing for a caller to check even if it had looked.
+`ProtectiveStopResult` now separates them, and keeps a third case apart
+too: a stop order that came back `FAILED` means the broker never
+answered, so a stop may or may not be resting. That is not the same as
+knowing there isn't one, and `fate_unknown` carries the difference into
+the notification and the audit row — a reconciliation that assumed "bare"
+could place a second stop on top of a live one.
+
+When a fill leaves a position wanting a stop it does not verifiably have,
+`POST /orders` now halts the account (`halt_account`), writes an
+`order.protective_stop_unplaced` audit row, fires a
+`RECONCILIATION_REQUIRED` notification, and returns the reason in the
+response as `unprotected_reason`.
+
+**The position is deliberately not closed automatically.** That is a
+judgement call, and the opposite one from the half-executed options spread
+above, so it is worth being explicit about why. There, the combination the
+risk engine approved never existed and the naked leg's real risk was ~193×
+what was approved; unwinding restored the state the approval was
+conditioned on. Here the position is exactly the one the caller asked for
+— only its protection is missing, often for a transient reason — and
+liquidating it at market on a broker quirk is a decision that belongs to
+whoever owns the account. The halt exempts reducing orders, so closing it
+by hand stays available while nothing new can be opened on top.
+
+What this does **not** do: retry the stop, place a fallback order type, or
+watch the position afterwards. An account in this state needs a human,
+which is what the halt and the notification are for.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

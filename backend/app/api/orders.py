@@ -12,7 +12,7 @@ from app.brokers.base import BrokerError
 from app.brokers.mock import MockBroker
 from app.core.audit import record_audit
 from app.core.metrics import ORDER_COUNT, RISK_REJECTION_COUNT
-from app.core.redis import account_halt_reason, channel_name, get_latest_price, get_price_age_seconds, get_price_jump_pct, publish
+from app.core.redis import account_halt_reason, channel_name, get_latest_price, get_price_age_seconds, get_price_jump_pct, halt_account, publish
 from app.database.models.instruments import Instrument
 from app.database.models.notifications import NotificationType
 from app.database.models.risk import RiskDecision as RiskEventDecision
@@ -231,6 +231,12 @@ class OrderResponse(BaseModel):
     quantity: float
     broker_order_id: str | None
     rejection_reason: str | None
+    # Why the resulting position has no live stop at the broker, when it
+    # wanted one. `None` on every order that did not open or change a
+    # position, and on every one whose stop is resting -- so a client can
+    # treat "present" as "this filled but is not protected". The order
+    # itself still succeeded; that is exactly why this needs saying.
+    unprotected_reason: str | None = None
 
 
 async def _publish_order_event(user: User, order) -> None:
@@ -492,6 +498,9 @@ async def place_order(
         db, final_order, user.id, instrument.id, execution_mode=execution_mode, broker_account_id=stack.broker_account_id
     )
 
+    # Set only when this fill left a position wanting a stop it does not
+    # verifiably have -- see the `is_unprotected` branch below.
+    unprotected_reason: str | None = None
     position_after = stack.position_manager.get(str(user.id), payload.symbol)
     if position_after is not None:
         # A genuine fill actually happened on this call -- as opposed to
@@ -527,7 +536,51 @@ async def place_order(
             # broker becomes a fresh naked position in the opposite
             # direction the moment it fires. See
             # app/trading/protective_stops.py.
-            await ensure_protective_stop(stack.broker, position_after)
+            stop_result = await ensure_protective_stop(stack.broker, position_after)
+            if stop_result.is_unprotected:
+                # A broker that refuses the stop order (a trigger too
+                # close to the last price, a freeze quantity, stop orders
+                # not accepted for this segment right now) leaves a live
+                # position with no stop at all. This used to be an ERROR
+                # in a log file and nothing more: the caller discarded
+                # this value, so the order answered 201/MONITORING and
+                # the only notification said "position opened".
+                #
+                # The position is not closed automatically. It is the one
+                # the caller deliberately asked for, and auto-liquidating
+                # it at market over a broker quirk -- often a transient
+                # one -- is a decision for whoever owns the account. What
+                # changes is that they are told, on the channel the
+                # blueprint designates for it, and that nothing further
+                # can be opened until someone has looked: the halt
+                # exempts reducing orders, so closing this position by
+                # hand stays available.
+                unprotected_reason = stop_result.problem
+                await halt_account(str(user.id), f"{payload.symbol} position has no stop at the broker")
+                await create_notification(
+                    db,
+                    user_id=user.id,
+                    notification_type=NotificationType.RECONCILIATION_REQUIRED,
+                    title=f"{payload.symbol} position has no stop-loss",
+                    body=stop_result.problem or "",
+                    data={
+                        "symbol": payload.symbol,
+                        "stop": payload.stop,
+                        "fate_unknown": stop_result.fate_unknown,
+                    },
+                )
+                await record_audit(
+                    db,
+                    actor="system",
+                    action="order.protective_stop_unplaced",
+                    user_id=user.id,
+                    details={
+                        "symbol": payload.symbol,
+                        "stop": payload.stop,
+                        "reason": stop_result.problem,
+                        "fate_unknown": stop_result.fate_unknown,
+                    },
+                )
         position_row = await persist_position(
             db, user.id, instrument.id, position_after, execution_mode=execution_mode, source_key="manual"
         )
@@ -618,7 +671,9 @@ async def place_order(
     )
     await _publish_order_event(user, final_order)
     await _publish_position_snapshot(user, stack)
-    return _to_response(final_order)
+    response = _to_response(final_order)
+    response.unprotected_reason = unprotected_reason
+    return response
 
 
 @router.get("/orders", response_model=list[OrderResponse])

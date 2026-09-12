@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -24,6 +24,10 @@ from app.strategy.dsl import StrategyDefinition
 
 router = APIRouter(prefix="/backtest", tags=["backtest"])
 
+# See app/api/paper.py: the same ceiling every money field in the API
+# carries, bounded by what `Numeric(18, 6)` can hold.
+_MAX_MONEY = 1e12
+
 
 class RunBacktestRequest(BaseModel):
     strategy_id: uuid.UUID
@@ -31,7 +35,7 @@ class RunBacktestRequest(BaseModel):
     timeframe: str
     start_date: datetime
     end_date: datetime
-    starting_capital: float = 100_000.0
+    starting_capital: float = Field(default=100_000.0, gt=0, lt=_MAX_MONEY)
     cost_model: dict = {}
 
 
@@ -138,7 +142,7 @@ class ValidateBacktestRequest(BaseModel):
     timeframe: str
     start_date: datetime
     end_date: datetime
-    starting_capital: float = 100_000.0
+    starting_capital: float = Field(default=100_000.0, gt=0, lt=_MAX_MONEY)
     cost_model: dict = {}
     train_pct: float = 0.6
     validation_pct: float = 0.2

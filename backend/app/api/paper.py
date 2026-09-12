@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.orders import _get_instrument_by_symbol
@@ -59,10 +59,18 @@ def _get_owned_session(session_id: uuid.UUID, user: User) -> _PaperSession:
     return session
 
 
+# Same ceiling `ReplayEngine`'s `starting_balance` already carries, and the
+# same one `app/api/orders.py` and `app/api/options.py` apply to money
+# fields: `Numeric(18, 6)` holds at most 999999999999.999999, and every
+# number derived from an account balance here -- position quantity,
+# notional, mark-to-market P&L -- ends up in a column of that type.
+_MAX_MONEY = 1e12
+
+
 class CreatePaperSessionRequest(BaseModel):
     strategy_id: uuid.UUID
     symbol: str
-    starting_balance: float = 100_000.0
+    starting_balance: float = Field(default=100_000.0, gt=0, lt=_MAX_MONEY)
 
 
 class PaperStateResponse(BaseModel):
@@ -125,12 +133,20 @@ async def get_paper_session(session_id: uuid.UUID, user: User = Depends(get_curr
 
 
 class FeedCandleRequest(BaseModel):
+    """A manual session's candles come from the client, by design -- this
+    endpoint *is* the user driving a simulation. What the bounds below add
+    is not a price opinion but the requirement that the numbers be prices
+    at all: `gt=0` rejects NaN and negative prices (every comparison
+    against NaN is False, so a NaN bound check fails and the value is
+    refused), `lt=_MAX_MONEY` rejects +inf and magnitudes no
+    `Numeric(18, 6)` column downstream can hold."""
+
     timestamp: datetime
-    open: float
-    high: float
-    low: float
-    close: float
-    volume: float = 0.0
+    open: float = Field(gt=0, lt=_MAX_MONEY)
+    high: float = Field(gt=0, lt=_MAX_MONEY)
+    low: float = Field(gt=0, lt=_MAX_MONEY)
+    close: float = Field(gt=0, lt=_MAX_MONEY)
+    volume: float = Field(default=0.0, ge=0, lt=_MAX_MONEY)
 
 
 @router.post("/{session_id}/candle", response_model=PaperStateResponse)

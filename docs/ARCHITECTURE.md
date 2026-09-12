@@ -6978,6 +6978,71 @@ stating rather than leaving to be discovered:
   resubmitted more than a day after the original still creates a second
   order.
 
+## A restart no longer strands a paper session's mirrored position
+
+`POST /paper/{id}/candle` mirrors the paper engine's position into the
+`positions` table on every candle under `source_key=f"paper:{session_id}"`,
+and `DELETE /paper/{id}` retires that row when the session is discarded.
+Both of those go through `_SESSIONS`, a module-level dict in
+`app/api/paper.py` with no persistence and no eviction — so a process
+restart dropped every live session while their rows stayed in Postgres, and
+`DELETE` answered 404 for exactly the sessions whose rows still needed
+retiring.
+
+Nothing else could reach those rows. `app/trading/persistence.py` is the
+only writer of `Position.is_open` anywhere in `app/`, and reaching it under
+a `paper:*` key needed a live engine; a new session gets a new UUID and
+therefore a new key. The rows stayed `is_open=True` permanently, and
+`app/risk/portfolio.py::compute_portfolio_exposure` sums exactly those
+rows. Measured on the real endpoints: one session with one open position,
+`GET /portfolio.total_exposure` 15606.06 before a restart, `GET /paper/{id}`
+404, `DELETE /paper/{id}` 404, and 15606.06 after — for an account holding
+nothing, with no route left that could ever change it. `portfolio_snapshots`
+journals the same number.
+
+**This is a reporting fault, not a control failure.** The risk gates on
+`POST /orders` and `POST /options/execute` take `current_exposure` from the
+in-memory `PositionManager`, never from this table, so an inflated
+`total_exposure` was a wrong number shown to the user and stored in the
+snapshot journal — it never blocked or admitted a trade that should have
+gone the other way.
+
+The fix is that `DELETE /paper/{session_id}` no longer requires the session
+to be in memory. Ownership is checked against whichever of the two
+representations survives: `engine.account_id` when the session is still
+there, exactly as before and as every other `/paper/*` route does, and the
+durable rows when it is not — `abandon_position_mirrors` matches on
+`user_id` *and* `source_key`, so another user's DELETE retires nothing and
+receives the same 404 as a session id that never existed. That helper lost
+its `instrument_id` argument in the process (the caller no longer has an
+engine to name the instrument) and gained a warning in its docstring: it
+now retires every open row under the key it is given, which is safe for a
+session-scoped key like `paper:{uuid}` and would retire a whole book if
+handed a shared one like `manual` or `auto`.
+
+**The fix is deliberately partial.** The caller needs the session id. The
+UI holds it, but a user who has lost it has no route to their own orphaned
+rows. The complete fix would be a startup sweep of every open `paper:*`
+row — correct on a single replica, where at process start those rows are
+orphaned by construction, and destructive on two, where one replica's
+orphans are indistinguishable from another replica's live sessions. The
+same asymmetry is why the repair path is the one that shipped: it is
+addressed at a single session the caller names, so it cannot mistake a
+peer's live session for a corpse. On a multi-replica deployment it would
+still retire a row belonging to a session live on another replica, which is
+what the owner asked for; that replica's engine would keep running and
+re-write the row on its next candle.
+
+Three tests cover this in
+`backend/tests/api/test_paper_session_cleanup.py`, all of them clearing
+`_SESSIONS` to model the restart exactly: the behavioural proof that the
+row is retired and exposure returns to 0, a control that another user's
+DELETE on the stranded session retires nothing and 404s, and a control that
+an invented UUID is still a 404 rather than a blanket 204. Both controls
+were measured against injected faults rather than assumed — removing the
+`user_id` clause from the lookup fails the first, removing the fallback 404
+fails both.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

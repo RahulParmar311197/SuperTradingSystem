@@ -107,17 +107,16 @@ async def persist_order(
     return row
 
 
-async def abandon_position_mirror(
+async def abandon_position_mirrors(
     db: AsyncSession,
     user_id: uuid.UUID,
-    instrument_id: uuid.UUID,
     execution_mode: ExecutionMode,
     *,
     source_key: str,
-) -> bool:
-    """Marks this source's open `positions` mirror not-open because the
-    engine behind it is gone, not because the position was exited. Returns
-    whether a row was actually found.
+) -> int:
+    """Marks this source's open `positions` mirrors not-open because the
+    engine behind them is gone, not because anything was exited. Returns
+    how many rows were retired.
 
     `persist_position` cannot express this: it derives `is_open` from a
     `PositionRecord`, whose `is_open` is the property `quantity != 0`, so
@@ -126,31 +125,42 @@ async def abandon_position_mirror(
     Deliberately journals no `Trade`. Nothing was sold at any price -- the
     simulation was discarded -- and `GET /portfolio.total_realized_pnl`
     sums the `trades` journal, so inventing an exit here would put a
-    fabricated P&L into the account's realized total. Leaving the row's
-    quantity and prices intact keeps the record of what the abandoned
+    fabricated P&L into the account's realized total. Leaving the rows'
+    quantities and prices intact keeps the record of what the abandoned
     session held; only its contribution to open exposure goes away.
 
-    The lookup is keyed exactly as `persist_position`'s is, so it can only
-    ever retire the row this source itself wrote.
+    The lookup is keyed by `source_key` rather than by instrument, so the
+    caller does not need a live engine to name the instrument -- which is
+    the whole point: after a restart the engine is gone and the row it
+    wrote is the only remaining trace of it. **This means the key must
+    identify one abandonable engine.** `paper:{session_id}` does: a paper
+    session holds one symbol and a new session gets a new UUID. A shared
+    key like `manual` or `auto` does not, and passing one here would retire
+    a whole book.
+
+    `user_id` is part of the lookup, so this can only ever touch rows the
+    calling user's own engines wrote.
     """
-    row = (
-        await db.execute(
-            select(PositionRow).where(
-                PositionRow.user_id == user_id,
-                PositionRow.instrument_id == instrument_id,
-                PositionRow.execution_mode == execution_mode,
-                PositionRow.source_key == source_key,
-                PositionRow.is_open.is_(True),
+    rows = (
+        (
+            await db.execute(
+                select(PositionRow).where(
+                    PositionRow.user_id == user_id,
+                    PositionRow.execution_mode == execution_mode,
+                    PositionRow.source_key == source_key,
+                    PositionRow.is_open.is_(True),
+                )
             )
         )
-    ).scalar_one_or_none()
-    if row is None:
-        return False
-
-    row.is_open = False
-    row.unrealized_pnl = 0.0
-    await db.commit()
-    return True
+        .scalars()
+        .all()
+    )
+    for row in rows:
+        row.is_open = False
+        row.unrealized_pnl = 0.0
+    if rows:
+        await db.commit()
+    return len(rows)
 
 
 async def persist_position(

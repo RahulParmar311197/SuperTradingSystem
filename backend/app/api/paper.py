@@ -22,7 +22,7 @@ from app.notifications.service import create_notification
 from app.paper.engine import PaperTradingEngine
 from app.smc.types import Candle
 from app.strategy.dsl import StrategyDefinition
-from app.trading.persistence import abandon_position_mirror, persist_position
+from app.trading.persistence import abandon_position_mirrors, persist_position
 
 router = APIRouter(prefix="/paper", tags=["paper"])
 
@@ -341,16 +341,38 @@ async def close_paper_session(
 
     No `Trade` is journaled: the position was not exited at any price, the
     simulation was abandoned, and `total_realized_pnl` sums the `trades`
-    table."""
-    session = _get_owned_session(session_id, user)
-    engine = session.engine
-    position = engine.position_manager.get(engine.account_id, engine.symbol)
-    if position is not None and position.is_open:
-        await abandon_position_mirror(
-            db,
-            user.id,
-            session.instrument_id,
-            ExecutionMode.PAPER,
-            source_key=f"paper:{session_id}",
-        )
-    del _SESSIONS[session_id]
+    table.
+
+    Deliberately does *not* require the session to still be in `_SESSIONS`.
+    `_SESSIONS` is process memory, so a restart drops every live session
+    while their mirrored rows survive in Postgres -- and before this, that
+    combination was terminal: `GET /paper/{id}` 404s, `DELETE /paper/{id}`
+    404ed too, and the rows counted toward `GET /portfolio.total_exposure`
+    forever with no route left that could address them. So ownership is
+    verified against whichever of the two survives. If the session is in
+    memory, `engine.account_id` decides, exactly as every other `/paper/*`
+    route does. If it is not, the `positions` rows do: `abandon_position_mirrors`
+    matches on `user_id` *and* `source_key`, so another user's DELETE
+    retires nothing and gets the same 404 as a session id that never
+    existed -- it cannot even confirm the session was real.
+
+    A caller therefore needs the session id to clean up after a restart. The
+    UI holds it; a user who has lost it has no route to these rows, which is
+    why this fix is a repair and not a sweep. A startup sweep of every
+    `paper:*` row would cover that case and is the wrong shape for a
+    multi-replica deployment -- at process start one replica's orphans are
+    indistinguishable from another replica's live sessions."""
+    session = _SESSIONS.get(session_id)
+    if session is not None and session.engine.account_id != str(user.id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Paper trading session not found")
+
+    retired = await abandon_position_mirrors(
+        db,
+        user.id,
+        ExecutionMode.PAPER,
+        source_key=f"paper:{session_id}",
+    )
+    if session is None and retired == 0:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Paper trading session not found")
+
+    _SESSIONS.pop(session_id, None)

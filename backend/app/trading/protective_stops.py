@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from dataclasses import dataclass
 
 from app.brokers.base import Broker, OrderRequest
 from app.database.models.strategy import Direction
@@ -26,6 +27,38 @@ from app.database.models.trading import OrderStatus, OrderType
 from app.trading.position_manager import PositionRecord
 
 logger = logging.getLogger("trading.protective_stops")
+
+
+@dataclass(slots=True)
+class ProtectiveStopResult:
+    """What happened when a position's broker-side stop was (re)placed.
+
+    The distinction between the last two fields is the whole reason this
+    type exists. `ensure_protective_stop` used to return `str | None`,
+    which spelled "no stop was wanted here" and "a stop was wanted and the
+    broker refused it" identically -- and its one caller discarded the
+    value anyway, so a refused stop was an ERROR in a log file and nothing
+    else. The order came back `201` with `MONITORING`, the position kept
+    the stop price it had been *sized from*, and nothing at the broker
+    would ever act on it.
+    """
+
+    # The resting order now guarding the position, when there is one.
+    order_id: str | None = None
+    # Why the position has no live stop, in words fit to show a user.
+    # `None` means nothing is wrong: either the stop is resting, or none
+    # was wanted (the position is closed, or carries no stop price).
+    problem: str | None = None
+    # True only when the broker never answered. A stop may or may not be
+    # resting at the exchange, which is not the same as knowing there
+    # isn't one -- the caller must not act as though the position is
+    # definitely bare.
+    fate_unknown: bool = False
+
+    @property
+    def is_unprotected(self) -> bool:
+        """A stop was wanted and the position does not verifiably have one."""
+        return self.problem is not None
 
 
 async def cancel_protective_stop(broker: Broker, position: PositionRecord) -> None:
@@ -45,9 +78,9 @@ async def cancel_protective_stop(broker: Broker, position: PositionRecord) -> No
         logger.warning("Could not cancel protective stop %s for %s", order_id, position.symbol, exc_info=True)
 
 
-async def ensure_protective_stop(broker: Broker, position: PositionRecord) -> str | None:
+async def ensure_protective_stop(broker: Broker, position: PositionRecord) -> ProtectiveStopResult:
     """Make the broker's resting stop match `position`'s current stop and
-    size, and return the live protective order id (or `None`).
+    size, and report whether the position ends up protected.
 
     Called after every fill on a position, because all three of the things
     this order is derived from can change with one: the quantity (adding
@@ -64,7 +97,11 @@ async def ensure_protective_stop(broker: Broker, position: PositionRecord) -> st
     await cancel_protective_stop(broker, position)
 
     if not position.is_open or position.stop is None:
-        return None
+        # Nothing to guard, or nothing to guard it with. Note that the
+        # cancel above has already run: a position that no longer wants a
+        # stop must not leave one resting, which at a real broker becomes
+        # a fresh naked position the moment it fires.
+        return ProtectiveStopResult()
 
     # The stop closes the position, so it faces the other way.
     exit_direction = Direction.SHORT if position.is_long else Direction.LONG
@@ -82,14 +119,40 @@ async def ensure_protective_stop(broker: Broker, position: PositionRecord) -> st
             trigger_price=position.stop,
         )
     )
-    if result.status in (OrderStatus.REJECTED, OrderStatus.FAILED):
+    if result.status == OrderStatus.FAILED:
+        # The broker never answered. Unlike a rejection this does not mean
+        # there is no stop -- it means nobody knows. Reported as a problem
+        # (the position is not verifiably protected) but flagged so a
+        # caller never treats the position as definitely bare.
+        logger.error(
+            "Protective stop for %s at %s went unanswered: %s",
+            position.symbol,
+            position.stop,
+            result.rejection_reason,
+        )
+        return ProtectiveStopResult(
+            problem=(
+                f"The broker did not answer the protective stop for {position.symbol} at {position.stop} "
+                f"({result.rejection_reason or 'no reason given'}). Whether one is resting is unknown -- "
+                "reconcile against the broker."
+            ),
+            fate_unknown=True,
+        )
+
+    if result.status == OrderStatus.REJECTED:
         logger.error(
             "Broker rejected the protective stop for %s at %s: %s",
             position.symbol,
             position.stop,
             result.rejection_reason,
         )
-        return None
+        return ProtectiveStopResult(
+            problem=(
+                f"The broker rejected the protective stop for {position.symbol} at {position.stop} "
+                f"({result.rejection_reason or 'no reason given'}). This position has no stop-loss at the "
+                "broker; the stop price it was sized from will not be acted on."
+            )
+        )
 
     position.protective_order_id = result.broker_order_id
-    return result.broker_order_id
+    return ProtectiveStopResult(order_id=result.broker_order_id)

@@ -7,7 +7,9 @@ from fastapi.testclient import TestClient
 from sqlalchemy import delete, select
 
 from app.brokers.base import AccountInfo, Broker, BrokerError, BrokerOrder, BrokerPosition, OrderRequest, OrderResult, Quote
+from app.brokers.mock import MockBroker as _MockBrokerBase
 from app.core.encryption import encrypt_credentials
+from app.core.redis import account_halt_reason, resume_account
 from app.database.models.instruments import Instrument, MarketType, OptionType
 from app.database.models.notifications import Notification, NotificationType
 from app.database.models.risk import AuditLog, RiskEvent
@@ -1658,4 +1660,162 @@ async def test_closing_a_live_position_withdraws_its_protective_stop(require_inf
                 assert row.is_open is False
                 assert row.protective_order_id is None
         finally:
+            await _cleanup(user_id, instrument_id)
+
+
+# --- a stop the broker would not take (blueprint §57, §60, §73-75) ---------
+#
+# `ensure_protective_stop` returned `str | None` and its one caller
+# discarded the value, so a broker that refused the stop order produced an
+# ERROR in a log file and nothing else: 201, MONITORING, a "position
+# opened" notification, and a live position carrying the stop price it had
+# been *sized from* with nothing at the broker that would ever act on it.
+
+
+class _NoStopOrdersBroker(_MockBrokerBase):
+    """A broker that takes the entry but not the stop. Routine in real
+    life: a trigger too close to the last price, a freeze quantity, or
+    stop orders not accepted for this segment right now."""
+
+    def __init__(self, outcome: OrderStatus = OrderStatus.REJECTED) -> None:
+        super().__init__()
+        self._outcome = outcome
+
+    async def place_order(self, request):
+        if request.order_type.value in ("SL", "SL_M"):
+            return OrderResult(
+                broker_order_id="", status=self._outcome, rejection_reason="Stop orders not accepted right now"
+            )
+        return await super().place_order(request)
+
+
+async def _instrument_for_stop_test() -> tuple[uuid.UUID, str]:
+    async with async_session_factory() as db:
+        instrument = Instrument(
+            symbol=f"NOSTOP{uuid.uuid4().hex[:6].upper()}", exchange="NSE",
+            market=MarketType.EQUITY, instrument_type="EQ",
+        )
+        db.add(instrument)
+        await db.commit()
+        await db.refresh(instrument)
+        return instrument.id, instrument.symbol
+
+
+async def test_a_refused_protective_stop_halts_the_account_and_says_so(require_infra):
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+        instrument_id, symbol = await _instrument_for_stop_test()
+        stack = orders_api._UserTradingStack(_NoStopOrdersBroker())
+        orders_api._STACKS[user_id] = stack
+        try:
+            r = client.post(
+                "/orders",
+                json={"symbol": symbol, "direction": "LONG", "entry": 100.0, "stop": 95.0},
+                headers=headers,
+            )
+            # The entry itself really did fill -- that is exactly why the
+            # missing stop has to be said out loud rather than inferred
+            # from a success response.
+            assert r.status_code == 201, r.text
+            body = r.json()
+            assert body["status"] == "MONITORING"
+
+            # The behavioural assertions come first so a failure here
+            # reads as "the account was left unprotected and nobody was
+            # told", not as "a response field is missing".
+            position = stack.position_manager.get(str(user_id), symbol)
+            assert position.quantity == pytest.approx(100.0)
+            assert position.protective_order_id is None
+            assert [o for o in await stack.broker.get_orders() if o.order_type.value == "SL_M"] == []
+
+            # Nothing further may be opened until a human has looked.
+            assert await account_halt_reason(str(user_id)) is not None
+
+            assert body["unprotected_reason"] is not None
+            assert "no stop-loss at the broker" in body["unprotected_reason"]
+
+            async with async_session_factory() as db:
+                notifications = (
+                    await db.execute(
+                        select(Notification).where(
+                            Notification.user_id == user_id,
+                            Notification.type == NotificationType.RECONCILIATION_REQUIRED,
+                        )
+                    )
+                ).scalars().all()
+                assert len(notifications) == 1
+                assert notifications[0].data["fate_unknown"] is False
+                audits = (
+                    await db.execute(
+                        select(AuditLog).where(
+                            AuditLog.user_id == user_id, AuditLog.action == "order.protective_stop_unplaced"
+                        )
+                    )
+                ).scalars().all()
+                assert len(audits) == 1
+        finally:
+            await resume_account(str(user_id))
+            orders_api._STACKS.pop(user_id, None)
+            await _cleanup(user_id, instrument_id)
+
+
+async def test_an_unanswered_protective_stop_records_the_fate_as_unknown(require_infra):
+    """A broker that never answered may or may not have a stop resting.
+    That is not the same as knowing there is none, and the record has to
+    keep the two apart -- a reconciliation that assumes "bare" could place
+    a second stop on top of a live one."""
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+        instrument_id, symbol = await _instrument_for_stop_test()
+        stack = orders_api._UserTradingStack(_NoStopOrdersBroker(OrderStatus.FAILED))
+        orders_api._STACKS[user_id] = stack
+        try:
+            r = client.post(
+                "/orders",
+                json={"symbol": symbol, "direction": "LONG", "entry": 100.0, "stop": 95.0},
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+            assert "unknown" in r.json()["unprotected_reason"]
+            assert await account_halt_reason(str(user_id)) is not None
+
+            async with async_session_factory() as db:
+                notifications = (
+                    await db.execute(
+                        select(Notification).where(
+                            Notification.user_id == user_id,
+                            Notification.type == NotificationType.RECONCILIATION_REQUIRED,
+                        )
+                    )
+                ).scalars().all()
+                assert len(notifications) == 1
+                assert notifications[0].data["fate_unknown"] is True
+        finally:
+            await resume_account(str(user_id))
+            orders_api._STACKS.pop(user_id, None)
+            await _cleanup(user_id, instrument_id)
+
+
+async def test_a_placed_protective_stop_leaves_the_response_and_account_clean(require_infra):
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+        instrument_id, symbol = await _instrument_for_stop_test()
+        try:
+            r = client.post(
+                "/orders",
+                json={"symbol": symbol, "direction": "LONG", "entry": 100.0, "stop": 95.0},
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+            assert r.json()["unprotected_reason"] is None
+
+            stack = orders_api.all_stacks()[user_id]
+            assert stack.position_manager.get(str(user_id), symbol).protective_order_id is not None
+            assert await account_halt_reason(str(user_id)) is None
+        finally:
+            await resume_account(str(user_id))
+            orders_api._STACKS.pop(user_id, None)
             await _cleanup(user_id, instrument_id)

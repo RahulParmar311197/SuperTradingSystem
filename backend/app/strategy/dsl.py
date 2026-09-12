@@ -320,10 +320,27 @@ class RiskConfig(BaseModel):
     max_risk_percent: float | None = None
 
 
+# `strategies.name` and `strategy_versions.name` are both `String(255)`;
+# a longer name reached Postgres and came back as a 500 rather than a 422.
+_MAX_NAME = 255
+# `candles.timeframe` is `String(8)`, so no candle row can carry a longer
+# timeframe -- 8 characters stores, 9 raises `StringDataRightTruncation`.
+# Every consumer of this field (`ScannerWorker`, `AutoTradeSupervisor`,
+# replay and backtest) loads candles by this exact string, so a strategy
+# whose timeframe cannot fit that column can never be evaluated by any of
+# them: it is accepted, stored, and silently never fires. Same rule as the
+# entry- and condition-type validators below -- the DSL does not accept a
+# strategy the engine can never satisfy.
+_MAX_TIMEFRAME = 8
+
+
 class StrategyDefinition(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=_MAX_NAME)
+    # `market` is deliberately unbounded: it has no reader anywhere in
+    # `app/` and lands only in the JSON `definition` column, so there is no
+    # width to match it to and no failure to prevent.
     market: str
-    timeframe: str
+    timeframe: str = Field(min_length=1, max_length=_MAX_TIMEFRAME)
     direction: str | None = None  # "bullish" | "bearish"; None = either
     conditions: list[Condition] = Field(default_factory=list)  # implicit AND across the list
     entry: EntryConfig = Field(default_factory=EntryConfig)

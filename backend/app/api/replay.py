@@ -2,7 +2,7 @@ import dataclasses
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.dependencies import get_current_user
@@ -40,8 +40,15 @@ async def _get_owned_session(session_id: uuid.UUID, user: User, db: AsyncSession
 class CreateReplayRequest(BaseModel):
     instrument_id: uuid.UUID
     timeframe: str
-    starting_balance: float = 100_000.0
-    swing_length: int = 3
+    starting_balance: float = Field(default=100_000.0, gt=0, lt=1e12)
+    # Same bounds as `GET /charts/{id}/smc`, and for the same reason:
+    # below 1 `detect_swings` raises, above ~100 the pivot window makes
+    # the scan cost grow without telling anyone anything. This one is
+    # currently inert -- `ReplayEngine.analyze` has no caller in `app/`,
+    # so the `SMCConfig` built here is never used -- but the field is
+    # accepted, stored on the engine, and one wiring-up away from being
+    # the same 500 the charts overlay was.
+    swing_length: int = Field(default=3, ge=1, le=100)
 
 
 class ReplayStateResponse(BaseModel):

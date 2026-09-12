@@ -9,11 +9,14 @@ upper bound, letting one request ask for an entire table.
 """
 
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import delete
 
+from app.database.models.instruments import Instrument, MarketType
+from app.database.models.market import Candle as CandleRow
 from app.database.models.risk import AuditLog
 from app.database.models.users import User, UserSession
 from app.database.session import async_session_factory
@@ -133,3 +136,165 @@ async def test_a_non_finite_body_value_is_a_422_not_a_500(require_infra):
             assert "inf" in body
         finally:
             await _cleanup(user_id)
+
+
+# --- an analysis knob is a cost knob too -----------------------------------
+#
+# The bounds above all landed on a parameter named `limit`. `swing_length`
+# is the same class of mistake one name over: a client-supplied integer
+# reaching an engine that has its own opinion about what is valid, with
+# nothing in between. `detect_swings` *raises* below 1 and grows a
+# `2 * swing_length + 1` window per bar above it.
+
+
+async def _seed_instrument_with_candles(bars: int = 200) -> uuid.UUID:
+    """A real instrument with real candles, so `GET /charts/{id}/smc`
+    actually reaches `SMCEngine.analyze` rather than short-circuiting on
+    an empty series."""
+    async with async_session_factory() as db:
+        instrument = Instrument(
+            symbol=f"SWING{uuid.uuid4().hex[:8].upper()}",
+            exchange="NSE",
+            market=MarketType.EQUITY,
+            instrument_type="EQ",
+            lot_size=1,
+            tick_size=0.05,
+        )
+        db.add(instrument)
+        await db.commit()
+        await db.refresh(instrument)
+
+        base = datetime(2025, 1, 1, 9, 15, tzinfo=timezone.utc)
+        db.add_all(
+            [
+                CandleRow(
+                    instrument_id=instrument.id,
+                    timeframe="5m",
+                    timestamp=base + timedelta(minutes=5 * i),
+                    open=100 + (i % 17) - (i % 5),
+                    high=102 + (i % 17) - (i % 5),
+                    low=98 + (i % 17) - (i % 5),
+                    close=101 + (i % 17) - (i % 5),
+                    volume=1000.0 + i,
+                )
+                for i in range(bars)
+            ]
+        )
+        await db.commit()
+        return instrument.id
+
+
+async def _drop_instrument(instrument_id: uuid.UUID) -> None:
+    async with async_session_factory() as db:
+        await db.execute(delete(CandleRow).where(CandleRow.instrument_id == instrument_id))
+        await db.execute(delete(Instrument).where(Instrument.id == instrument_id))
+        await db.commit()
+
+
+@pytest.mark.parametrize("swing_length", [0, -1, -100])
+async def test_a_swing_length_below_one_is_a_422_not_a_server_error(require_infra, swing_length):
+    """Behavioural proof. `detect_swings` raises
+    `ValueError("swing_length must be >= 1")`, and with the parameter
+    declared a bare `int` that reached the catch-all handler: every one of
+    these answered **500** before the bound was added."""
+    instrument_id = await _seed_instrument_with_candles()
+    with TestClient(app) as client:
+        headers, user_id = await _register(client)
+        try:
+            r = client.get(
+                f"/charts/{instrument_id}/smc?timeframe=5m&swing_length={swing_length}",
+                headers=headers,
+            )
+            assert r.status_code == 422, r.text
+            assert any(d["loc"] == ["query", "swing_length"] for d in r.json()["detail"])
+        finally:
+            await _cleanup(user_id)
+            await _drop_instrument(instrument_id)
+
+
+async def test_an_absurd_swing_length_is_capped(require_infra):
+    """Behavioural proof for the *upper* bound, which is a cost bound
+    rather than a correctness one.
+
+    A huge `swing_length` empties the pivot range and returns 200, so
+    nothing looks wrong from the outside -- but values short of that
+    simply make the scan expensive. Measured over 16000 candles,
+    `detect_swings` costs 26ms at the default 3 and 3976ms at 4000: a
+    ~150x multiplier bought with one integer in a query string, on the
+    event loop every other request shares.
+    """
+    instrument_id = await _seed_instrument_with_candles()
+    with TestClient(app) as client:
+        headers, user_id = await _register(client)
+        try:
+            r = client.get(
+                f"/charts/{instrument_id}/smc?timeframe=5m&swing_length={10 ** 9}", headers=headers
+            )
+            assert r.status_code == 422, r.text
+            assert any(d["loc"] == ["query", "swing_length"] for d in r.json()["detail"])
+        finally:
+            await _cleanup(user_id)
+            await _drop_instrument(instrument_id)
+
+
+async def test_an_in_range_swing_length_still_reaches_the_engine(require_infra):
+    """Control, and a live one: the bound must reject bad values rather
+    than all of them, and the parameter must still change the analysis.
+
+    Both values here are inside the new bounds. Over 200 bars a pivot of
+    3 finds swings and so yields a premium/discount dealing range, while
+    a pivot of 95 leaves `range(95, 105)` -- too few bars to confirm one
+    -- and yields none. If `swing_length` were ignored the two responses
+    would be identical, so this fails on a bound that quietly clamps as
+    well as on one that rejects everything.
+    """
+    instrument_id = await _seed_instrument_with_candles()
+    with TestClient(app) as client:
+        headers, user_id = await _register(client)
+        try:
+            tight = client.get(
+                f"/charts/{instrument_id}/smc?timeframe=5m&swing_length=3", headers=headers
+            )
+            wide = client.get(
+                f"/charts/{instrument_id}/smc?timeframe=5m&swing_length=95", headers=headers
+            )
+            assert tight.status_code == 200, tight.text
+            assert wide.status_code == 200, wide.text
+            assert tight.json()["dealing_range"] is not None
+            assert wide.json()["dealing_range"] is None
+        finally:
+            await _cleanup(user_id)
+            await _drop_instrument(instrument_id)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("swing_length", 0), ("swing_length", -1), ("starting_balance", -1.0), ("starting_balance", 0.0)],
+)
+async def test_replay_rejects_the_same_malformed_knobs(require_infra, field, value):
+    """Behavioural proof that the *request* is refused, and an honest
+    caveat: unlike the charts overlay, `POST /replay` did **not** 500 on
+    `swing_length=0`, because `ReplayEngine.analyze` has no caller in
+    `app/` and the `SMCConfig` built from this field is therefore never
+    used. The value was accepted and stored on the engine regardless.
+    This bound is the trap being closed before it is stepped in, not a
+    live crash being fixed -- see the request model's own comment.
+    """
+    instrument_id = await _seed_instrument_with_candles()
+    with TestClient(app) as client:
+        headers, user_id = await _register(client)
+        try:
+            r = client.post(
+                "/replay",
+                json={
+                    "instrument_id": str(instrument_id),
+                    "timeframe": "5m",
+                    field: value,
+                },
+                headers=headers,
+            )
+            assert r.status_code == 422, r.text
+            assert any(d["loc"] == ["body", field] for d in r.json()["detail"])
+        finally:
+            await _cleanup(user_id)
+            await _drop_instrument(instrument_id)

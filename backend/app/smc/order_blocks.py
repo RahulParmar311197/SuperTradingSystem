@@ -138,6 +138,13 @@ def update_mitigation(candles: list[Candle], blocks: list[OrderBlock]) -> None:
                 block.invalidated or (block.size and deepest_fill >= block.size)
             ):
                 block.mitigated_index = i
+                # Settled: `filled_percentage` clamps at 1.0 and cannot
+                # move, `mitigated` is true from here whatever follows, and
+                # `mitigated_index` records only the first such bar. See
+                # `app.smc.fvg.update_mitigation` for why stopping here
+                # matters -- this pair of loops made `SMCEngine.analyze`
+                # quadratic in history length.
+                break
 
         block.filled_percentage = min(deepest_fill / block.size, 1.0) if block.size else 0.0
         block.mitigated = block.filled_percentage >= 1.0 or block.invalidated

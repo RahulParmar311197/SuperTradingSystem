@@ -51,7 +51,33 @@ def detect_fvgs(
 
 def update_mitigation(candles: list[Candle], gaps: list[FairValueGap]) -> None:
     """Recomputes fill/mitigation state for each gap using candles after it
-    was created. Mutates the gap objects in place."""
+    was created. Mutates the gap objects in place.
+
+    Stops scanning a gap the moment its outcome is settled. Both outputs
+    anyone reads are monotone: `filled_percentage` is `min(deepest_fill /
+    size, 1.0)`, so it cannot move once `deepest_fill` reaches `size`, and
+    `mitigated` is sticky-true from that same point. Scanning the rest of
+    the series after that can only recompute the same two values.
+
+    That matters because this is the hot loop of the whole engine. Every
+    call re-derived every gap against every later candle -- O(gaps x
+    candles), and gaps grow with the series, so `SMCEngine.analyze` was
+    quadratic in history length. `PaperTradingEngine.on_candle` calls
+    `analyze` once per bar over its whole accumulated history, and
+    `AutoTradeSupervisor` runs that on a 60s loop, so a single pass
+    measured 11ms at 500 bars and 7.5 SECONDS at 16000 -- roughly eleven
+    days of one-minute data for one instrument. The loop fell behind its
+    own interval and kept falling further behind as history grew.
+
+    `invalidated` is the one field that can now be left `False` where a
+    full scan would eventually have set it: a gap filled gradually and
+    only engulfed by some much later candle. Nothing outside this module
+    reads it -- `SMCEngine.active_fvgs`, the chart overlay and the AI
+    context all read `mitigated`/`filled_percentage`, which are exact. An
+    engulfing candle fills the gap completely in the same iteration it
+    invalidates it, so invalidation never arrives before the fill that
+    ends the scan anyway.
+    """
     for gap in gaps:
         deepest_fill = 0.0
         for i in range(gap.created_index + 1, len(candles)):
@@ -69,6 +95,9 @@ def update_mitigation(candles: list[Candle], gaps: list[FairValueGap]) -> None:
 
             if candle.low <= gap.bottom and candle.high >= gap.top:
                 gap.invalidated = True
+
+            if gap.invalidated or (gap.size and deepest_fill >= gap.size):
+                break
 
         gap.filled_percentage = min(deepest_fill / gap.size, 1.0) if gap.size else 0.0
         gap.mitigated = gap.filled_percentage >= 1.0 or gap.invalidated

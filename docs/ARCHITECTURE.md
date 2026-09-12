@@ -6093,6 +6093,56 @@ a real feed. The hit rates above are a property of the corpus, not an edge.
 Two of the five strategies fire on a quarter to a third of all bars, which
 is a frequency to be suspicious of, not proud of.
 
+## A half-executed spread is a naked option
+
+A defined-risk options combination is only defined-risk while every leg
+exists. `app/risk/options_risk.py` gates a strategy on the *combined*
+payoff `compute_payoff_summary` produces — a 25200/25000 bull put spread
+is approved because the long put caps the short one at a 6,500 loss. The
+exchange enforces none of that pairing: each leg is a separate order, and
+the broker is free to fill one and reject the next.
+
+Measured, on a 100,000 account: the short put filled, the protective long
+put came back rejected, and the account was left holding a naked short
+put whose real maximum loss is the strike (1,254,000 — roughly 193× what
+was approved, and 12× the whole account). The response was `201 Created`
+with a "position opened" notification, no halt, and no indication
+anywhere that the approved combination did not exist. Each leg's status
+was reported accurately; nothing drew the conclusion from them.
+
+`_remediate_partial_batch` (`app/api/options.py`) now draws it. A leg
+counts as established only when it is completely filled; if any leg is
+not, and anything at all executed, the batch is broken and:
+
+- **A leg the broker never answered (`FAILED`) is never unwound.** Since
+  `UpstoxBroker.place_order` gained its transport-failure branch, that
+  status means *fate unknown*, not *rejected* — an opposing order against
+  a position that may or may not exist is a new position half the time.
+  Those go to reconciliation, and the filled legs are deliberately left
+  alone.
+- **Otherwise the exposure this call newly opened is given back** with
+  opposing market orders, journalled through the same `_submit_leg` path
+  as the original legs so the unwind is a real, audited order and not an
+  invisible adjustment. The quantity is what the *position gained*, not
+  what the order filled: a fill that closes 50 long and opens 50 short
+  opened 50, and unwinding 100 would leave the account long again.
+- **The account is halted either way** (`app.core.redis.halt_account`,
+  blueprint §73-75), because an unwind is best effort — it can be
+  rejected in turn, and it does not restore a leg the batch merely
+  *reduced*. The halt exempts reducing orders, so the holder can still
+  get out; what it stops is piling more on top.
+
+The one case that does not halt is a batch where no leg reached the
+exchange at all: nothing was opened, so there is nothing to remediate and
+locking the account would be punishment for an order the exchange never
+saw.
+
+The response carries `strategy_intact` and `remediation` so a client
+reading `max_loss` can tell whether that number describes a position that
+exists. It says nothing about *whether the strategy was a good idea* —
+only whether the thing the risk engine approved is the thing the account
+is holding.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via
@@ -6112,14 +6162,16 @@ is a frequency to be suspicious of, not proud of.
   candle feed), so today every leg reports a "no liquidity data available"
   warning rather than ever actually rejecting on real data. That's
   reported honestly in the response (`liquidity_warnings`), not hidden.
-- **Not atomic.** Once the strategy-level risk check approves, each leg
-  is submitted as its own order through the same broker/persistence path
-  `POST /orders` uses (`app.trading.persistence`, the resolved broker from
+- **Not atomic**, and what is done about that. Once the strategy-level
+  risk check approves, each leg is submitted as its own order through the
+  same broker/persistence path `POST /orders` uses
+  (`app.trading.persistence`, the resolved broker from
   `app.trading.broker_resolver`). Neither this codebase nor (unverified)
   Upstox/Dhan guarantee all-or-nothing multi-leg fills, so a later leg's
-  rejection does not undo an earlier leg's fill — every leg's own outcome
-  is in the response instead of a single pass/fail that would misrepresent
-  what actually happened at the broker.
+  rejection genuinely does not undo an earlier leg's fill. Every leg's own
+  outcome is in the response, and since a partly executed batch leaves
+  exposure nobody approved, `_remediate_partial_batch` unwinds and halts —
+  see "A half-executed spread is a naked option" below.
 
 ## The `.__dict__` bug
 

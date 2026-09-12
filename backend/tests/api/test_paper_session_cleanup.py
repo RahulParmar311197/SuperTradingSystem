@@ -322,3 +322,108 @@ async def test_another_user_cannot_retire_someone_elses_mirror(require_infra):
             assert (await _rows(owner_id))[0].is_open is True
         finally:
             await _cleanup([owner_id, other_id], [strategy_id], [symbol])
+
+
+# --- the same orphan, reached through a restart instead of a DELETE -------
+#
+# The tests above all clean up through a session that is still in
+# `_SESSIONS`. That registry is process memory: a restart drops every live
+# session and their mirrored rows survive in Postgres. Before the fix below
+# that combination was terminal -- `GET /paper/{id}` 404s, `DELETE
+# /paper/{id}` 404ed too, and nothing else in `app/` can reach a row under a
+# `paper:*` key -- so the exposure inflation the file above fixes came
+# straight back the first time the process was restarted with a position
+# open. Measured on the real endpoints: one session, one open position,
+# `GET /portfolio.total_exposure` 15606.06 before the restart and 15606.06
+# after it, with DELETE answering 404.
+
+
+def _restart() -> None:
+    """What a process restart does to paper sessions, and only that.
+
+    `_SESSIONS` is module-level state with no eviction and no persistence,
+    so clearing it is an exact model of losing the process: the engines are
+    gone, the `positions` rows they wrote are not.
+    """
+    from app.api import paper as paper_module
+
+    paper_module._SESSIONS.clear()
+
+
+async def test_a_restart_no_longer_strands_the_mirrored_position(require_infra):
+    """Behavioural proof. After the restart the only thing left that names
+    the session is its `source_key` on the row, so DELETE has to work from
+    that rather than from the in-memory engine."""
+    symbol = f"PCI{uuid.uuid4().hex[:6].upper()}"
+    with TestClient(app) as client:
+        headers, user_id = await _register(client, "paperrestart")
+        await _make_instrument(symbol)
+        strategy_id = _create_strategy(client, headers, symbol)
+        try:
+            session_id = _run_session(client, headers, strategy_id, symbol)
+            assert (await _rows(user_id))[0].is_open is True, "fixture must open a real position"
+            assert client.get("/portfolio", headers=headers).json()["total_exposure"] > 0
+
+            _restart()
+
+            assert client.get(f"/paper/{session_id}", headers=headers).status_code == 404, (
+                "the engine must really be gone, or this proves nothing about a restart"
+            )
+            r = client.delete(f"/paper/{session_id}", headers=headers)
+            assert r.status_code == 204, r.text
+
+            rows = await _rows(user_id)
+            assert len(rows) == 1, "the row is retired, not deleted"
+            assert rows[0].is_open is False
+            assert client.get("/portfolio", headers=headers).json()["total_exposure"] == 0.0
+        finally:
+            await _cleanup([user_id], [strategy_id], [symbol])
+
+
+async def test_another_user_cannot_retire_a_stranded_mirror(require_infra):
+    """Control, and the one that matters for this change: with the session
+    gone from memory there is no `engine.account_id` left to check, so
+    ownership has to come from the durable row instead. If the fallback
+    ever retired rows without matching `user_id`, this is what would catch
+    it -- and the 404 must be the same one a session id that never existed
+    gets, so it does not confirm the session was real.
+
+    Measured rather than assumed: with the `user_id` clause removed from
+    `abandon_position_mirrors`' lookup, the intruder's DELETE retires the
+    owner's row and this fails. The closing pair of assertions is not a
+    control -- they are the behavioural half, and they fail on the code
+    before this change, where the owner's own DELETE 404s too.
+    """
+    symbol = f"PCJ{uuid.uuid4().hex[:6].upper()}"
+    with TestClient(app) as client:
+        owner_headers, owner_id = await _register(client, "paperstrandowner")
+        other_headers, other_id = await _register(client, "paperstrandother")
+        await _make_instrument(symbol)
+        strategy_id = _create_strategy(client, owner_headers, symbol)
+        try:
+            session_id = _run_session(client, owner_headers, strategy_id, symbol)
+            _restart()
+
+            assert client.delete(f"/paper/{session_id}", headers=other_headers).status_code == 404
+            assert (await _rows(owner_id))[0].is_open is True, "the intruder retired someone else's position"
+            assert client.get("/portfolio", headers=owner_headers).json()["total_exposure"] > 0
+
+            # And the owner can still clean it up afterwards -- the refused
+            # call left the row addressable.
+            assert client.delete(f"/paper/{session_id}", headers=owner_headers).status_code == 204
+            assert (await _rows(owner_id))[0].is_open is False
+        finally:
+            await _cleanup([owner_id, other_id], [strategy_id], [symbol])
+
+
+async def test_deleting_a_session_id_that_never_existed_is_still_404(require_infra):
+    """Control. The fallback must not turn DELETE into a blanket 204 for
+    any UUID a caller invents: with no session in memory and no row under
+    that key, there is nothing to clean up and the answer is still 404."""
+    with TestClient(app) as client:
+        headers, user_id = await _register(client, "papernosuch")
+        try:
+            r = client.delete(f"/paper/{uuid.uuid4()}", headers=headers)
+            assert r.status_code == 404, r.text
+        finally:
+            await _cleanup([user_id], [], [])

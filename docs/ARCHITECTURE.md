@@ -6938,11 +6938,45 @@ restored types directly so those casts are not tidied away later.
 these columns for exactly this reason — it was the only place that had
 met the problem.
 
-### What this does not fix
+### Orders, and the double fill that exposed
 
-Open **orders** are still not rehydrated, so the multi-replica caveat
-above stands for the order state machine. A restart still loses in-flight
-order state; it no longer loses the position book.
+Rehydrating positions but not orders left a sharper bug directly
+reachable, found by following that thread. `OrderManager`'s idempotency
+index is process memory too, and `persist_order` is idempotent on
+`idempotency_key` — it looks the row up by that key and *updates* it,
+correctly assuming one key means one order. A process that has forgotten
+its keys breaks that assumption. Measured, resubmitting an identical
+order after a restart:
+
+| | before | after |
+|---|---|---|
+| the resubmit | a **new** order id | the original order id |
+| position | **100 → 200** | 100, unchanged |
+| `orders` rows | 1, showing qty 100 | 1 |
+
+So a second order really filled at the broker while the journal kept one
+row for the first — the position could not be reconciled against the
+orders that produced it. The key itself is content-derived
+(`{user}:{symbol}:{direction}:{entry}:{stop}:{price}`) and was never the
+problem; the index holding it was.
+
+`load_recent_orders` rebuilds that index. Two things about it are worth
+stating rather than leaving to be discovered:
+
+* **Events are restored, and that is load-bearing.** `persist_order`
+  appends `order.events[n:]` where `n` is the count already in the
+  database. An order restored with no events would have every subsequent
+  transition fall outside that slice and never be written — the audit
+  trail would stop at the restart, silently, with no error anywhere.
+* **The window is 24 hours, and that is a judgement call.** Within one
+  process the index never forgets, but a process lifetime is itself
+  arbitrary, and loading an account's whole order history on every stack
+  build grows without bound. Every accidental resubmit this dedupe exists
+  to absorb — a double-click, a client retry, a user re-pressing after a
+  restart — happens within minutes, and a day is the unit the risk
+  counters already work in. The residual is real: an identical order
+  resubmitted more than a day after the original still creates a second
+  order.
 
 ## Multi-leg options execution (§37-40)
 
@@ -7036,15 +7070,16 @@ worth remembering: "we already checked for this" is not the same claim as
   "Cross-process design" below), but there's no leader election, so
   running more than one `worker` replica would double-process everything.
 - **Multiple API replicas for the manual `/orders` path** — every fill is
-  durably mirrored into Postgres now (see Stage 9), and *positions* are
-  now rebuilt from that mirror when a stack is first built (see "A
-  restarted process no longer starts flat" below). What is still
-  process-local is the **order** state machine (`OrderManager`, held in
-  `app/api/orders.py`'s `_STACKS`): a second API replica starts with no
-  knowledge of the first's in-flight orders and could place a conflicting
-  one. Rehydrating open orders too, or moving that state into Redis like
-  the trading halt, is what closes the remaining gap — not attempted
-  here.
+  durably mirrored into Postgres, and both *positions* and *recent
+  orders* are now rebuilt from that mirror when a stack is first built
+  (see "A restarted process no longer starts flat" below). What remains
+  is genuinely concurrent operation: two replicas that build their stacks
+  at the same moment each rehydrate from the same snapshot and can still
+  act on stale knowledge of each other's in-flight orders, and an order
+  placed on replica A after replica B rehydrated is invisible to B until
+  B rebuilds. Moving that state into Redis, like the trading halt, is
+  what closes it — not attempted here. A single replica restarting is no
+  longer affected.
 
 ## Cross-process design
 

@@ -30,7 +30,14 @@ from app.risk.portfolio import compute_correlated_exposure
 from app.trading.broker_resolver import resolve_broker
 from app.trading.execution import ExecutionEngine
 from app.trading.order_manager import OrderManager
-from app.trading.persistence import load_open_positions, persist_order, persist_position, record_trade
+from app.trading.persistence import (
+    ORDER_REHYDRATION_WINDOW,
+    load_open_positions,
+    load_recent_orders,
+    persist_order,
+    persist_position,
+    record_trade,
+)
 from app.trading.position_manager import PositionManager, PositionRecord
 
 router = APIRouter(tags=["trading"])
@@ -142,9 +149,21 @@ async def _stack_for(user: User, db: AsyncSession) -> _UserTradingStack:
                 # this, a restart reported exposure 0.00 and `GET
                 # /positions` returned `[]` while the row sat open in
                 # Postgres.
+                execution_mode = _execution_mode_for(stack)
                 stack.position_manager.restore(
-                    await load_open_positions(
-                        db, user.id, _execution_mode_for(stack), source_key="manual"
+                    await load_open_positions(db, user.id, execution_mode, source_key="manual")
+                )
+                # And the order book's idempotency index, without which an
+                # identical resubmit after a restart fills a second time
+                # while `persist_order` updates the first order's row --
+                # measured as position 100 -> 200 against a one-row
+                # journal. See `load_recent_orders`.
+                stack.order_manager.restore(
+                    await load_recent_orders(
+                        db,
+                        user.id,
+                        execution_mode,
+                        since=datetime.now(timezone.utc) - ORDER_REHYDRATION_WINDOW,
                     )
                 )
                 _STACKS[user.id] = stack

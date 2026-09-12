@@ -18,6 +18,7 @@ how `AutoTradeSupervisor` already persists `Trade` rows.
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timedelta
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,7 +30,8 @@ from app.database.models.trading import Order as OrderRow
 from app.database.models.trading import OrderEvent as OrderEventRow
 from app.database.models.trading import Position as PositionRow
 from app.database.models.trading import Trade as TradeRow
-from app.trading.order_manager import OrderRecord
+from app.database.models.trading import OrderStatus
+from app.trading.order_manager import OrderEventRecord, OrderRecord
 from app.trading.position_manager import PositionRecord
 
 
@@ -323,6 +325,95 @@ async def load_open_positions(
             stop=float(row.stop) if row.stop is not None else None,
             target=float(row.target) if row.target is not None else None,
             protective_order_id=row.protective_order_id,
+        )
+        for row, symbol in rows
+    ]
+
+
+# How far back `load_recent_orders` rebuilds. A judgement call, stated
+# plainly rather than hidden: within one process `OrderManager` never
+# forgets a key, but a process lifetime is itself arbitrary, and loading
+# an account's entire order history on every stack build grows without
+# bound. Every accidental resubmit this dedupe exists to absorb -- a
+# double-click, a client retry, a user re-pressing after a restart --
+# happens within minutes. A day is also the unit the risk counters
+# already work in (`trades_today`). The residual is real and deliberate:
+# an identical order resubmitted more than this after the original still
+# creates a second order.
+ORDER_REHYDRATION_WINDOW = timedelta(hours=24)
+
+
+async def load_recent_orders(
+    db: AsyncSession,
+    user_id: uuid.UUID,
+    execution_mode: ExecutionMode,
+    *,
+    since: datetime,
+) -> list[OrderRecord]:
+    """Rebuild recent orders, so `OrderManager`'s idempotency index
+    survives a restart.
+
+    Without this, a restarted process forgets every key it has issued.
+    `create_order` then mints a *new* order for an identical resubmit
+    while `persist_order` -- which is idempotent on `idempotency_key` and
+    correctly assumes one key means one order -- updates the first
+    order's row instead of inserting a second. Measured: an identical
+    resubmit after a restart filled a second time (position 100 -> 200)
+    while the `orders` table still held one row for 100, so the journal
+    could not be reconciled against the position it produced.
+
+    Events are restored, not left empty, and that is load-bearing rather
+    than tidiness: `persist_order` appends `order.events[n:]` where `n` is
+    the count already in the database. An order restored with no events
+    would have every subsequent transition fall outside that slice and
+    never be written, silently ending the audit trail at the restart.
+    """
+    rows = (
+        await db.execute(
+            select(OrderRow, InstrumentRow.symbol)
+            .join(InstrumentRow, InstrumentRow.id == OrderRow.instrument_id)
+            .where(
+                OrderRow.user_id == user_id,
+                OrderRow.execution_mode == execution_mode,
+                OrderRow.created_at >= since,
+            )
+        )
+    ).all()
+    if not rows:
+        return []
+
+    events_by_order: dict[uuid.UUID, list[OrderEventRecord]] = {}
+    for event in (
+        await db.execute(
+            select(OrderEventRow)
+            .where(OrderEventRow.order_id.in_([row.id for row, _ in rows]))
+            .order_by(OrderEventRow.occurred_at, OrderEventRow.created_at)
+        )
+    ).scalars():
+        events_by_order.setdefault(event.order_id, []).append(
+            OrderEventRecord(
+                from_status=OrderStatus(event.from_status) if event.from_status else None,
+                to_status=OrderStatus(event.to_status),
+                detail=(event.detail or {}).get("detail", ""),
+                occurred_at=event.occurred_at,
+            )
+        )
+
+    account_id = str(user_id)
+    return [
+        OrderRecord(
+            id=row.id,
+            idempotency_key=row.idempotency_key,
+            account_id=account_id,
+            symbol=symbol,
+            direction=row.direction,
+            order_type=row.order_type,
+            quantity=float(row.quantity),
+            price=float(row.price) if row.price is not None else None,
+            status=row.status,
+            broker_order_id=row.broker_order_id,
+            rejection_reason=row.rejection_reason,
+            events=events_by_order.get(row.id, []),
         )
         for row, symbol in rows
     ]

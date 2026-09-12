@@ -61,21 +61,78 @@ class ProtectiveStopResult:
         return self.problem is not None
 
 
-async def cancel_protective_stop(broker: Broker, position: PositionRecord) -> None:
-    """Cancel the resting stop guarding `position`, if there is one.
+# An order in one of these states is not resting: it cannot fire again, so
+# the goal state below is already met. Everything else -- including
+# PARTIALLY_FILLED, which is still live for the remainder -- counts as a
+# stop that may yet trigger.
+_SETTLED_STATUSES = frozenset(
+    {OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.EXPIRED, OrderStatus.CLOSED}
+)
 
-    Tolerant by design: a stop that has already fired, or that the broker
-    no longer knows about, is not an error -- the goal state is "no live
-    protective order for this position", and both of those already are it.
+
+async def _is_no_longer_resting(broker: Broker, order_id: str) -> bool:
+    """Ask the broker whether `order_id` can still fire.
+
+    Used only after a cancel has failed, to tell the two failures apart:
+    "the order was already gone" (the ordinary case -- the stop fired, or
+    was cancelled at the venue) and "the cancel request never landed" (a
+    timeout, a 5xx). Adapters signal both as `BrokerError`, and matching on
+    message text would be guesswork, so this asks the only question that
+    actually decides it. `get_orders` is surface every adapter must
+    implement.
+
+    An order the broker does not list at all counts as gone: a venue that
+    has forgotten an order is not about to fire it. A `get_orders` that
+    itself fails answers False -- unknown is never treated as safe here.
+    """
+    try:
+        orders = await broker.get_orders()
+    except Exception:  # noqa: BLE001 - unknown, which this must not read as "gone"
+        logger.warning("Could not confirm the fate of protective stop %s", order_id, exc_info=True)
+        return False
+    for order in orders:
+        if order.broker_order_id == order_id:
+            return order.status in _SETTLED_STATUSES
+    return True
+
+
+async def cancel_protective_stop(broker: Broker, position: PositionRecord) -> bool:
+    """Cancel the resting stop guarding `position`, if there is one.
+    Returns whether there is verifiably no live protective order left.
+
+    Tolerant of the ordinary failure: a stop that has already fired, or
+    that the broker no longer knows about, is not an error -- the goal
+    state is "no live protective order for this position", and both of
+    those already are it.
+
+    Not tolerant of the dangerous one. This used to clear
+    `protective_order_id` *before* attempting the cancel and swallow every
+    exception, so a cancel that never landed lost the only reference to an
+    order still resting at the venue, and `ensure_protective_stop` went on
+    to place a second stop on top of it. Measured against a broker whose
+    cancel raises: a 200-unit long ended up with two resting SL_M orders
+    totalling 300 units, reported as `problem=None`. Both fire together
+    when price reaches the stop, selling 300 against 200 and leaving the
+    account short 100 with nothing guarding it -- the naked position this
+    module's own docstring exists to prevent.
+
+    So the id survives a cancel whose outcome is not known, and the caller
+    is told.
     """
     order_id = position.protective_order_id
     if order_id is None:
-        return
-    position.protective_order_id = None
+        return True
     try:
         await broker.cancel_order(order_id)
     except Exception:  # noqa: BLE001 - a broker that cannot cancel must not break the caller
         logger.warning("Could not cancel protective stop %s for %s", order_id, position.symbol, exc_info=True)
+        if not await _is_no_longer_resting(broker, order_id):
+            # It may still be live. Keep the id: it is the only handle
+            # anyone -- a retry, the reconciliation worker, a human -- has
+            # on that order.
+            return False
+    position.protective_order_id = None
+    return True
 
 
 async def ensure_protective_stop(broker: Broker, position: PositionRecord) -> ProtectiveStopResult:
@@ -94,7 +151,22 @@ async def ensure_protective_stop(broker: Broker, position: PositionRecord) -> Pr
     optional surface that not every adapter implements meaningfully, while
     cancel and place are the two calls every adapter must support.
     """
-    await cancel_protective_stop(broker, position)
+    if not await cancel_protective_stop(broker, position):
+        # The old stop may still be resting. Placing another one now is the
+        # one action that is strictly worse than doing nothing: two stops
+        # against one position fire together and over-sell it into a naked
+        # position facing the other way. Report instead -- the caller in
+        # app/api/orders.py halts the account and raises
+        # RECONCILIATION_REQUIRED on exactly this signal.
+        return ProtectiveStopResult(
+            problem=(
+                f"The broker did not confirm cancelling the previous protective stop for "
+                f"{position.symbol} ({position.protective_order_id}), and still lists it as live. "
+                "No replacement stop was placed: a second one could fire alongside it and "
+                "over-sell the position. Reconcile this order against the broker."
+            ),
+            fate_unknown=True,
+        )
 
     if not position.is_open or position.stop is None:
         # Nothing to guard, or nothing to guard it with. Note that the

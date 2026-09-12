@@ -1,0 +1,14 @@
+# Development / CI only -- never installed into the production image.
+#
+# `smartmoneyconcepts` is an independent implementation of the same SMC
+# detectors as `app/smc`. It is used exclusively by
+# `tests/smc/test_reference_agreement.py` to cross-check our engine
+# against a second opinion; `app/smc/reference.py` imports it lazily so
+# neither it nor its numba/llvmlite dependency (~64MB) enters the
+# application's import graph.
+#
+# It is NOT look-ahead safe -- see the module docstring in
+# app/smc/reference.py for the measurements -- so it must never be placed
+# on the live, replay or backtest path.
+-r requirements.txt
+smartmoneyconcepts==0.0.27

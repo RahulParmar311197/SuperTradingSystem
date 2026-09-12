@@ -1,8 +1,11 @@
 import asyncio
 import logging
+import math
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -101,6 +104,37 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _json_safe(value: object) -> object:
+    """Replace values `json.dumps` refuses with a printable stand-in.
+
+    A validation error echoes the input that failed, and JSON has no
+    literal for infinity or NaN -- so serialising the 422 raised
+    `ValueError: Out of range float values are not JSON compliant`, which
+    the handler below then turned into a **500**. A client sending
+    `{"risk_per_trade_pct": 1e400}` therefore got a server error for what
+    is exactly the bad request the constraint exists to name. Every
+    endpoint with a bounded numeric body field had this; it is fixed here
+    rather than per-field so no future field has to remember.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        return repr(value)
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    # `jsonable_encoder` first, exactly as FastAPI's own default handler
+    # does: a `model_validator` failure carries the raw `ValueError` in
+    # its `ctx`, which plain `json.dumps` cannot serialise. Then the
+    # non-finite scrub on top, which is the part FastAPI's default is
+    # missing.
+    return JSONResponse(status_code=422, content={"detail": _json_safe(jsonable_encoder(exc.errors()))})
 
 
 @app.exception_handler(Exception)

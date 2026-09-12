@@ -1916,3 +1916,109 @@ async def test_a_paper_order_with_no_market_data_is_still_accepted(require_infra
         finally:
             orders_api._STACKS.pop(user_id, None)
             await _cleanup(user_id, instrument_id)
+
+
+# --- prices are untrusted client input (§57, §60) --------------------------
+#
+# `entry`/`stop`/`price` were plain unbounded floats that flow all the way
+# to `Numeric(18, 6)` columns. `entry=1e308` was risk-approved, FILLED at
+# the broker and its order row committed -- and then `persist_position`
+# raised NumericValueOutOfRangeError, 500ing the request and leaving an
+# order journalled MONITORING with no matching `positions` row.
+
+
+async def test_an_overflowing_entry_price_does_not_split_the_order_and_position_journals(require_infra):
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+        async with async_session_factory() as db:
+            instrument = Instrument(
+                symbol=f"HUGE{uuid.uuid4().hex[:6].upper()}", exchange="NSE",
+                market=MarketType.EQUITY, instrument_type="EQ",
+            )
+            db.add(instrument)
+            await db.commit()
+            await db.refresh(instrument)
+            instrument_id, symbol = instrument.id, instrument.symbol
+        try:
+            r = client.post(
+                "/orders",
+                json={"symbol": symbol, "direction": "LONG", "entry": 1e308, "stop": 1.0},
+                headers=headers,
+            )
+
+            assert r.status_code == 422, r.text
+            assert any(d["loc"] == ["body", "entry"] for d in r.json()["detail"])
+
+            # The behavioural core: nothing may have been journalled. On the
+            # old code an order row existed here with no position row.
+            async with async_session_factory() as db:
+                orders = (await db.execute(select(Order).where(Order.user_id == user_id))).scalars().all()
+                positions = (await db.execute(select(Position).where(Position.user_id == user_id))).scalars().all()
+                assert orders == []
+                assert positions == []
+        finally:
+            orders_api._STACKS.pop(user_id, None)
+            await _cleanup(user_id, instrument_id)
+
+
+@pytest.mark.parametrize(
+    "entry,stop",
+    [
+        (-100.0, -105.0),  # negative prices reached the broker and came back rejected
+        (0.0, -5.0),       # zero is not a price either
+        (1e400, 95.0),     # inf: rejected by lt=, and the 422 must still serialise
+    ],
+)
+async def test_a_price_that_is_not_a_price_is_refused_at_the_boundary(require_infra, entry, stop):
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+        async with async_session_factory() as db:
+            instrument = Instrument(
+                symbol=f"BAD{uuid.uuid4().hex[:6].upper()}", exchange="NSE",
+                market=MarketType.EQUITY, instrument_type="EQ",
+            )
+            db.add(instrument)
+            await db.commit()
+            await db.refresh(instrument)
+            instrument_id, symbol = instrument.id, instrument.symbol
+        try:
+            r = client.post(
+                "/orders",
+                json={"symbol": symbol, "direction": "LONG", "entry": entry, "stop": stop},
+                headers=headers,
+            )
+            assert r.status_code == 422, r.text
+            async with async_session_factory() as db:
+                orders = (await db.execute(select(Order).where(Order.user_id == user_id))).scalars().all()
+                assert orders == []
+        finally:
+            orders_api._STACKS.pop(user_id, None)
+            await _cleanup(user_id, instrument_id)
+
+
+async def test_an_ordinary_price_still_places_an_order(require_infra):
+    """Control: the new bounds must not reject normal input."""
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+        async with async_session_factory() as db:
+            instrument = Instrument(
+                symbol=f"OK{uuid.uuid4().hex[:6].upper()}", exchange="NSE",
+                market=MarketType.EQUITY, instrument_type="EQ",
+            )
+            db.add(instrument)
+            await db.commit()
+            await db.refresh(instrument)
+            instrument_id, symbol = instrument.id, instrument.symbol
+        try:
+            r = client.post(
+                "/orders",
+                json={"symbol": symbol, "direction": "LONG", "entry": 100.0, "stop": 95.0},
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+        finally:
+            orders_api._STACKS.pop(user_id, None)
+            await _cleanup(user_id, instrument_id)

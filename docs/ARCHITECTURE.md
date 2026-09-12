@@ -6455,6 +6455,67 @@ startup failure with nothing in their config to point at. It now ships a
 documented `DEBUG=` line, and the production checklist gained the matching
 bullet.
 
+## A price is untrusted input too (§57, §60)
+
+Bounding the query parameters (above) left request bodies unaudited, and
+`PlaceOrderRequest.entry`/`stop`/`price` were plain unbounded floats that
+flow all the way to `Numeric(18, 6)` columns — which hold at most
+999999999999.999999.
+
+`entry=1e308` was risk-approved (`calculate_position_size` divides the
+risk budget by the entry-to-stop distance, so a huge distance sizes a
+*tiny* quantity, and every notional check then looked small), **filled at
+the broker**, and its order row committed. Then:
+
+```
+asyncpg.exceptions.NumericValueOutOfRangeError: numeric field overflow
+  app/api/orders.py:609 in place_order
+  app/trading/persistence.py:214 in persist_position
+
+in-memory orders left behind: 1  (status=MONITORING, qty=5e-306)
+persisted order rows: 1
+```
+
+One request, from any authenticated client, produced a three-way
+divergence: a position at the broker, an order journalled `MONITORING`,
+live `PositionManager` state, and **no row in `positions`** — plus a 500.
+Negative and zero prices were reaching the broker too, coming back as
+rejections rather than being refused at the boundary.
+
+`entry`/`stop`/`price` now carry `gt=0, lt=1e12`. `gt=0` also rejects
+non-finite values without a separate rule: NaN fails every comparison and
+`inf` fails `lt=`.
+
+### The fix uncovered a second, general bug
+
+Adding those bounds turned `entry=1e400` from a 403 into a **500**, which
+is worse — so it was worth chasing rather than accepting. The cause is not
+in this endpoint at all:
+
+```
+ValueError: Out of range float values are not JSON compliant
+```
+
+A validation error echoes the input that failed, JSON has no literal for
+infinity, and FastAPI's default `RequestValidationError` handler
+serialises that payload — so the 422 could not be written and the
+unhandled-exception handler turned it into a 500. **Every** endpoint with
+a bounded numeric body field had this, which was confirmed on
+`POST /auto-trading/enable` (whose `risk_per_trade_pct` bound long
+predates this change) against otherwise-unmodified code:
+
+```
+risk_per_trade_pct=1e400  -> HTTP 500
+risk_per_trade_pct=200    -> HTTP 422
+```
+
+So `app/main.py` now installs a `RequestValidationError` handler that runs
+`jsonable_encoder` first — exactly as FastAPI's own default does, because
+a `model_validator` failure carries a raw `ValueError` in its `ctx` — and
+then replaces non-finite floats with their `repr` so the offending value
+is still reported, just printably. Fixed once, centrally, rather than
+per-field, so no future bounded field has to remember.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

@@ -6804,6 +6804,90 @@ sequence measured across cursors 12, 18, 24, 29, 33, 39 is
 and never decrease — which a full-series leak fails on the first of those,
 because it would report the sweep from the very first request.
 
+## A zero close desynchronised the correlation pair (round 106)
+
+`build_correlation_matrix` intersects each symbol pair on the timestamps
+they genuinely share before computing returns, and its docstring explains
+why at length: correlating by list position "silently compares one
+instrument's recent history against another's older history and reports a
+number with no meaning". That care was undone one step later.
+
+The returns themselves came from `_returns`, which drops a return whose
+previous close is zero:
+
+```python
+[(closes[i] - closes[i - 1]) / closes[i - 1]
+ for i in range(1, len(closes)) if closes[i - 1] != 0]
+```
+
+That is correct for one series and wrong for two. A zero close in one
+instrument and not the other leaves the two lists **different lengths**,
+and `pearson_correlation` then falls back to truncating from the tail —
+pairing one instrument's bars against the other's *neighbouring* bars.
+The positional misalignment the timestamp intersection exists to prevent,
+reintroduced immediately after it.
+
+Measured on two symbols following the **identical** path at the
+**identical** timestamps, differing only by a single zero close near the
+end of a 60-bar window:
+
+| | reported correlation |
+|---|---|
+| before | **−0.5224** |
+| after | **+0.5224** |
+
+Same magnitude, inverted sign — the signature of a one-bar shift on an
+alternating series. Two instruments that move together were reported as
+moving against each other.
+
+The fix is `_paired_returns`, which walks the shared timestamps once and
+emits a return for both instruments or neither, so the two series are
+equal-length by construction rather than by luck:
+
+```python
+if previous_a == 0 or previous_b == 0:
+    continue
+```
+
+A zero close is not hypothetical. Nothing in `upsert_candles` validates
+one, and an options contract that expires worthless prints exactly that.
+
+**What is deliberately not claimed.** At the default
+`correlation_threshold` of 0.7 neither value trips
+`correlated_exposure_limit`, so this is not a demonstrated change of risk
+verdict, and the test says so in as many words. What it is, is a
+meaningless number produced by a module whose entire purpose is a
+meaningful one — the same standard its own docstring sets.
+
+`pearson_correlation`'s tail truncation was left alone rather than
+hardened into a length check. `tests/risk/test_correlation.py::
+test_correlation_aligns_series_on_shared_timestamps` deliberately calls it
+with mismatched lengths to demonstrate the *original* positional-alignment
+bug, and that test is right to exist. Alignment is the caller's job, as
+the docstring says, so the fix belongs entirely in the caller.
+
+### Checked in the same pass and deliberately left alone
+
+* **`correlated_exposure` skips the target symbol.** Adding to an existing
+  position in the same instrument therefore does not count the existing
+  leg. That is correct: `exposure_limit` already gates on
+  `current_exposure + position_notional`, where `current_exposure` is the
+  whole book. The correlated check is about *cross-instrument*
+  concentration; same-symbol concentration is the plain exposure check's
+  job, and counting it twice would double-charge it.
+* **Both callers pass `target_notional=0.0`.** `RiskEngine` adds the
+  trade's own sized notional itself (`proposal.correlated_exposure +
+  position_notional`), so passing the real notional would double-count.
+  `app/paper/engine.py` and `app/api/orders.py` both pass 0.0 with a
+  comment saying why. No defect.
+* **`OptionsRiskProposal` has no correlated-exposure field**, so
+  `POST /options/execute` does not consult that gate. Wiring it would be
+  inert today: correlation is computed from candle history keyed by
+  `Instrument.symbol`, and option contracts have none (`option_chains` /
+  `option_snapshots` still have zero writers). Worth revisiting when
+  options-chain ingestion exists; adding a gate that can never fire is
+  the kind of change the previous rounds were written to avoid.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

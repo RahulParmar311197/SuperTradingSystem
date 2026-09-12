@@ -6199,6 +6199,64 @@ What this does **not** do: retry the stop, place a fallback order type, or
 watch the position afterwards. An account in this state needs a human,
 which is what the halt and the notification are for.
 
+## No market data is not fresh market data (§57)
+
+`RiskCheck("market_data_fresh")` exists so an order is never sized or
+priced against information the platform cannot vouch for.
+`get_price_age_seconds` returns `None` when no price has ever been seen
+for a symbol, or its TTL has expired — its own docstring calls that
+"there is nothing fresh to trust". `POST /orders` read it as
+`... or 0.0`, the **freshest possible value**.
+
+Measured against a connected (non-`MockBroker`) stack, two orders on two
+instruments:
+
+```
+CASE A -- no market data at all
+  get_price_age_seconds -> None
+  HTTP 201 -> MONITORING
+
+CASE B -- market data exists but is 60s stale
+  get_price_age_seconds -> 60.0
+  HTTP 403 -> Data age 60.02s vs max 10.0s
+```
+
+A price a minute old was refused; no price whatsoever was filled, and
+journalled `LIVE`. Worse information passed the gate that better
+information failed.
+
+The lenient default was not an accident — a comment introduced it
+deliberately, and its reasoning was right about the case it named:
+
+> nothing to be stale relative to, so treat that case as fresh rather
+> than blocking every order **in a system with no broker connected**
+
+That is the `MockBroker` case, Stage 9's honest default, where no
+market-data worker is expected to be running and blocking every paper
+order would be nonsense rather than safety. The error was applying that
+conclusion to a system which *does* have a broker connected. There, "we
+have no idea what this instrument is trading at" is precisely when not to
+send an order, and a market-data worker that has died is the exact
+failure this check exists to catch.
+
+So `_market_data_age_for` narrows the leniency to the case that was
+actually argued for: `None` from Redis becomes `0.0` for a stack trading
+against `MockBroker`, and stays `None` for a real one.
+`TradeRiskProposal.market_data_age_seconds` is now `float | None`, and the
+engine treats `None` as a distinct failure — *"No market data for this
+instrument"* — rather than a number to compare. A caller that cannot say
+how old the data is has not said it is fresh.
+
+Two things deliberately left alone:
+
+- **`recent_price_jump_pct`'s `or 0.0` on the next line is correct.** No
+  prior tick genuinely is no jump, not an unknown one. The two lines look
+  identical and mean opposite things, which is most of why this survived.
+- **`OptionsRiskProposal.market_data_age_seconds` keeps its `0.0`
+  default.** No options-chain ingestion exists at all (see above), so
+  every leg would block rather than degrade — a different situation with
+  its own documented reasoning.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

@@ -166,6 +166,32 @@ async def _mark_open_positions_to_market(stack: "_UserTradingStack", user_id: st
     return positions
 
 
+def _market_data_age_for(stack: "_UserTradingStack", age_seconds: float | None) -> float | None:
+    """How stale this instrument's price is, as the risk engine should read it.
+
+    `get_price_age_seconds` returns `None` when no price has ever been
+    seen for a symbol, or its TTL has expired -- its own docstring calls
+    that "there is nothing fresh to trust". This used to be flattened with
+    `or 0.0`, the *freshest possible* value, so `market_data_fresh` passed
+    for a symbol with no feed at all. Measured against a connected broker:
+    a price 60s old was rejected against the 10s limit, and no price at
+    all was accepted. Worse information passed the gate that better
+    information failed.
+
+    The lenient reading is right for exactly one case, and the comment
+    that introduced it said so: a stack with no connected broker trades
+    against `MockBroker` (Stage 9's honest default) in a system where no
+    market-data worker is expected to be running, and blocking every paper
+    order there would be nonsense. A stack with a real broker is not that
+    system. There, "we have no idea what this instrument is trading at" is
+    precisely when not to send a live order -- and a market-data worker
+    that has died is the failure this check exists to catch.
+    """
+    if age_seconds is not None:
+        return age_seconds
+    return 0.0 if isinstance(stack.broker, MockBroker) else None
+
+
 def _execution_mode_for(stack: "_UserTradingStack") -> ExecutionMode:
     """Blueprint §101: "Never make paper and live look identical" — a
     stack with no connected broker account trades against `MockBroker`
@@ -388,11 +414,10 @@ async def place_order(
         weekly_pnl=stack.weekly_pnl,
         current_exposure=current_exposure,
         strategy_allocation=0.0,
-        # No live feed is wired for this symbol yet if this comes back None
-        # (see app.workers.market_data_worker) — nothing to be stale
-        # relative to, so treat that case as fresh rather than blocking
-        # every order in a system with no broker connected.
-        market_data_age_seconds=await get_price_age_seconds(payload.symbol) or 0.0,
+        # `None` (no feed for this symbol, see app.workers.market_data_worker)
+        # means "fresh" only for a stack with no connected broker -- see
+        # `_market_data_age_for`.
+        market_data_age_seconds=_market_data_age_for(stack, await get_price_age_seconds(payload.symbol)),
         broker_healthy=await stack.broker.is_healthy(),
         correlated_exposure=correlated_exposure,
         repeated_rejections=stack.repeated_rejections,

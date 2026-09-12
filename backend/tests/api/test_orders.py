@@ -15,6 +15,7 @@ from app.database.models.trading import ExecutionMode, Order, OrderEvent, OrderS
 from app.database.models.users import BrokerAccount, BrokerAccountStatus, BrokerName, User, UserSession
 from app.database.session import async_session_factory
 from app.main import app
+import app.api.orders as orders_api
 from app.risk.engine import RiskEngine
 from app.risk.limits import RiskCheck, RiskDecision, RiskDecisionResult
 
@@ -1556,5 +1557,105 @@ async def test_two_limit_orders_differing_only_in_price_are_not_deduped(require_
             assert first.json()["id"] != second.json()["id"]
             assert first.json()["quantity"] == pytest.approx(500 / 4)
             assert second.json()["quantity"] == pytest.approx(500 / 3)
+        finally:
+            await _cleanup(user_id, instrument_id)
+
+
+async def test_a_live_order_gets_a_broker_side_stop_that_actually_closes_it(require_infra):
+    # Regression test: `payload.stop` was recorded on the position and
+    # persisted, and then nothing in the system ever acted on it. The paper
+    # engine checks a stop against each candle it is fed; a live position
+    # has no candle loop and no watcher, so price could run straight
+    # through a live stop with the position left open and losing. A real
+    # desk answers this by resting a stop *at the broker*, which keeps
+    # working while this process is restarting or disconnected.
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+        async with async_session_factory() as db:
+            instrument = Instrument(
+                symbol=f"STOP{uuid.uuid4().hex[:6].upper()}", exchange="NSE",
+                market=MarketType.EQUITY, instrument_type="EQ",
+            )
+            db.add(instrument)
+            await db.commit()
+            await db.refresh(instrument)
+            instrument_id, symbol = instrument.id, instrument.symbol
+        try:
+            r = client.post(
+                "/orders",
+                json={"symbol": symbol, "direction": "LONG", "entry": 100.0, "stop": 95.0},
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+
+            stack = orders_api.all_stacks()[user_id]
+            resting = [
+                o for o in await stack.broker.get_orders()
+                if o.order_type.value == "SL_M" and o.status == OrderStatus.ACKNOWLEDGED
+            ]
+            assert len(resting) == 1, "a live entry with a stop must leave a protective order resting"
+            assert resting[0].quantity == pytest.approx(100.0)
+
+            async with async_session_factory() as db:
+                row = (
+                    await db.execute(select(Position).where(Position.user_id == user_id))
+                ).scalar_one()
+                # Durable, because the order it names lives at the broker
+                # and outlives this process.
+                assert row.protective_order_id == resting[0].broker_order_id
+
+            # The market gaps straight through the stop.
+            stack.broker.set_quote(symbol, ltp=80.0)
+            assert await stack.broker.get_positions() == []
+        finally:
+            await _cleanup(user_id, instrument_id)
+
+
+async def test_closing_a_live_position_withdraws_its_protective_stop(require_infra):
+    # A stop left resting against a position that no longer exists is worse
+    # than useless: when it fires it opens a fresh naked position in the
+    # opposite direction.
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+        async with async_session_factory() as db:
+            instrument = Instrument(
+                symbol=f"STOP{uuid.uuid4().hex[:6].upper()}", exchange="NSE",
+                market=MarketType.EQUITY, instrument_type="EQ",
+            )
+            db.add(instrument)
+            await db.commit()
+            await db.refresh(instrument)
+            instrument_id, symbol = instrument.id, instrument.symbol
+        try:
+            r = client.post(
+                "/orders",
+                json={"symbol": symbol, "direction": "LONG", "entry": 100.0, "stop": 95.0},
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+
+            # Close it with an opposing order.
+            r = client.post(
+                "/orders",
+                json={"symbol": symbol, "direction": "SHORT", "entry": 101.0, "stop": 106.0},
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+
+            stack = orders_api.all_stacks()[user_id]
+            resting = [
+                o for o in await stack.broker.get_orders()
+                if o.order_type.value == "SL_M" and o.status == OrderStatus.ACKNOWLEDGED
+            ]
+            assert resting == [], "no stop may rest against a closed position"
+
+            async with async_session_factory() as db:
+                row = (
+                    await db.execute(select(Position).where(Position.user_id == user_id))
+                ).scalar_one()
+                assert row.is_open is False
+                assert row.protective_order_id is None
         finally:
             await _cleanup(user_id, instrument_id)

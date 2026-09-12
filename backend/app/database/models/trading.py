@@ -116,6 +116,13 @@ class Position(Base):
     average_price: Mapped[float] = mapped_column(Numeric(18, 6), nullable=False, default=0)
     stop: Mapped[float | None] = mapped_column(Numeric(18, 6))
     target: Mapped[float | None] = mapped_column(Numeric(18, 6))
+    # The broker's id for the resting stop order enforcing `stop`, when one
+    # is live. Persisted rather than held in memory because the order it
+    # names lives at the broker and outlives this process: without a
+    # durable handle, an API restart would leave a real protective order
+    # resting with nothing able to cancel or replace it, and the next entry
+    # on the same symbol would stack a second one beside it.
+    protective_order_id: Mapped[str | None] = mapped_column(String(64))
     unrealized_pnl: Mapped[float] = mapped_column(Numeric(18, 6), default=0)
     realized_pnl: Mapped[float] = mapped_column(Numeric(18, 6), default=0)
     is_open: Mapped[bool] = mapped_column(default=True)

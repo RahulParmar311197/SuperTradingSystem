@@ -27,7 +27,14 @@ class TradeRiskProposal:
     current_exposure: float  # in account-currency notional
     strategy_allocation: float  # notional already allocated to this strategy
 
-    market_data_age_seconds: float
+    # Seconds since the last tick for this instrument, or `None` for "no
+    # market data at all". Those are different facts and the check below
+    # treats them differently: a caller that cannot say how old the data
+    # is has not told us it is fresh. A caller for which "no feed" is
+    # expected and harmless (the paper engine, or a stack trading against
+    # `MockBroker`) passes 0.0 explicitly instead -- see
+    # `_market_data_age_for` in app/api/orders.py.
+    market_data_age_seconds: float | None
     broker_healthy: bool
     repeated_rejections: int = 0
     recent_price_jump_pct: float = 0.0
@@ -193,8 +200,11 @@ class RiskEngine:
         checks.append(
             RiskCheck(
                 "market_data_fresh",
-                proposal.market_data_age_seconds <= limits.market_data_max_staleness_seconds,
-                f"Data age {proposal.market_data_age_seconds}s vs max {limits.market_data_max_staleness_seconds}s",
+                proposal.market_data_age_seconds is not None
+                and proposal.market_data_age_seconds <= limits.market_data_max_staleness_seconds,
+                "No market data for this instrument"
+                if proposal.market_data_age_seconds is None
+                else f"Data age {proposal.market_data_age_seconds}s vs max {limits.market_data_max_staleness_seconds}s",
             )
         )
         checks.append(RiskCheck("broker_healthy", proposal.broker_healthy))

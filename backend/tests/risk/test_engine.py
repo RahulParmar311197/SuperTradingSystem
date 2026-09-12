@@ -203,3 +203,23 @@ def test_a_reducing_proposal_is_still_stopped_by_an_unhealthy_broker():
     decision = RiskEngine().evaluate(_tripped_proposal(is_reducing=True, broker_healthy=False))
     assert decision.decision == RiskDecision.REJECT
     assert any(c.name == "broker_healthy" and not c.passed for c in decision.checks)
+
+
+def test_no_market_data_at_all_fails_the_freshness_check():
+    # `None` is not a small age, it is the absence of one. Flattened to
+    # 0.0 it read as the freshest possible value, so the staleness gate
+    # passed for an instrument with no feed -- while a real 60s age
+    # against a 10s limit was rejected. Worse information must not pass a
+    # gate that better information fails.
+    decision = RiskEngine(limits=RiskLimits()).evaluate(_base_proposal(market_data_age_seconds=None))
+
+    assert not decision.approved
+    check = next(c for c in decision.checks if c.name == "market_data_fresh")
+    assert not check.passed
+    assert check.detail == "No market data for this instrument"
+
+
+def test_a_caller_that_knows_the_data_is_fresh_still_passes():
+    decision = RiskEngine(limits=RiskLimits()).evaluate(_base_proposal(market_data_age_seconds=0.0))
+
+    assert next(c for c in decision.checks if c.name == "market_data_fresh").passed

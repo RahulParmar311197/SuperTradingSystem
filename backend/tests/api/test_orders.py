@@ -9,7 +9,7 @@ from sqlalchemy import delete, select
 from app.brokers.base import AccountInfo, Broker, BrokerError, BrokerOrder, BrokerPosition, OrderRequest, OrderResult, Quote
 from app.brokers.mock import MockBroker as _MockBrokerBase
 from app.core.encryption import encrypt_credentials
-from app.core.redis import account_halt_reason, resume_account
+from app.core.redis import account_halt_reason, get_price_age_seconds, resume_account, set_latest_price
 from app.database.models.instruments import Instrument, MarketType, OptionType
 from app.database.models.notifications import Notification, NotificationType
 from app.database.models.risk import AuditLog, RiskEvent
@@ -1024,6 +1024,15 @@ async def test_closing_trade_records_the_real_fill_price_not_the_claimed_entry(r
             stack.broker = _FakeRealBroker(quote_price=101.0)
             stack.execution_engine.broker = stack.broker
 
+            # A connected broker in a real deployment also has a live
+            # market-data feed behind it (app.workers.market_data_worker).
+            # Publishing a tick here is part of simulating that, not a
+            # concession: since `market_data_fresh` started treating "no
+            # feed at all" as unfresh for a non-MockBroker stack, a live
+            # stack with no published price is a *dead feed*, which is a
+            # different scenario from the one this test is about.
+            await set_latest_price(instrument.symbol, 101.0)
+
             # A reducing SHORT fill: entry=101.5 is within the 1% deviation
             # tolerance of the real quote (101.0), so it passes
             # entry_matches_market -- but the actual fill still happens at
@@ -1119,6 +1128,12 @@ async def test_cancel_order_broker_failure_is_surfaced_cleanly_and_leaves_status
             stack = orders_module._STACKS[user_id]
             stack.broker = _NeverFillsBroker()
             stack.execution_engine.broker = stack.broker
+
+            # As above: a connected broker in a real deployment has a live
+            # feed behind it, and `market_data_fresh` now treats "no feed
+            # at all" as unfresh for a non-MockBroker stack. This test is
+            # about a cancel that fails, not about a dead feed.
+            await set_latest_price(instrument.symbol, 100.0)
 
             # Different stop from the first order above -- the idempotency
             # key (app/api/orders.py) is derived from
@@ -1817,5 +1832,87 @@ async def test_a_placed_protective_stop_leaves_the_response_and_account_clean(re
             assert await account_halt_reason(str(user_id)) is None
         finally:
             await resume_account(str(user_id))
+            orders_api._STACKS.pop(user_id, None)
+            await _cleanup(user_id, instrument_id)
+
+
+# --- no market data is not fresh market data (blueprint §57) ---------------
+#
+# `get_price_age_seconds` returns None when no price has ever been seen
+# for a symbol (or its TTL expired) -- its own docstring calls that
+# "there is nothing fresh to trust". Flattened with `or 0.0` it became the
+# *freshest possible* value, so `market_data_fresh` passed for an
+# instrument with no feed at all. Measured against a connected broker: a
+# price 60s old was rejected against the 10s limit, and no price at all
+# was accepted.
+
+
+async def test_a_live_order_for_an_instrument_with_no_market_data_is_rejected(require_infra):
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+        async with async_session_factory() as db:
+            instrument = Instrument(
+                symbol=f"NODATA{uuid.uuid4().hex[:6].upper()}", exchange="NSE",
+                market=MarketType.EQUITY, instrument_type="EQ",
+            )
+            db.add(instrument)
+            await db.commit()
+            await db.refresh(instrument)
+            instrument_id, symbol = instrument.id, instrument.symbol
+
+        # A connected broker -- not MockBroker, so this stack is LIVE.
+        orders_api._STACKS[user_id] = orders_api._UserTradingStack(_FakeRealBroker(quote_price=100.0))
+        try:
+            assert await get_price_age_seconds(symbol) is None, "this symbol must have no feed for the test to mean anything"
+
+            r = client.post(
+                "/orders",
+                json={"symbol": symbol, "direction": "LONG", "entry": 100.0, "stop": 95.0},
+                headers=headers,
+            )
+
+            assert r.status_code == 403, r.text
+            assert "No market data for this instrument" in r.json()["detail"]
+
+            # Nothing may have reached the broker.
+            async with async_session_factory() as db:
+                orders = (await db.execute(select(Order).where(Order.user_id == user_id))).scalars().all()
+                assert [o for o in orders if o.status != OrderStatus.REJECTED] == []
+        finally:
+            orders_api._STACKS.pop(user_id, None)
+            await _cleanup(user_id, instrument_id)
+
+
+async def test_a_paper_order_with_no_market_data_is_still_accepted(require_infra):
+    """The lenient reading is right for exactly one case and must survive:
+    a stack with no connected broker trades against `MockBroker` in a
+    system where no market-data worker is expected to run at all. Blocking
+    there would make the paper platform unusable rather than safe."""
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+        async with async_session_factory() as db:
+            instrument = Instrument(
+                symbol=f"PAPER{uuid.uuid4().hex[:6].upper()}", exchange="NSE",
+                market=MarketType.EQUITY, instrument_type="EQ",
+            )
+            db.add(instrument)
+            await db.commit()
+            await db.refresh(instrument)
+            instrument_id, symbol = instrument.id, instrument.symbol
+        try:
+            assert await get_price_age_seconds(symbol) is None
+
+            r = client.post(
+                "/orders",
+                json={"symbol": symbol, "direction": "LONG", "entry": 100.0, "stop": 95.0},
+                headers=headers,
+            )
+
+            assert r.status_code == 201, r.text
+            stack = orders_api.all_stacks()[user_id]
+            assert orders_api._execution_mode_for(stack) == ExecutionMode.PAPER
+        finally:
             orders_api._STACKS.pop(user_id, None)
             await _cleanup(user_id, instrument_id)

@@ -24,6 +24,7 @@ from app.database.session import get_db
 from app.notifications.service import create_notification
 from app.risk.engine import RiskEngine, TradeRiskProposal, calculate_position_size
 from app.risk.kill_switch import load_kill_switch_state
+from app.trading.protective_stops import ensure_protective_stop
 from app.risk.limits import RiskLimits
 from app.risk.portfolio import compute_correlated_exposure
 from app.trading.broker_resolver import resolve_broker
@@ -517,6 +518,16 @@ async def place_order(
             # reduces/closes a position in the other direction, whose stop
             # belongs to that original entry, not this one.
             position_after.stop = payload.stop
+        if just_filled:
+            # Put (or move, or withdraw) the broker-side order that
+            # actually enforces this position's stop. Every fill can
+            # invalidate the resting one: adding leaves it covering part
+            # of the position, a flip puts it on the wrong side, and a
+            # close leaves it resting against nothing -- which at a real
+            # broker becomes a fresh naked position in the opposite
+            # direction the moment it fires. See
+            # app/trading/protective_stops.py.
+            await ensure_protective_stop(stack.broker, position_after)
         position_row = await persist_position(
             db, user.id, instrument.id, position_after, execution_mode=execution_mode, source_key="manual"
         )

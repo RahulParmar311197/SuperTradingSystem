@@ -195,6 +195,7 @@ async def persist_position(
             average_price=position.average_price,
             stop=position.stop,
             target=position.target,
+            protective_order_id=position.protective_order_id,
             unrealized_pnl=position.unrealized_pnl,
             realized_pnl=position.realized_pnl,
             is_open=position.is_open,
@@ -205,6 +206,7 @@ async def persist_position(
         row.average_price = position.average_price
         row.stop = position.stop
         row.target = position.target
+        row.protective_order_id = position.protective_order_id
         row.unrealized_pnl = position.unrealized_pnl
         row.realized_pnl = position.realized_pnl
         row.is_open = position.is_open

@@ -42,6 +42,20 @@ class ExecutionEngine:
             self.order_manager.transition(order_id, OrderStatus.REJECTED, result.rejection_reason or "rejected by broker")
             return
 
+        if result.status == OrderStatus.FAILED:
+            # The broker never answered -- a timeout, a dropped connection,
+            # an unreadable response. The order's fate is unknown, which is
+            # not the same as rejected and must not be recorded as an
+            # acknowledgement: every other status below this line claims the
+            # broker confirmed something. Left FAILED for
+            # `ReconciliationWorker` to resolve against the broker's own
+            # record, and deliberately without applying a fill, since there
+            # is no fill to trust.
+            self.order_manager.transition(
+                order_id, OrderStatus.FAILED, result.rejection_reason or "broker did not answer"
+            )
+            return
+
         self.order_manager.transition(order_id, OrderStatus.ACKNOWLEDGED, "broker acknowledged")
 
         if result.filled_quantity > 0:

@@ -5882,6 +5882,139 @@ B — revoking your own session and then listing with that same token only
 ever worked *because* of this hole, which is a fair illustration of how
 quietly it sat.
 
+## A live position's stop was a number nobody acted on (§57, §60)
+
+`POST /orders` requires a `stop`. It sizes the position from it
+(`calculate_position_size`), the risk engine gates the trade on it, and
+since blueprint §60 was wired up it is attached to the resulting
+`PositionRecord` and persisted to `positions.stop`. Then nothing happened.
+
+Grepping every reader of a position's stop finds exactly one enforcement
+point: `app/paper/engine.py`, which compares it against each candle fed
+into `on_candle`. A live position has no candle loop. No worker polled
+quotes against open stops; `ReconciliationWorker` compares local and
+broker *positions*, not prices. So for a live order the stop was recorded,
+displayed, and never enforced — price could run straight through it with
+the position open and losing.
+
+Measured before the fix, a long of 10 units entered at 100 with a stop at
+95, after the market fell to 80:
+
+```
+positions = [('ACME', 10, 100.0)]     # still open
+loss = -200.00                        # the stop would have capped it at -50.00
+```
+
+The fix is what a real desk does: rest the stop **at the broker**. A
+broker-side stop keeps working while this process is restarting, wedged,
+or disconnected — which is precisely when a local watcher loop would fail
+and precisely when the stop matters most. `app/trading/protective_stops.py`
+places one as soon as an entry fills, and `ensure_protective_stop` is
+called after *every* fill on the position, because a fill can invalidate
+the resting order in three different ways: adding to a position leaves the
+old stop covering only part of it, a flip leaves it on the wrong side, and
+a close leaves it resting against nothing — which at a real broker becomes
+a **new naked position in the opposite direction** the moment it fires.
+
+Two supporting pieces were required.
+
+**`MockBroker` could not hold a stop at all.** `place_order` sent SL/SL_M
+through `_resolve_fill_price`, which reads `request.price` for any
+non-MARKET type. An SL_M is market-once-triggered and carries no limit
+price, so it resolved to `None` and came back `REJECTED` —
+`"No usable price for a SL_M order on ACME"`. A protective stop was
+unplaceable through the only broker any test or paper account actually
+uses, which is also why no test could ever have covered this. It now holds
+resting stops and fires them when `set_quote` crosses the trigger: a
+sell-stop at or below, a buy-stop at or above. `UpstoxBroker` already
+mapped `SL`/`SL_M` and sent `trigger_price`, so the live adapter needed no
+change — that half was ready and had nothing calling it.
+
+**`positions.protective_order_id` is a new column**, not in-memory state.
+The order it names lives at the broker and outlives this process; without
+a durable handle, an API restart would leave a real protective order
+resting with nothing able to cancel or replace it, and the next entry on
+the same symbol would stack a second one beside it.
+
+Some deliberate choices worth stating:
+
+- **SL_M, not SL.** Once a stop triggers, getting out matters more than
+  the price. A stop-limit can go unfilled in exactly the fast market that
+  triggered it, leaving the position open with its protection spent.
+- **A gap fills at the gapped price, not the trigger.** The test pins
+  this: a stop is a trigger, not a guaranteed price, and reporting the
+  trigger would overstate every result by the size of the gap.
+- **Replace rather than modify.** `Broker.modify_order` is optional
+  surface not every adapter implements meaningfully; cancel and place are
+  the two calls every adapter must support.
+- **An inverted bracket now closes immediately.** A long whose stop sits
+  *above* its entry produces a sell-stop already through its trigger, and
+  a real broker fires that at once. Nothing validates stop direction
+  against entry direction, so this is the visible consequence of an order
+  that was always wrong — surfaced now instead of resting behind
+  protection that could never help it.
+
+**What this does not do.** It does not add a local watchdog for brokers
+that reject stop orders outright: `ensure_protective_stop` logs and
+returns `None`, and the position is then unprotected exactly as before —
+a follow-up should halt the account in that case. Target/take-profit
+orders are not placed; only the stop is. The paper and auto-trade engines
+are untouched, since they already enforce stops against the candles they
+are fed, and giving them broker-side stops as well would close positions
+twice. And this has never run against a real broker — `UpstoxBroker`'s
+stop payload is unverified against Upstox's live servers.
+
+## A timeout placing an order was neither caught nor distinguishable (§50, §75)
+
+`Broker.place_order`'s contract is explicit that a failure must come back
+as an `OrderResult`, never as an exception, and says why: `ExecutionEngine.
+submit` has no try/except around the call, and by the time it runs the
+order is already registered under its idempotency key. An exception both
+500s the request *and* wedges the order permanently — a retry with the
+same parameters returns `created=False` and never calls `submit()` again.
+
+`UpstoxBroker.place_order` honoured that for an HTTP 4xx/5xx
+(`HTTPStatusError`) and for Upstox's 200-with-error-envelope
+(`BrokerError`). It did not catch a transport failure. A connect timeout,
+a read timeout, a dropped connection, or a proxy answering with something
+that is not JSON all escaped into the caller — the single most likely
+failure mode in a real deployment, since it needs nothing more than a
+flaky network.
+
+The suite could not have caught this: **no broker double anywhere in it
+raised from `place_order`**. Every fake returned a well-formed
+`OrderResult`.
+
+The subtle half is what the result should say. A timeout is **not** a
+rejection:
+
+- `REJECTED` asserts that no order reached the market and the account is
+  flat. Every downstream consumer reads it that way — the position
+  manager applies no fill, the risk engine's exposure math assumes
+  nothing opened, and `repeated_rejections` counts it as a broker saying
+  no.
+- A timeout may well have placed a real order that is filling right now.
+
+So a transport failure returns `OrderStatus.FAILED` with a reason that
+says the order's fate is unknown, and `ExecutionEngine.submit` grew a
+branch for it. Without that branch the order fell through to
+`transition(ACKNOWLEDGED, "broker acknowledged")` — recording that the
+broker confirmed something it never said. `FAILED` is exactly the state
+`ReconciliationWorker` exists to resolve against the broker's own record,
+and a broker-side position with no local match already halts the account
+(§75) rather than trading on top of an unknown.
+
+`SUBMITTED -> FAILED` was already an allowed transition; nothing had ever
+used it.
+
+**What this does not do.** It does not retry, and it must not: retrying an
+order whose fate is unknown is how you end up with two positions. It does
+not reconcile eagerly — the order sits FAILED until the next
+reconciliation pass. `DhanBroker` is still a skeleton and is not covered.
+And this is tested against `httpx.MockTransport`, not against Upstox's
+real servers, so it proves the adapter's behaviour on a transport failure,
+not that Upstox fails in exactly these ways.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

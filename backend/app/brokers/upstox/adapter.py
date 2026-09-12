@@ -210,6 +210,37 @@ class UpstoxBroker(Broker):
             # must always come back as a normal REJECTED OrderResult so it
             # flows through the existing rejection handling instead.
             return OrderResult(broker_order_id="", status=OrderStatus.REJECTED, rejection_reason=str(exc))
+        except (httpx.HTTPError, ValueError) as exc:
+            # The order left this process and we do not know what became of
+            # it: a connect/read timeout, a dropped connection, a proxy
+            # returning something that is not JSON. `httpx.HTTPError` is the
+            # base of every transport failure this client can raise, and
+            # `ValueError` covers `response.json()` on a non-JSON body.
+            #
+            # FAILED, deliberately, not REJECTED. They are different claims
+            # about the user's money: REJECTED means no order reached the
+            # market and no position exists, while a timeout may well have
+            # placed a real order that is filling right now. Reporting a
+            # rejection here would tell the user -- and the risk engine's
+            # exposure math -- that they are flat when they may not be. An
+            # order left FAILED is what `ReconciliationWorker` exists to
+            # resolve against the broker's own record, and a broker-side
+            # position with no local match halts the account (blueprint
+            # §75) rather than trading on top of an unknown.
+            #
+            # Raising was never an option: callers have no try/except around
+            # place_order, and by this point the order is registered under
+            # its idempotency key, so an exception both 500s the request and
+            # wedges the order forever -- a retry short-circuits on the key
+            # and never calls submit() again.
+            return OrderResult(
+                broker_order_id="",
+                status=OrderStatus.FAILED,
+                rejection_reason=(
+                    f"Upstox did not answer this order ({type(exc).__name__}: {exc}). Whether it reached "
+                    "the exchange is unknown -- reconcile against the broker before trading this symbol again."
+                ),
+            )
 
     async def modify_order(self, broker_order_id: str, **changes) -> OrderResult:
         body = {"order_id": broker_order_id, **changes}

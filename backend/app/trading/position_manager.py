@@ -26,6 +26,13 @@ class PositionRecord:
     # only way to answer "how much notional does *this* strategy already
     # have open" -- see RiskLimits.max_strategy_allocation_pct.
     strategy_id: str | None = None
+    # The broker-side stop order currently protecting this position, if
+    # one is live. `stop` is the price; this is the actual resting order
+    # that enforces it. Without it a stop is a number nobody acts on --
+    # the paper engine checks `stop` against each candle it is fed, but a
+    # live position has no candle loop and no watcher, so before protective
+    # orders existed a live stop did nothing at all.
+    protective_order_id: str | None = None
 
     @property
     def is_open(self) -> bool:

@@ -33,12 +33,50 @@ class MockBroker(Broker):
         self.reject_probability = reject_probability
         self.partial_fill_probability = partial_fill_probability
         self._orders: dict[str, BrokerOrder] = {}
+        # Stop orders that are live at the broker but not yet triggered,
+        # keyed by broker_order_id. A real broker holds these; without
+        # somewhere to hold them here, a protective stop could not be
+        # simulated at all (see place_order).
+        self._resting: dict[str, OrderRequest] = {}
         self._positions: dict[str, BrokerPosition] = {}
         self._quotes: dict[str, Quote] = {}
         self._healthy = True
 
     def set_quote(self, symbol: str, ltp: float, bid: float | None = None, ask: float | None = None) -> None:
         self._quotes[symbol] = Quote(symbol=symbol, ltp=ltp, bid=bid, ask=ask, timestamp=datetime.now(timezone.utc))
+        self._trigger_resting_orders(symbol, ltp)
+
+    def _trigger_resting_orders(self, symbol: str, ltp: float) -> None:
+        """Fill any resting stop whose trigger this price has crossed.
+
+        A real broker watches the tape; the only "tape" this broker has is
+        `set_quote`, so that is where a stop gets its chance to fire. A
+        sell-stop (SHORT, protecting a long) triggers at or below its
+        trigger price; a buy-stop (LONG, protecting a short) at or above.
+        """
+        for broker_order_id, request in list(self._resting.items()):
+            if request.symbol != symbol or request.trigger_price is None:
+                continue
+            crossed = (
+                ltp <= request.trigger_price
+                if request.direction.value == "SHORT"
+                else ltp >= request.trigger_price
+            )
+            if not crossed:
+                continue
+            del self._resting[broker_order_id]
+            # SL_M becomes a market order at the price that triggered it;
+            # SL becomes a limit order at its own limit price. Neither can
+            # fill better than the trigger it just crossed.
+            fill_price = request.price if request.order_type == OrderType.SL else ltp
+            if not fill_price or fill_price <= 0:
+                fill_price = ltp
+            order = self._orders[broker_order_id]
+            order.status = OrderStatus.FILLED
+            order.filled_quantity = request.quantity
+            order.average_fill_price = fill_price
+            order.updated_at = datetime.now(timezone.utc)
+            self._apply_fill_to_position(request.symbol, request.direction, request.quantity, fill_price)
 
     def set_healthy(self, healthy: bool) -> None:
         self._healthy = healthy
@@ -76,6 +114,40 @@ class MockBroker(Broker):
                 )
                 self._orders[broker_order_id] = order
                 return OrderResult(broker_order_id, OrderStatus.REJECTED, rejection_reason="Simulated rejection")
+
+        if request.order_type in (OrderType.SL, OrderType.SL_M) and request.trigger_price is not None:
+            # A stop order does not fill on arrival -- it rests at the
+            # broker until price crosses its trigger. Before this, SL/SL_M
+            # went through `_resolve_fill_price`, which reads `request.price`
+            # for any non-MARKET type: an SL_M (market-once-triggered, and
+            # so carrying no limit price) resolved to None and came back
+            # REJECTED, making a protective stop unplaceable through the
+            # only broker any test or paper account actually uses.
+            order = BrokerOrder(
+                broker_order_id=broker_order_id,
+                symbol=request.symbol,
+                direction=request.direction,
+                order_type=request.order_type,
+                quantity=request.quantity,
+                price=request.price,
+                status=OrderStatus.ACKNOWLEDGED,
+                updated_at=datetime.now(timezone.utc),
+            )
+            self._orders[broker_order_id] = order
+            self._resting[broker_order_id] = request
+            # A stop placed on the wrong side of the market is already
+            # through its trigger and fires immediately, exactly as it
+            # would at a real broker.
+            quote = self._quotes.get(request.symbol)
+            if quote is not None:
+                self._trigger_resting_orders(request.symbol, quote.ltp)
+            filled = self._orders[broker_order_id]
+            return OrderResult(
+                broker_order_id=broker_order_id,
+                status=filled.status,
+                filled_quantity=filled.filled_quantity,
+                average_fill_price=filled.average_fill_price,
+            )
 
         fill_price = self._resolve_fill_price(request)
         if fill_price is None:
@@ -174,6 +246,11 @@ class MockBroker(Broker):
         order = self._orders.get(broker_order_id)
         if order is None:
             raise KeyError(f"Unknown order {broker_order_id}")
+        if order.status in (OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED):
+            # Already terminal -- cancelling a filled stop must not report
+            # and must never un-fill it.
+            return OrderResult(broker_order_id, order.status, order.filled_quantity, order.average_fill_price)
+        self._resting.pop(broker_order_id, None)
         order.status = OrderStatus.CANCELLED
         return OrderResult(broker_order_id, OrderStatus.CANCELLED)
 

@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -200,13 +200,34 @@ def _execution_mode_for(stack: "_UserTradingStack") -> ExecutionMode:
     return ExecutionMode.PAPER if isinstance(stack.broker, MockBroker) else ExecutionMode.LIVE
 
 
+# Every price and quantity column in app/database/models/trading.py is
+# `Numeric(18, 6)`, which holds at most 999999999999.999999. A price at or
+# above this is not a price a exchange would quote; it is a value that
+# reaches Postgres and overflows it.
+_MAX_PRICE = 1e12
+
+
 class PlaceOrderRequest(BaseModel):
     symbol: str
     direction: Direction
     order_type: OrderType = OrderType.MARKET
-    entry: float
-    stop: float
-    price: float | None = None
+    # Bounded because these are untrusted client input that flows all the
+    # way to a `Numeric(18, 6)` column. `entry=1e308` used to be accepted:
+    # the order was risk-approved, FILLED at the broker, and its row
+    # committed -- and then `persist_position` raised
+    # NumericValueOutOfRangeError, 500ing the request and leaving an order
+    # journalled MONITORING with no matching `positions` row and live
+    # in-memory PositionManager state. One request, a three-way
+    # divergence between the broker, the order journal and the position
+    # journal.
+    #
+    # `gt=0` also rejects non-finite values on its own: NaN fails every
+    # comparison, and `inf` fails `lt=_MAX_PRICE`. A price of zero or less
+    # is not a price either -- those were reaching the broker and coming
+    # back as rejections rather than being refused here.
+    entry: float = Field(gt=0, lt=_MAX_PRICE)
+    stop: float = Field(gt=0, lt=_MAX_PRICE)
+    price: float | None = Field(default=None, gt=0, lt=_MAX_PRICE)
 
     @model_validator(mode="after")
     def _reject_order_types_this_platform_cannot_execute(self) -> "PlaceOrderRequest":

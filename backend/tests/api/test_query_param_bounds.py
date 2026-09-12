@@ -102,3 +102,34 @@ async def test_setups_limit_is_bounded_too(require_infra):
             assert any(d["loc"] == ["query", "limit"] for d in r.json()["detail"])
         finally:
             await _cleanup(user_id)
+
+
+# --- a validation failure must not become a server error -------------------
+
+
+async def test_a_non_finite_body_value_is_a_422_not_a_500(require_infra):
+    """JSON has no literal for infinity, but `1e400` parses to it.
+
+    FastAPI's default handler echoes the offending input in the 422 body,
+    so serialising it raised `ValueError: Out of range float values are
+    not JSON compliant` -- which the unhandled-exception handler then
+    turned into a 500. Every endpoint with a bounded numeric body field
+    had this, so it is fixed once in `app/main.py` rather than per-field.
+
+    This uses `/auto-trading/enable` deliberately: its
+    `risk_per_trade_pct` bound (`le=100`) predates this change, so a pass
+    here is the general handler working, not a field-level fix.
+    """
+    with TestClient(app) as client:
+        headers, user_id = await _register(client)
+        client.post("/trading-permissions/grant", json={"permission": "AUTO_TRADE", "confirm": True}, headers=headers)
+        try:
+            r = client.post("/auto-trading/enable", json={"risk_per_trade_pct": 1e400, "confirm": True}, headers=headers)
+
+            assert r.status_code == 422, r.text
+            # The offending value still has to be reported, just printably.
+            body = r.text
+            assert "risk_per_trade_pct" in body
+            assert "inf" in body
+        finally:
+            await _cleanup(user_id)

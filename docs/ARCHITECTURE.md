@@ -7154,6 +7154,77 @@ carries one, and the same trade-off was already accepted by the §74 and §88
 validators, but it is a real property of where the check lives rather than
 an oversight.
 
+## A failed protective-stop cancel no longer gets a second stop placed on top
+
+`ensure_protective_stop` runs after every fill on a live position and keeps
+the broker-side stop in step with the position: cancel the old resting
+order, place a new one. `cancel_protective_stop` cleared
+`position.protective_order_id` **before** attempting the cancel and then
+swallowed every exception, on the reasoning that a stop which has already
+fired is not an error.
+
+That reasoning covers one of the two ways a cancel fails. The other is a
+request that never landed — a timeout, a 5xx, a dropped connection — where
+the order is still resting at the venue. The id was already gone, so
+nothing referenced that order any more, and the code went straight on to
+place a second stop.
+
+Measured against a broker whose cancel raises, over two fills on one
+position:
+
+```
+fill 1: stop placed            resting SL_M orders = 1
+fill 2 (cancel fails):         resting SL_M orders = 2
+    qty=100  (the orphan, at the old trigger)
+    qty=200  (the replacement)
+  position size                = 200
+  quantity resting on stops    = 300
+  reported problem             = None
+```
+
+The result said the position was protected. It was over-protected in the
+worst way: both orders fire together when price reaches the trigger, 300
+sells against a 200 position, and the account is left **short 100 with
+nothing guarding it** — the naked position this module's own docstring
+exists to prevent, manufactured by the machinery meant to prevent it. Every
+later fill whose cancel fails adds another orphan.
+
+**Telling the two failures apart.** Adapters raise `BrokerError` for both:
+Upstox converts an HTTP error to `BrokerError`, and its HTTP-200
+error-envelope shape ("Order already complete") arrives as `BrokerError`
+too. Matching on message text would be guesswork, so the fix asks the
+question that actually decides it — `broker.get_orders()`, surface every
+adapter must implement. An order listed in a settled state (filled,
+cancelled, rejected, expired, closed), or not listed at all, is gone; a
+venue that has forgotten an order is not about to fire it. Anything else,
+including a `get_orders` that itself fails, counts as possibly live.
+
+When it may be live, the id is kept — it is the only handle a retry, the
+reconciliation worker or a human has on that order — and
+`ensure_protective_stop` returns `problem` with `fate_unknown=True` instead
+of placing anything. `app/api/orders.py` already halts the account and
+raises `RECONCILIATION_REQUIRED` on exactly that signal, so no new
+machinery was needed.
+
+**The trade-off, stated plainly.** Not placing the replacement leaves the
+position covered only by the stale order — in the measurement above, 100
+units of a 200-unit position, at the old trigger price. That is worse
+coverage than the two-stop state in the narrow sense of quantity covered.
+It is chosen anyway: a partially covered position plus an immediate halt
+and an explicit reconcile alert is recoverable, and an unbounded naked
+position facing the other way is not. The alternative was never "correct
+protection" — it was a different, worse failure that reported success.
+
+**The ordinary case stays ordinary**, and a control test pins it: a stop
+that fired makes the venue refuse the cancel with the same exception a
+timeout raises, and that is the routine end of every stopped-out trade. It
+must not report a problem, keep a stale id, or stand in the way of the next
+entry — otherwise the stop doing its job would halt the account every time.
+
+This is live-path code. As everywhere else in this document, it is exercised
+against `MockBroker` and a fault-injecting subclass of it, not against a
+real venue.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

@@ -50,7 +50,7 @@ async def _issue_tokens(db: AsyncSession, user: User, device_info: str | None = 
             expires_at=expires_at,
         )
     )
-    access_token = create_access_token(user.id)
+    access_token = create_access_token(user.id, session_id)
     await db.commit()
     return access_token, refresh_token
 
@@ -127,6 +127,22 @@ async def refresh(db: AsyncSession, refresh_token: str) -> tuple[str, str]:
     # Rotate: revoke the used refresh token and issue a new pair.
     session.revoked = True
     return await _issue_tokens(db, user, device_info=session.device_info)
+
+
+async def get_active_session(db: AsyncSession, session_id: uuid.UUID) -> UserSession | None:
+    """The session an access token names, or `None` if it is no longer
+    live -- revoked (logged out, explicitly revoked, or caught up in
+    reuse containment) or past `expires_at`.
+
+    Every reader of an access token must go through this. `revoked` is
+    the only thing any of §69's remediation paths actually set, so a
+    reader that skips it is a reader revocation cannot reach.
+    """
+    result = await db.execute(select(UserSession).where(UserSession.id == session_id))
+    session = result.scalar_one_or_none()
+    if session is None or session.revoked or session.expires_at < datetime.now(timezone.utc):
+        return None
+    return session
 
 
 async def logout(db: AsyncSession, refresh_token: str) -> None:

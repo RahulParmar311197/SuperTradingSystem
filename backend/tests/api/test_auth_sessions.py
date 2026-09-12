@@ -126,6 +126,14 @@ async def test_sessions_lists_device_info_and_revoke_removes_it(require_infra):
     # other half: POST /auth/sessions/{id}/revoke removes a session from
     # the list (the account-holder's own action, distinct from /logout's
     # "revoke the session I'm currently using").
+    #
+    # The revoked session is device A's and the listing is done from
+    # device B. Revoking your own session and then listing with that same
+    # token only ever worked because a revoked session's access token kept
+    # authenticating -- the hole
+    # test_revoking_a_session_stops_its_access_token now covers. Two
+    # sessions is also what makes "removes it" a real claim: one entry
+    # disappears and the other stays.
     with TestClient(app) as client:
         email = f"sessionslist-{uuid.uuid4().hex[:8]}@example.com"
         r = client.post("/auth/register", json={"email": email, "password": "testpass123", "name": "Sessions Test"})
@@ -137,23 +145,28 @@ async def test_sessions_lists_device_info_and_revoke_removes_it(require_infra):
             json={"email": email, "password": "testpass123"},
             headers={"User-Agent": "pytest-device-a"},
         )
-        access_token = r.json()["access_token"]
-        headers = {"Authorization": f"Bearer {access_token}"}
+        assert r.status_code == 200, r.text
+        r = client.post(
+            "/auth/login",
+            json={"email": email, "password": "testpass123"},
+            headers={"User-Agent": "pytest-device-b"},
+        )
+        assert r.status_code == 200, r.text
+        headers = {"Authorization": f"Bearer {r.json()['access_token']}"}
 
         try:
             r = client.get("/auth/sessions", headers=headers)
             assert r.status_code == 200, r.text
             sessions = r.json()
-            assert len(sessions) == 1
-            assert sessions[0]["device_info"] == "pytest-device-a"
-            session_id = sessions[0]["id"]
+            assert sorted(s["device_info"] for s in sessions) == ["pytest-device-a", "pytest-device-b"]
+            session_a = next(s["id"] for s in sessions if s["device_info"] == "pytest-device-a")
 
-            r = client.post(f"/auth/sessions/{session_id}/revoke", headers=headers)
+            r = client.post(f"/auth/sessions/{session_a}/revoke", headers=headers)
             assert r.status_code == 204, r.text
 
             r = client.get("/auth/sessions", headers=headers)
             assert r.status_code == 200, r.text
-            assert r.json() == []
+            assert [s["device_info"] for s in r.json()] == ["pytest-device-b"]
         finally:
             await _cleanup(user_id)
 
@@ -305,5 +318,118 @@ async def test_the_device_survives_a_refresh_token_rotation(require_infra):
             r = client.get("/auth/sessions", headers=headers)
             assert r.status_code == 200, r.text
             assert [s["device_info"] for s in r.json()] == [agent]
+        finally:
+            await _cleanup(user_id)
+
+
+async def test_logout_stops_the_access_token_not_just_the_refresh_token(require_infra):
+    # Regression test: access tokens carried only `sub`, so nothing that
+    # revokes a session could reach them. `get_current_user` -- the gate in
+    # front of every authenticated endpoint -- decoded the token, loaded
+    # the user and never looked at `UserSession.revoked`. A logged-out
+    # session's access token kept working for the rest of its lifetime
+    # (access_token_expire_minutes, 30 by default), which on this system
+    # is long enough to place orders with.
+    with TestClient(app) as client:
+        access, refresh, user_id = await _register_and_login(client, "logoutaccess")
+        headers = {"Authorization": f"Bearer {access}"}
+        try:
+            assert client.get("/auth/sessions", headers=headers).status_code == 200
+
+            assert client.post("/auth/logout", json={"refresh_token": refresh}).status_code == 204
+
+            r = client.get("/auth/sessions", headers=headers)
+            assert r.status_code == 401, r.text
+        finally:
+            await _cleanup(user_id)
+
+
+async def test_revoking_a_session_stops_its_access_token(require_infra):
+    # The self-service half of the same hole: POST /auth/sessions/{id}/revoke
+    # removed the session from the list while its access token kept
+    # authenticating. The list said "no active sessions" in a 200 response
+    # to a request authenticated by one of them.
+    with TestClient(app) as client:
+        access, _refresh, user_id = await _register_and_login(client, "revokeaccess")
+        headers = {"Authorization": f"Bearer {access}"}
+        try:
+            session_id = client.get("/auth/sessions", headers=headers).json()[0]["id"]
+            assert client.post(f"/auth/sessions/{session_id}/revoke", headers=headers).status_code == 204
+
+            r = client.get("/auth/sessions", headers=headers)
+            assert r.status_code == 401, r.text
+        finally:
+            await _cleanup(user_id)
+
+
+async def test_refresh_token_reuse_containment_also_kills_the_access_token(require_infra):
+    # The sharpest case, because `refresh()` documents the opposite: it
+    # says it revokes every session "so a thief's live access/refresh pair
+    # is cut off too". Only the refresh half was cut off. After the system
+    # detected reuse -- the textbook token-theft signal -- and revoked
+    # every session, the access token from the rotated-to session still
+    # authenticated every endpoint.
+    with TestClient(app) as client:
+        _access, refresh, user_id = await _register_and_login(client, "reuseaccess")
+        try:
+            r = client.post("/auth/refresh", json={"refresh_token": refresh})
+            assert r.status_code == 200, r.text
+            rotated_access = r.json()["access_token"]
+            assert client.get(
+                "/auth/sessions", headers={"Authorization": f"Bearer {rotated_access}"}
+            ).status_code == 200
+
+            # Replay the already-rotated token: the theft signal.
+            assert client.post("/auth/refresh", json={"refresh_token": refresh}).status_code == 401
+
+            r = client.get("/auth/sessions", headers={"Authorization": f"Bearer {rotated_access}"})
+            assert r.status_code == 401, r.text
+        finally:
+            await _cleanup(user_id)
+
+
+async def test_rotating_a_refresh_token_retires_the_old_access_token(require_infra):
+    # `refresh()` revokes the session it rotates out of, so the access
+    # token issued from that session stops working at rotation rather than
+    # lingering for its remaining lifetime. This is the intended
+    # consequence of binding tokens to sessions, asserted here so the
+    # behaviour is pinned rather than incidental.
+    with TestClient(app) as client:
+        old_access, refresh, user_id = await _register_and_login(client, "rotateaccess")
+        try:
+            assert client.get(
+                "/auth/sessions", headers={"Authorization": f"Bearer {old_access}"}
+            ).status_code == 200
+
+            r = client.post("/auth/refresh", json={"refresh_token": refresh})
+            assert r.status_code == 200, r.text
+            new_access = r.json()["access_token"]
+
+            assert client.get(
+                "/auth/sessions", headers={"Authorization": f"Bearer {old_access}"}
+            ).status_code == 401
+            assert client.get(
+                "/auth/sessions", headers={"Authorization": f"Bearer {new_access}"}
+            ).status_code == 200
+        finally:
+            await _cleanup(user_id)
+
+
+async def test_an_access_token_with_no_session_binding_is_refused(require_infra):
+    # Tokens minted before access tokens carried a `sid` name no session,
+    # so no revocation path can ever reach them. They fail closed rather
+    # than being trusted -- one re-login, versus an unrevokable credential.
+    from app.auth.security import TokenType, _create_token
+    from datetime import timedelta
+
+    with TestClient(app) as client:
+        access, _refresh, user_id = await _register_and_login(client, "nosid")
+        try:
+            legacy = _create_token(str(user_id), TokenType.ACCESS, timedelta(minutes=30))
+            r = client.get("/auth/sessions", headers={"Authorization": f"Bearer {legacy}"})
+            assert r.status_code == 401, r.text
+            assert client.get(
+                "/auth/sessions", headers={"Authorization": f"Bearer {access}"}
+            ).status_code == 200
         finally:
             await _cleanup(user_id)

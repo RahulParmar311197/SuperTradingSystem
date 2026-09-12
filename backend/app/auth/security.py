@@ -67,9 +67,25 @@ def _create_token(
     return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
 
 
-def create_access_token(user_id: uuid.UUID) -> str:
+def create_access_token(user_id: uuid.UUID, session_id: uuid.UUID) -> str:
+    """Access tokens carry the session they were issued from, exactly as
+    refresh tokens do.
+
+    Without `sid` an access token names only its user, so nothing that
+    revokes a session can reach it: `POST /auth/logout`, `POST
+    /auth/sessions/{id}/revoke` and the refresh-token-reuse containment in
+    `app.auth.service.refresh` all set `UserSession.revoked`, and every
+    reader of an access token ignored that column. A revoked session's
+    access token kept authenticating every REST endpoint and the WebSocket
+    streams for the remainder of its lifetime (`access_token_expire_minutes`,
+    30 by default) -- long enough to place orders with. `sid` is what lets
+    `app.auth.dependencies.get_current_user` check the session is still
+    live."""
     return _create_token(
-        str(user_id), TokenType.ACCESS, timedelta(minutes=settings.access_token_expire_minutes)
+        str(user_id),
+        TokenType.ACCESS,
+        timedelta(minutes=settings.access_token_expire_minutes),
+        session_id=str(session_id),
     )
 
 

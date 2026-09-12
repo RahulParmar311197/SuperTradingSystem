@@ -16,7 +16,8 @@ import uuid
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 
-from app.auth.security import InvalidTokenError, TokenType, decode_token
+from app.auth import service as auth_service
+from app.auth.security import InvalidTokenError, TokenType, decode_token_payload
 from app.core.redis import channel_name, subscribe
 from app.database.models.users import User, UserStatus
 from app.database.session import async_session_factory
@@ -31,12 +32,23 @@ async def _authenticate(websocket: WebSocket) -> User | None:
     if not token:
         return None
     try:
-        user_id = decode_token(token, TokenType.ACCESS)
+        payload = decode_token_payload(token, TokenType.ACCESS)
     except InvalidTokenError:
         return None
 
+    # Same session check `get_current_user` applies to every REST request
+    # (see its comment). A stream is if anything the worse place to skip
+    # it: a socket opened just before a revocation keeps pushing this
+    # user's live order and position events for as long as it stays
+    # connected, so a revoked session must not be able to open one.
+    session_id = payload.get("sid")
+    if not session_id:
+        return None
+
     async with async_session_factory() as db:
-        user = await get_user_by_id(db, uuid.UUID(user_id))
+        if await auth_service.get_active_session(db, uuid.UUID(session_id)) is None:
+            return None
+        user = await get_user_by_id(db, uuid.UUID(payload["sub"]))
     if user is None or user.status != UserStatus.ACTIVE:
         return None
     return user

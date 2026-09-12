@@ -5803,6 +5803,85 @@ asserting only on the session count and id — blind-spot shape (e), a test
 whose name claims a contract its assertions never reach. It now asserts
 the value.
 
+## Revoking a session did not revoke its access token (§69)
+
+Every §69 remediation path — `POST /auth/logout`, `POST
+/auth/sessions/{id}/revoke`, and the refresh-token-reuse containment in
+`app/auth/service.py` — does exactly one thing: set `UserSession.revoked`.
+Nothing that reads an access token ever looked at that column.
+
+`create_access_token(user_id)` minted a JWT carrying only `sub`; the
+session id went into the *refresh* token alone. So `get_current_user` —
+the dependency in front of every authenticated REST endpoint — decoded the
+token, loaded the user, and returned it. `_authenticate` in
+`app/api/websockets.py` did the same for the live streams. Neither could
+tell a live session from a revoked one, because neither was told which
+session it was looking at.
+
+Measured end to end, all three paths:
+
+```
+1) POST /auth/logout
+   before logout : GET /auth/sessions -> 200  ([{...one session...}])
+   logout        -> 204
+   AFTER logout  : GET /auth/sessions -> 200  ([])
+
+2) POST /auth/sessions/{id}/revoke
+   revoke        -> 204
+   AFTER revoke  : GET /auth/sessions -> 200  ([])
+
+3) refresh-token reuse detected
+   replaying the used refresh token -> 401
+   rotated-to refresh token now     -> 401
+   rotated-to ACCESS token          -> 200  ([])
+```
+
+The endpoint answered **"you have no active sessions"** with a `200`, to a
+request authenticated by one of them.
+
+Case 3 is the one that matters most, because `refresh()` states the
+opposite in its own comment: it revokes every session for the user
+*"so a thief's live access/refresh pair is cut off too"*. Only the refresh
+half was cut off. After the system detected the textbook token-theft
+signal and "contained" it, the thief kept full API access —
+`access_token_expire_minutes` is 30 by default — which on this system is
+enough time to place orders.
+
+Access tokens now carry `sid`, exactly as refresh tokens always have, and
+both readers resolve it through one shared `get_active_session` helper
+that rejects a session that is revoked or past `expires_at`. The WebSocket
+path needed it at least as much as the REST path: a stream opened just
+before a revocation would otherwise keep pushing that user's live order
+and position events for as long as the socket stayed up.
+
+Three consequences worth stating rather than discovering later:
+
+- **An access token minted before this change has no `sid` and is
+  refused.** It names no session, so no revocation path can reach it;
+  failing closed costs those holders one re-login, versus leaving an
+  unrevokable credential in circulation.
+- **Rotating a refresh token now retires the old access token
+  immediately.** `refresh()` revokes the session it rotates out of, so the
+  access token issued from it dies with it instead of lingering for its
+  remaining lifetime. That is the point of rotation, but a client that
+  refreshes while requests are still in flight on the old token will see
+  those 401 — it must use the new token from the moment it rotates.
+  `test_rotating_a_refresh_token_retires_the_old_access_token` pins it.
+- **One extra `SELECT` per authenticated request.** `get_current_user`
+  already did a user lookup per request; this adds a session lookup beside
+  it. Stateless-JWT purity was never actually on offer here — the
+  user lookup was already there — and revocation that cannot revoke is
+  not a performance win.
+
+**What this does not change.** Token lifetimes are untouched (30-minute
+access, 30-day refresh). There is no admin "log this user out everywhere"
+endpoint; the paths above are the only ones that revoke. And
+`tests/api/test_auth_sessions.py::test_sessions_lists_device_info_and_revoke_removes_it`
+had to be rewritten to revoke device A's session while listing from device
+B — revoking your own session and then listing with that same token only
+ever worked *because* of this hole, which is a fair illustration of how
+quietly it sat.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

@@ -6317,6 +6317,66 @@ A stash-verify proves nothing for a change like this — the old code is
 also correct — so the test's own credibility is established by injecting a
 plausible-but-wrong early exit (break on first overlap), which it catches.
 
+## Two more scans that should have been lookups (§22, §24)
+
+Stopping the settled-zone rescans (above) made `SMCEngine.analyze` about
+11x faster but left its *shape* unchanged — still quadratic, just with a
+smaller constant. Measured after that change:
+
+```
+    bars   days of 1m   analyze
+   16000           11     0.61s
+   32000           22     1.92s
+   64000           44     5.81s
+  128000           89    22.83s
+```
+
+So the wall moved from roughly eleven days of stored history to roughly
+three months, and then reappeared. `cProfile` named the two sites holding
+the shape up, both asking a bounded question by way of an unbounded scan:
+
+- **`detect_order_blocks`** asked, for every structure event, "is there a
+  same-direction FVG within ±2 bars of this break?" — and answered it by
+  scanning every gap. Both lists grow with the series: 2.4 million
+  generator steps over 16 000 bars. The question only ever uses
+  `created_index`, so indexing the gaps by it once turns each answer into
+  five dict lookups.
+- **`detect_equal_levels`** grouped swings into equal-highs/equal-lows
+  pools by scanning every candidate for each anchor — O(swings²). But
+  `candidates` is *already sorted by price* and the grouping test is a
+  band around the anchor, so every group is a contiguous run: `bisect`
+  bounds the scan to the band.
+
+```
+    bars   before    after
+   16000    0.61s    0.36s
+   32000    1.92s    1.04s
+   64000    5.81s    2.34s
+  128000   22.83s    5.82s     (3.9x)
+```
+
+The bisect window is deliberately widened by one position on each side and
+the original predicate — `abs(s.price - anchor.price) <= tolerance` — still
+decides membership. The band bounds are recomputed floats, so a swing
+sitting exactly on the boundary could otherwise fall a single ulp outside
+the slice; the slice is an optimisation of *where to look*, never of *what
+counts*.
+
+### A test that was checking a copy of the logic
+
+Worth recording, because the mistake is easy to repeat. The first version
+of the order-block test rebuilt the `created_index` index inside the test
+and compared that to the reference scan. It passed — and kept passing when
+an off-by-one was injected into the real ±2 window, because it had never
+touched the shipped code at all. A test that duplicates the implementation
+cannot fail when the implementation changes.
+
+The replacement recovers the predicate's answer *through* `detect_order_blocks`:
+`fvg_score` contributes exactly 0.3 to `strength`, so differencing a normal
+run against one given no gaps recovers whether the lookup found an adjacent
+gap. That version does catch the injected off-by-one, as does the
+equal-levels test when the bisect window is deliberately mis-set.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

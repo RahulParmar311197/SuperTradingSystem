@@ -37,6 +37,16 @@ def detect_order_blocks(
     fvgs = fvgs or []
     blocks: list[OrderBlock] = []
 
+    # `has_adjacent_fvg` below asks one question per structure event: is
+    # there a same-direction FVG within +/-2 bars of the break? It used to
+    # answer it by scanning every gap, and both lists grow with the
+    # series, so that alone was O(events x gaps) -- 2.4M generator steps
+    # over 16000 bars. Indexing by the only key the question uses turns
+    # each answer into five dict lookups.
+    fvg_directions_by_index: dict[int, set[str]] = {}
+    for fvg in fvgs:
+        fvg_directions_by_index.setdefault(fvg.created_index, set()).add(fvg.direction.value)
+
     for event in events:
         origin_index = None
         search_from = max(0, event.index - lookback_candles)
@@ -60,13 +70,10 @@ def detect_order_blocks(
         avg_range = _average_range(candles, event.index) or 1e-9
         displacement_score = min((breakout_candle.high - breakout_candle.low) / avg_range, 2.0) / 2.0
 
+        wanted_direction = "BULLISH" if event.direction == Direction.BULLISH else "BEARISH"
         has_adjacent_fvg = any(
-            event.index - 2 <= fvg.created_index <= event.index + 2
-            and (
-                (event.direction == Direction.BULLISH and fvg.direction.value == "BULLISH")
-                or (event.direction == Direction.BEARISH and fvg.direction.value == "BEARISH")
-            )
-            for fvg in fvgs
+            wanted_direction in fvg_directions_by_index.get(i, ())
+            for i in range(event.index - 2, event.index + 3)
         )
         fvg_score = 1.0 if has_adjacent_fvg else 0.0
 

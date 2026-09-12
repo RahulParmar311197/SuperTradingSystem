@@ -7106,6 +7106,54 @@ broker's payload — has zero callers in `app/`, and the only feed wired to
 the worker is `SimulatedFeed`. There is no live feed to harden yet, and
 inventing one to guard it would be speculative.
 
+## Client-supplied strings have to fit the columns they land in
+
+The same shape as the money bounds above, one type over. Postgres does not
+silently truncate an over-long value into a `VARCHAR(n)` — it raises
+`StringDataRightTruncation` — so a bare `str` request field meant the check
+happened in the database rather than at the boundary, and what a client got
+back for a bad request was a **500**:
+
+| request | field | column | before |
+|---|---|---|---|
+| `POST /instruments` | `symbol` at 65 chars | `String(64)` | 500 |
+| `POST /instruments` | `exchange` at 33 | `String(32)` | 500 |
+| `POST /instruments` | `instrument_type` at 33 | `String(32)` | 500 |
+| `POST /instruments` | `currency` at 9 | `String(8)` | 500 |
+| `POST /strategies` | `name` at 256 | `String(255)` | 500 |
+
+Two values were accepted that should not have been. An **empty** `symbol`
+registered an instrument at 201 — and `symbol` carries a unique index and
+is the key every instrument lookup in the system goes through, so the empty
+string is a real row that can exist exactly once and matches nothing anyone
+would search for. An empty strategy `name` was accepted the same way. Both
+are now `min_length=1`.
+
+The last case is a different failure with the same root. A
+`StrategyDefinition.timeframe` longer than 8 characters was accepted,
+stored, and could then never be evaluated: `candles.timeframe` is
+`String(8)`, so no candle row can carry a longer string — measured, 8
+characters store and 9 raise — and `ScannerWorker`, `AutoTradeSupervisor`,
+replay and backtest all load candles by that exact string. The strategy
+simply never fired, with nothing anywhere reporting why. That is the rule
+the entry-type (§74) and condition-type (§88) validators already apply, so
+it belongs in the same place: the DSL does not accept a strategy the engine
+can never satisfy.
+
+`StrategyDefinition.market` is deliberately left unbounded, and a control
+test asserts that. It has no reader anywhere in `app/` and lands only in
+the JSON `definition` column, so there is no width to match it to and no
+failure to prevent; bounding it would be a guess dressed as a rule.
+
+**The known cost of validating in the DSL.** `StrategyDefinition` is
+validated on *read* as well as write — `model_validate(row.definition)`
+runs every time a stored strategy is loaded — so a row written before this
+change with a name over 255 characters or a timeframe over 8 would now fail
+to load rather than merely never fire. Nothing in the suite or the fixtures
+carries one, and the same trade-off was already accepted by the §74 and §88
+validators, but it is a real property of where the check lives rather than
+an oversight.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

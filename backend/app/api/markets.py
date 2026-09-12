@@ -3,7 +3,7 @@ import uuid
 from datetime import date, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -44,18 +44,31 @@ class InstrumentResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+# The `instruments` column widths, restated. Postgres does not truncate an
+# over-long value into a VARCHAR(n) -- it raises `StringDataRightTruncation`,
+# which turns a registration into a 500 for what is purely a bad request
+# (measured: symbol at 65, exchange at 33, instrument_type at 33 and
+# currency at 9 characters each answered 500). `min_length=1` is the other
+# half: `symbol` is the key every instrument lookup in the system goes
+# through, and an empty one used to register happily.
+_MAX_SYMBOL = 64
+_MAX_EXCHANGE = 32
+_MAX_INSTRUMENT_TYPE = 32
+_MAX_CURRENCY = 8
+
+
 class InstrumentCreateRequest(BaseModel):
-    symbol: str
-    exchange: str
+    symbol: str = Field(min_length=1, max_length=_MAX_SYMBOL)
+    exchange: str = Field(min_length=1, max_length=_MAX_EXCHANGE)
     market: MarketType
-    instrument_type: str
-    underlying: str | None = None
+    instrument_type: str = Field(min_length=1, max_length=_MAX_INSTRUMENT_TYPE)
+    underlying: str | None = Field(default=None, min_length=1, max_length=_MAX_SYMBOL)
     expiry: date | None = None
     strike: float | None = None
     option_type: OptionType | None = None
     lot_size: int = 1
     tick_size: float = 0.05
-    currency: str = "INR"
+    currency: str = Field(default="INR", min_length=1, max_length=_MAX_CURRENCY)
 
     @model_validator(mode="after")
     def _derivative_fields_match_the_market(self) -> "InstrumentCreateRequest":

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import bisect
+
 from app.smc.types import (
     Candle,
     LiquidityPool,
@@ -24,14 +26,27 @@ def detect_equal_levels(swings: list[Swing], tolerance_pct: float = 0.05) -> lis
         candidates = sorted(
             (s for s in swings if s.swing_type == swing_type), key=lambda s: s.price
         )
+        # `candidates` is sorted by price and the grouping test is a band
+        # around the anchor's price, so every member of a group is
+        # contiguous here. Scanning the whole list per anchor made this
+        # O(swings^2), and swings grow with history. Binary search bounds
+        # the scan to the band instead.
+        prices = [s.price for s in candidates]
         used: set[int] = set()
         for anchor in candidates:
             if anchor.index in used:
                 continue
             tolerance = anchor.price * (tolerance_pct / 100)
+            # One extra position each side, then the original predicate
+            # unchanged: the band bounds are recomputed floats, so a value
+            # exactly on the boundary could otherwise land a single ulp
+            # outside the slice. The predicate, not the slice, decides
+            # membership.
+            lo = max(0, bisect.bisect_left(prices, anchor.price - tolerance) - 1)
+            hi = min(len(candidates), bisect.bisect_right(prices, anchor.price + tolerance) + 1)
             group = [
                 s
-                for s in candidates
+                for s in candidates[lo:hi]
                 if s.index not in used and abs(s.price - anchor.price) <= tolerance
             ]
             if len(group) < 2:

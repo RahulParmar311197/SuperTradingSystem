@@ -1,5 +1,6 @@
 import pytest
 
+from app.brokers.base import OrderResult
 from app.brokers.mock import MockBroker
 from app.database.models.strategy import Direction
 from app.database.models.trading import OrderStatus, OrderType
@@ -67,3 +68,37 @@ def test_position_manager_realizes_pnl_on_reversal():
 
     assert position.quantity == 0
     assert position.realized_pnl == 100.0  # 10 units * (110-100)
+
+
+@pytest.mark.asyncio
+async def test_a_broker_that_never_answered_leaves_the_order_failed_not_acknowledged():
+    # A timeout is not a rejection and it is not an acknowledgement. The
+    # order may be filling at the exchange right now, so recording
+    # ACKNOWLEDGED (which every branch below the rejection check does)
+    # would claim the broker confirmed something it never said, and
+    # applying a fill would invent one. FAILED is what
+    # ReconciliationWorker exists to resolve against the broker's record.
+    class _SilentBroker(MockBroker):
+        async def place_order(self, request):
+            return OrderResult(
+                broker_order_id="",
+                status=OrderStatus.FAILED,
+                rejection_reason="broker did not answer",
+            )
+
+    broker = _SilentBroker()
+    broker.set_quote("ACME", ltp=100.0)
+    order_manager = OrderManager()
+    position_manager = PositionManager()
+    engine = ExecutionEngine(broker, order_manager, position_manager)
+
+    order, _ = order_manager.create_order(
+        "idem-failed", "acct", "ACME", Direction.LONG, OrderType.MARKET, 10.0, None
+    )
+    order_manager.transition(order.id, OrderStatus.VALIDATING)
+    order_manager.transition(order.id, OrderStatus.RISK_APPROVED)
+
+    await engine.submit(order.id)
+
+    assert order_manager.get(order.id).status == OrderStatus.FAILED
+    assert position_manager.get("acct", "ACME") is None, "no fill may be invented for an unanswered order"

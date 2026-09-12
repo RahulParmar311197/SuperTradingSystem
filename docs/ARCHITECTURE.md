@@ -5964,6 +5964,57 @@ are fed, and giving them broker-side stops as well would close positions
 twice. And this has never run against a real broker — `UpstoxBroker`'s
 stop payload is unverified against Upstox's live servers.
 
+## A timeout placing an order was neither caught nor distinguishable (§50, §75)
+
+`Broker.place_order`'s contract is explicit that a failure must come back
+as an `OrderResult`, never as an exception, and says why: `ExecutionEngine.
+submit` has no try/except around the call, and by the time it runs the
+order is already registered under its idempotency key. An exception both
+500s the request *and* wedges the order permanently — a retry with the
+same parameters returns `created=False` and never calls `submit()` again.
+
+`UpstoxBroker.place_order` honoured that for an HTTP 4xx/5xx
+(`HTTPStatusError`) and for Upstox's 200-with-error-envelope
+(`BrokerError`). It did not catch a transport failure. A connect timeout,
+a read timeout, a dropped connection, or a proxy answering with something
+that is not JSON all escaped into the caller — the single most likely
+failure mode in a real deployment, since it needs nothing more than a
+flaky network.
+
+The suite could not have caught this: **no broker double anywhere in it
+raised from `place_order`**. Every fake returned a well-formed
+`OrderResult`.
+
+The subtle half is what the result should say. A timeout is **not** a
+rejection:
+
+- `REJECTED` asserts that no order reached the market and the account is
+  flat. Every downstream consumer reads it that way — the position
+  manager applies no fill, the risk engine's exposure math assumes
+  nothing opened, and `repeated_rejections` counts it as a broker saying
+  no.
+- A timeout may well have placed a real order that is filling right now.
+
+So a transport failure returns `OrderStatus.FAILED` with a reason that
+says the order's fate is unknown, and `ExecutionEngine.submit` grew a
+branch for it. Without that branch the order fell through to
+`transition(ACKNOWLEDGED, "broker acknowledged")` — recording that the
+broker confirmed something it never said. `FAILED` is exactly the state
+`ReconciliationWorker` exists to resolve against the broker's own record,
+and a broker-side position with no local match already halts the account
+(§75) rather than trading on top of an unknown.
+
+`SUBMITTED -> FAILED` was already an allowed transition; nothing had ever
+used it.
+
+**What this does not do.** It does not retry, and it must not: retrying an
+order whose fate is unknown is how you end up with two positions. It does
+not reconcile eagerly — the order sits FAILED until the next
+reconciliation pass. `DhanBroker` is still a skeleton and is not covered.
+And this is tested against `httpx.MockTransport`, not against Upstox's
+real servers, so it proves the adapter's behaviour on a transport failure,
+not that Upstox fails in exactly these ways.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

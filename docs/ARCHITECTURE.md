@@ -7225,6 +7225,63 @@ This is live-path code. As everywhere else in this document, it is exercised
 against `MockBroker` and a fault-injecting subclass of it, not against a
 real venue.
 
+## The stop-loss feature was halting every account that used it
+
+Two features, each correct in isolation, that between them made live
+trading unusable.
+
+`app/trading/protective_stops.py` places a position's broker-side stop by
+calling `broker.place_order` directly, deliberately not through
+`OrderManager`: it is not an order anyone submitted, it carries no
+idempotency key of its own, and its lifecycle belongs to the position
+rather than to the order journal. The position holds the only reference to
+it, in `PositionRecord.protective_order_id`.
+
+`reconcile_orders` (blueprint §75) flags any broker order that is not in
+the local order index and whose status is SUBMITTED, ACKNOWLEDGED,
+PARTIALLY_FILLED or FILLED as "unknown locally". A resting stop reports
+ACKNOWLEDGED. So every protective stop this system placed was, one minute
+later, a reconciliation mismatch — and `ReconciliationWorker` responds to
+any mismatch by halting the account, writing an audit row and raising
+RECONCILIATION_REQUIRED.
+
+Measured end to end: one `POST /orders` with a stop, then one
+reconciliation pass:
+
+```
+broker order a208abed  type=MARKET  status=FILLED
+broker order cc4ab1f2  type=SL_M    status=ACKNOWLEDGED
+reconciliation in_sync = False
+  order mismatch: Broker order cc4ab1f2... for ACME is unknown locally
+```
+
+Resuming a halted account is a deliberate manual admin action (§75, §116),
+so the sequence was: place a live entry with a stop, get halted within 60
+seconds, have an admin resume it, place the next entry, get halted again.
+A stop-loss and live trading were mutually exclusive.
+
+The fix is that `reconcile()` already receives the local positions, so it
+collects their `protective_order_id`s and passes them to `reconcile_orders`
+as the set of broker orders this system placed on purpose without an
+`OrderRecord`. The exemption is exactly those ids:
+
+* a resting stop no position claims is still flagged — that orphan is
+  precisely what reconciliation exists to catch, and after the round above
+  it is also what a failed cancel deliberately leaves behind;
+* an order placed outside this system entirely (by hand at the broker's own
+  terminal, say) is still flagged;
+* a stop that **fired** is not hidden. The order goes FILLED and is
+  exempt, but the consequence — the position is open locally and gone at
+  the broker — is reported by `reconcile_positions`, which is the half of
+  the report that matters. A control test pins that, so if it ever stopped
+  holding, the exemption would fail rather than quietly swallow a closed
+  position.
+
+Ids are collected from every local position, not only the open ones: a
+position that has just gone flat still holds the id until its cancel is
+confirmed, and flagging it in that window would halt the account for a stop
+being retired normally.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

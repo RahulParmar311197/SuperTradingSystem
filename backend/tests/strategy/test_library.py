@@ -148,7 +148,13 @@ def test_the_blueprint_example_is_starved_by_a_five_bar_lookback(corpus):
     ],
 )
 def test_lookback_defaults_follow_the_events_formation_time(condition_type, expected):
-    assert Condition(type=condition_type).lookback == expected
+    # `premium_discount` needs a zone to be a valid condition at all (see
+    # `Condition._reject_premium_discount_without_a_zone`, added when a
+    # zone-less one turned out to be unsatisfiable). The zone has no
+    # bearing on the lookback default this asserts -- it is supplied only
+    # so the condition constructs.
+    extra = {"zone": "premium"} if condition_type is ConditionType.PREMIUM_DISCOUNT else {}
+    assert Condition(type=condition_type, **extra).lookback == expected
 
 
 def test_an_explicit_lookback_is_always_honoured():

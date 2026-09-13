@@ -1,6 +1,12 @@
 # Example reverse-proxy config for a production deployment (blueprint §105).
 # Not wired into docker-compose.yml yet — add an nginx service once you're
 # running more than one API replica.
+#
+# Set TRUSTED_PROXY_HOPS=1 on the API when you put this in front of it.
+# `$proxy_add_x_forwarded_for` below appends the address nginx observed to
+# whatever the client sent, and the API reads that many entries back from
+# the right of the header. Without the setting the API sees only nginx's
+# own address and rate-limits every user in the world as one client.
 
 upstream api_backend {
     server api:8000;

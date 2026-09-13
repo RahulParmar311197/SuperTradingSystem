@@ -7514,6 +7514,61 @@ new validator rejected it. The test was
 wrong, not the change: `zone` has no bearing on the lookback table, and the
 test now passes `zone="premium"` with a comment saying why.
 
+## Which address the rate limiter keys on (§105)
+
+`app/core/rate_limit.py` guards `/auth/login` (10/minute) and
+`/auth/register` (5/minute) per client IP, and took that IP from
+`request.client.host` — the socket peer. With nothing in front of the
+process that is the real client, which is why this looked right. Deployed
+the way this repo documents — `infrastructure/nginx/nginx.conf.example`,
+blueprint §105 — the peer is nginx, the same address for everybody, and
+the per-IP limiter becomes **one global bucket for the whole platform**.
+
+Measured before the fix, twelve requests from twelve distinct client
+addresses through one proxy, under the login limit of 10/minute:
+
+```
+[200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 429, 429]
+```
+
+The eleventh and twelfth users could not log in. Not the eleventh attempt
+by one abuser — the eleventh *person*. On a trading platform that is a
+denial of service anyone can trigger deliberately, and that eleven
+ordinary users trigger by signing in at the open.
+
+`X-Forwarded-For` is now consulted, but only when `TRUSTED_PROXY_HOPS`
+says a proxy is actually there, and never from the left. nginx's
+`$proxy_add_x_forwarded_for` *appends* the peer it saw, so the chain reads
+`<whatever the client sent>, <what each proxy observed>`: everything
+forgeable is on the left, and counting back from the right by the number
+of proxies you run lands on the address the innermost trusted proxy
+actually saw. Reading the leftmost entry — the usual shortcut — would be
+worse than the bug: any client could pick its own bucket to evade the
+limit, or claim a victim's address and lock them out of login. The tests
+pin that direction explicitly, with one abuser forging a fresh address per
+attempt and still being limited.
+
+The default is `0`, which keeps a proxy-less deployment behaving exactly
+as before. That is deliberate rather than timid: a process with no proxy
+in front cannot distinguish a real `X-Forwarded-For` from one a client
+invented, so trusting it by default would hand every client the evasion
+above. The consequence is that this is a fix an operator must *switch on*
+— so `.env.example`, `docs/PRODUCTION_READINESS.md` and the nginx example
+itself all now say to set it, and the nginx example says why.
+
+**Blast radius is exactly the limiter.** `request.client` had one reader
+in the whole backend, so nothing else was attributing requests to the
+proxy — no audit row, no session record, no log line. Worth stating
+plainly, because "the app is blind to client IPs behind a proxy" sounds
+like it should be much larger than it is.
+
+`backend/tests/test_core_rate_limit.py` is new; the module had no tests.
+The three end-to-end cases re-enable rate limiting for one throwaway app
+(the suite disables it globally, since every test request shares one
+client "IP"), and the control among them is the one that must still
+reject: a limiter that never says no would pass the headline test for
+entirely the wrong reason.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

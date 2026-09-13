@@ -17,6 +17,17 @@ services:
 
   redis:
     image: redis:7-alpine
+    # Account halts (`halt:*`) and the blueprint §58 kill switch live only
+    # in Redis, and both are controls that must stay engaged until a human
+    # deliberately lifts them. With no volume and no persistence the
+    # default image keeps them in the container's ephemeral layer, so
+    # recreating this container silently resumed every halted account --
+    # without the audit row and notification that
+    # `POST /admin/accounts/{id}/resume` writes. AOF, plus a named volume
+    # alongside the one `postgres` already has.
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
     ports:
       - "6379:6379"
     healthcheck:
@@ -78,3 +89,4 @@ services:
 
 volumes:
   postgres_data:
+  redis_data:

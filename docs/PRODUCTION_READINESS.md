@@ -119,7 +119,14 @@ For real deployment:
 
 1. Provision Postgres 16 and Redis 7 (or use `docker-compose.yml` as a
    starting point — it is not a production-grade Postgres/Redis setup:
-   no backups, no replication, no TLS).
+   no backups, no replication, no TLS). **Redis must be durable**, not
+   just fast: account halts (`halt:*`) and the §58 kill switch live only
+   there, so an instance that comes back empty resumes every halted
+   account with none of the audit trail
+   `POST /admin/accounts/{id}/resume` leaves. The compose file now gives
+   Redis a named volume and `--appendonly yes`; a managed Redis needs the
+   equivalent, and a failover to an empty replica lifts the controls
+   regardless — see docs/ARCHITECTURE.md.
 2. Copy `.env.example` to `.env`, fill in real secrets (see above) and
    real broker credentials once you have them.
 3. Run migrations: `alembic upgrade head` (or the `migrate` service in

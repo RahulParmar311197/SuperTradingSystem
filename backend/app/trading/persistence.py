@@ -23,6 +23,8 @@ from datetime import datetime, timedelta
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.text import clip
+
 from app.database.models.strategy import Direction
 from app.database.models.instruments import Instrument as InstrumentRow
 from app.database.models.trading import ExecutionMode
@@ -33,6 +35,10 @@ from app.database.models.trading import Trade as TradeRow
 from app.database.models.trading import OrderStatus
 from app.trading.order_manager import OrderEventRecord, OrderRecord
 from app.trading.position_manager import PositionRecord
+
+# Read off the column rather than restated, so widening the column cannot
+# leave a stale number behind here.
+_REJECTION_REASON_LIMIT = OrderRow.__table__.c.rejection_reason.type.length
 
 
 async def persist_order(
@@ -76,7 +82,15 @@ async def persist_order(
             price=order.price,
             status=order.status,
             broker_order_id=order.broker_order_id,
-            rejection_reason=order.rejection_reason,
+            # The broker wrote this one, and never promised a length:
+            # `UpstoxBroker._extract_error_message` falls back to the whole
+            # response body, which for a proxy 502 is an HTML page.
+            # Measured at 789 characters, this insert raised and the
+            # rejection vanished -- no order row at all, so no status, no
+            # reason, and no ORDER_REJECTED notification for a live order
+            # the broker had refused. `broker_order_id` above is
+            # deliberately NOT clipped: a shortened id is a wrong id.
+            rejection_reason=clip(order.rejection_reason, _REJECTION_REASON_LIMIT),
         )
         db.add(row)
         await db.flush()
@@ -84,7 +98,7 @@ async def persist_order(
     else:
         row.status = order.status
         row.broker_order_id = order.broker_order_id
-        row.rejection_reason = order.rejection_reason
+        row.rejection_reason = clip(order.rejection_reason, _REJECTION_REASON_LIMIT)
         persisted_event_count = (
             await db.execute(
                 select(func.count()).select_from(OrderEventRow).where(OrderEventRow.order_id == row.id)

@@ -122,7 +122,17 @@ class Position(Base):
     # durable handle, an API restart would leave a real protective order
     # resting with nothing able to cancel or replace it, and the next entry
     # on the same symbol would stack a second one beside it.
-    protective_order_id: Mapped[str | None] = mapped_column(String(64))
+    # 128 to match `orders.broker_order_id` above, which holds the same
+    # kind of value -- an id the broker issued. This was String(64) when
+    # the column was added, narrower than the codebase's own declaration
+    # for the same thing and narrow for no stated reason. Since an id
+    # cannot be truncated (a shortened order id is not a shorter name for
+    # the order, it is one that silently matches nothing at the broker),
+    # the narrower column just meant an id between 65 and 128 characters
+    # was accepted by the order journal and rejected by the position
+    # journal -- and rejected *after* the protective stop was already
+    # resting at the venue.
+    protective_order_id: Mapped[str | None] = mapped_column(String(128))
     unrealized_pnl: Mapped[float] = mapped_column(Numeric(18, 6), default=0)
     realized_pnl: Mapped[float] = mapped_column(Numeric(18, 6), default=0)
     is_open: Mapped[bool] = mapped_column(default=True)

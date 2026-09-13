@@ -7569,6 +7569,65 @@ client "IP"), and the control among them is the one that must still
 reject: a limiter that never says no would pass the headline test for
 entirely the wrong reason.
 
+## What a broker writes, and the columns that hold it (§59-63)
+
+Every string a broker hands back is diagnostic text of no promised
+length. `UpstoxBroker._extract_error_message` falls back to
+`response.text` — the entire body — when the reply is not JSON, and a
+proxy or CDN 502 in front of the broker returns an HTML page. Postgres
+`VARCHAR(n)` does not truncate: it raises `StringDataRightTruncation` and
+takes the transaction with it. So a verbose broker made the write itself
+the failure.
+
+Measured, two live sites:
+
+- A **789-character rejection reason** made `POST /orders` raise out of
+  `persist_order`. The order journal was left with `[]` — no row at all,
+  so no status, no reason, and no record that a live order had been
+  refused. An identical retry failed identically.
+- A **996-character stop rejection** was worse. The entry had already
+  filled and was journaled `MONITORING`, the broker had refused the
+  protective stop, the account had been halted — and the write that
+  failed was the **notification telling the account holder their live
+  position has no stop-loss** (`Notification.body` is `String(1000)`).
+  The position was live, unprotected, and unannounced, on precisely the
+  path §107/§108 built to make sure it never is.
+
+`app/core/text.py`'s `clip` fits such text to the column and marks where
+it cut, applied at the persistence boundary — `persist_order` for
+`rejection_reason`, `create_notification` for `title` and `body` — so
+every producer is covered rather than each adapter separately. The limits
+are read off the columns (`Order.__table__.c.rejection_reason.type.length`
+and friends) rather than restated, because the bug underneath all of this
+is two places disagreeing about one width. Losing the tail of a
+diagnostic message does not compare to losing the message, the order row,
+and the alert; `data` is a JSON column with no width, so the
+machine-readable half of every notification survives whole.
+
+**An identifier is the opposite case, and got the opposite fix.**
+`positions.protective_order_id` was `String(64)` while
+`orders.broker_order_id` — the same value, an id the broker issued — is
+`String(128)`. Measured: the order journal stores a 100-character id, and
+`persist_position` rejects the same string. Clipping would be actively
+dangerous here: a shortened order id is not a shorter name for the order,
+it is one that silently matches nothing at the broker, which is how a
+protective stop becomes invisible to reconciliation. The column is
+widened to 128 by migration `d1f3a7c9b204` instead. The narrow
+declaration came from §107's own migration — it was a guess, and the
+wrong one.
+
+**Deliberately untouched:** `RiskEvent.reason`, also `String(500)`. Its
+writers are this system's own risk-engine strings (`decision.reason`,
+`outcome.risk_rejected_reason`), bounded by construction, not broker
+text. Clipping there would be speculation, not a fix.
+
+Also worth recording, since the test says so out loud rather than
+silently: a **broker** rejection on `POST /orders` produces no
+notification at all. The endpoint notifies on a *risk-engine* rejection
+only. Whether a broker-side rejection deserves one is a real question and
+a separate one; this round only made sure the order row survives to be
+the record.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

@@ -7325,6 +7325,52 @@ else. The durable fix is to keep halts in Postgres and treat Redis as a
 cache of them, which changes how the control is modelled rather than how it
 is deployed; it is not taken here.
 
+## Revoking a session now ends its open streams, not just its requests
+
+Blueprint §69's revocation was made real earlier: `get_current_user` looks
+the session up on every REST request, so `POST /auth/sessions/{id}/revoke`,
+`logout` and the refresh-reuse containment all cut access immediately.
+WebSockets kept their own copy of that check — at the handshake, once — and
+nothing re-checked afterwards.
+
+Measured end to end, with a socket open on `/ws/orders`:
+
+```
+received before revoke: {'event': 'before revocation'}
+revoke -> HTTP 204
+REST with the same token -> 401
+socket still streaming after revoke: {'event': 'AFTER revocation'}
+```
+
+`/ws/orders` and `/ws/positions` carry that user's live order and position
+events. Someone revoking a session on a stolen laptop or a shared machine
+is told the session is gone, is shown it refusing REST — and the socket
+keeps delivering, for as long as it stays connected.
+
+`_relay` now runs a third task alongside the forwarder and the
+disconnect watchdog: whichever finishes first ends the connection — the
+client goes away, the channel errors, or `_watch_for_revocation` finds the
+session gone. `_authenticate` returns the session id with the user so
+there is something to re-check, and every authenticated endpoint passes it
+through; `_relay`'s parameter stays optional, and a control test covers the
+no-session caller.
+
+**Two honest limits.** The re-check is a timer
+(`SESSION_RECHECK_SECONDS = 30.0`, named rather than inlined so the cost is
+visible: one indexed lookup per open socket per interval), so a revoked
+session keeps receiving for up to that long — bounded, where it used to be
+unbounded. And it polls because revocation is a Postgres `UPDATE` on
+`user_sessions` with no event to subscribe to; publishing one on the
+existing Redis bus would be tighter and is a larger change than this hole
+warrants.
+
+The tests shorten the interval rather than waiting it out — what is being
+proven is that the socket closes at all, not the production cadence. Both
+were measured against injected faults: a watcher that returns immediately
+fails the live-session control, and one that never returns fails the
+revocation proof. Note that the control cannot run at all against the
+pre-change code, since the constant it pins does not exist there.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

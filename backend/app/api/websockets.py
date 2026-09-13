@@ -27,7 +27,21 @@ from app.users.service import get_user_by_id
 router = APIRouter(tags=["websocket"])
 
 
-async def _authenticate(websocket: WebSocket) -> User | None:
+# How often an open socket re-checks that its session is still live.
+# Revocation is immediate over REST -- `get_current_user` looks the session
+# up on every request -- but a stream has no requests to hang that check
+# on, so it is a timer, and the residual is that a revoked session keeps
+# receiving for up to this long. Named rather than inlined so the cost is
+# visible: one small indexed lookup per open socket per interval.
+SESSION_RECHECK_SECONDS = 30.0
+
+
+async def _authenticate(websocket: WebSocket) -> tuple[User, uuid.UUID] | None:
+    """The authenticated user and the session its token was issued from.
+
+    The session id comes back with the user because authenticating once at
+    the handshake is not enough: see `_watch_for_revocation`.
+    """
     token = websocket.query_params.get("token")
     if not token:
         return None
@@ -51,7 +65,30 @@ async def _authenticate(websocket: WebSocket) -> User | None:
         user = await get_user_by_id(db, uuid.UUID(payload["sub"]))
     if user is None or user.status != UserStatus.ACTIVE:
         return None
-    return user
+    return user, uuid.UUID(session_id)
+
+
+async def _watch_for_revocation(session_id: uuid.UUID) -> None:
+    """Returns once `session_id` is no longer a live session.
+
+    The handshake check alone left revocation applying to REST and not to
+    streams. Measured: with a socket open on `/ws/orders`,
+    `POST /auth/sessions/{id}/revoke` answered 204, the same token then got
+    401 from every REST route -- and the socket went on delivering that
+    user's order events. A user revokes a session (a stolen laptop, a
+    shared machine) precisely to stop that, and blueprint §69 treats the
+    revocation as the thing that ends access.
+
+    Polling rather than listening: revocation is a Postgres UPDATE on
+    `user_sessions`, with no event anyone can subscribe to. Publishing one
+    would be the tighter design, and a bigger change than the hole
+    warrants.
+    """
+    while True:
+        await asyncio.sleep(SESSION_RECHECK_SECONDS)
+        async with async_session_factory() as db:
+            if await auth_service.get_active_session(db, session_id) is None:
+                return
 
 
 async def _forward(websocket: WebSocket, channel: str) -> None:
@@ -80,12 +117,18 @@ async def _watch_for_disconnect(websocket: WebSocket) -> None:
             return
 
 
-async def _relay(websocket: WebSocket, channel: str) -> None:
+async def _relay(websocket: WebSocket, channel: str, session_id: uuid.UUID | None = None) -> None:
     await websocket.accept()
-    forward_task = asyncio.ensure_future(_forward(websocket, channel))
-    watch_task = asyncio.ensure_future(_watch_for_disconnect(websocket))
+    tasks = {
+        asyncio.ensure_future(_forward(websocket, channel)),
+        asyncio.ensure_future(_watch_for_disconnect(websocket)),
+    }
+    if session_id is not None:
+        # Whichever finishes first ends the connection: the client goes
+        # away, the channel errors, or the session is revoked under it.
+        tasks.add(asyncio.ensure_future(_watch_for_revocation(session_id)))
     try:
-        done, pending = await asyncio.wait({forward_task, watch_task}, return_when=asyncio.FIRST_COMPLETED)
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in pending:
             task.cancel()
         for task in pending:
@@ -105,11 +148,12 @@ async def _relay(websocket: WebSocket, channel: str) -> None:
 
 
 async def _authenticated_relay(websocket: WebSocket, channel: str) -> None:
-    user = await _authenticate(websocket)
-    if user is None:
+    authenticated = await _authenticate(websocket)
+    if authenticated is None:
         await websocket.close(code=4401, reason="Unauthorized")
         return
-    await _relay(websocket, channel)
+    _user, session_id = authenticated
+    await _relay(websocket, channel, session_id)
 
 
 @router.websocket("/ws/market")
@@ -135,28 +179,31 @@ async def ws_signals(websocket: WebSocket, instrument_id: str | None = None) -> 
 
 @router.websocket("/ws/orders")
 async def ws_orders(websocket: WebSocket) -> None:
-    user = await _authenticate(websocket)
-    if user is None:
+    authenticated = await _authenticate(websocket)
+    if authenticated is None:
         await websocket.close(code=4401, reason="Unauthorized")
         return
-    await _relay(websocket, channel_name("orders", str(user.id)))
+    user, session_id = authenticated
+    await _relay(websocket, channel_name("orders", str(user.id)), session_id)
 
 
 @router.websocket("/ws/positions")
 async def ws_positions(websocket: WebSocket) -> None:
-    user = await _authenticate(websocket)
-    if user is None:
+    authenticated = await _authenticate(websocket)
+    if authenticated is None:
         await websocket.close(code=4401, reason="Unauthorized")
         return
-    await _relay(websocket, channel_name("positions", str(user.id)))
+    user, session_id = authenticated
+    await _relay(websocket, channel_name("positions", str(user.id)), session_id)
 
 
 @router.websocket("/ws/replay")
 async def ws_replay(websocket: WebSocket, session_id: str) -> None:
-    user = await _authenticate(websocket)
-    if user is None:
+    authenticated = await _authenticate(websocket)
+    if authenticated is None:
         await websocket.close(code=4401, reason="Unauthorized")
         return
+    user, auth_session_id = authenticated
     try:
         session_uuid = uuid.UUID(session_id)
     except ValueError:
@@ -172,4 +219,4 @@ async def ws_replay(websocket: WebSocket, session_id: str) -> None:
     if owned is None:
         await websocket.close(code=4404, reason="Replay session not found")
         return
-    await _relay(websocket, channel_name("replay", session_id))
+    await _relay(websocket, channel_name("replay", session_id), auth_session_id)

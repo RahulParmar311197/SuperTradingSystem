@@ -7282,6 +7282,49 @@ position that has just gone flat still holds the id until its cancel is
 confirmed, and flagging it in that window would halt the account for a stop
 being retired normally.
 
+## The emergency controls only existed in a Redis with no disk
+
+Two controls in this system are deliberately one-way, in the sense that
+only a human is supposed to lift them:
+
+* **account halts** (`halt:*`) — set by `ReconciliationWorker` when local
+  and broker state disagree, and by `POST /orders` when a position ends up
+  with no stop at the broker. Blueprint §75 makes resuming a deliberate
+  manual step, and `POST /admin/accounts/{id}/resume` records it with an
+  audit row;
+* **the kill switch** (blueprint §58) — global, per-account, per-strategy,
+  read by `RiskEngine.evaluate` and `evaluate_options_risk` on every
+  proposal.
+
+`app/core/redis.py` is the only store for either. And `docker-compose.yml`
+gave `postgres` a named volume while giving `redis` nothing at all: no
+volume, and no persistence configured, so both controls lived in the
+container's ephemeral layer. Recreating that container — an ordinary
+deploy — dropped them. An account halted because its positions disagreed
+with the broker would start trading again, with none of the audit trail
+the manual resume path leaves behind. The asymmetry sat in the same
+fifteen lines of one file, which is probably why it went unnoticed: the
+service that obviously holds state got a volume, the one that quietly holds
+the safety state did not.
+
+The fix is the same treatment `postgres` already had — a named
+`redis_data` volume and `--appendonly yes` — and three tests in
+`backend/tests/test_deployment_durability.py` that assert the *properties*
+(some durable volume, some persistence configured) rather than the exact
+spelling, so the deployment can change how it gets there without breaking
+them. The third is a control on `postgres`, so that if a future change
+strips both, the failure does not read as though only Redis mattered.
+
+**What this does not establish.** There is no Docker in this environment,
+so the container restart itself has never been exercised here — the
+evidence is the compose file and the code paths, not an observed restart.
+And AOF plus a volume only covers the ordinary restart: a genuine Redis
+data loss (a wiped volume, a fresh instance, a failover to an empty
+replica) still lifts every halt silently, because the halt exists nowhere
+else. The durable fix is to keep halts in Postgres and treat Redis as a
+cache of them, which changes how the control is modelled rather than how it
+is deployed; it is not taken here.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

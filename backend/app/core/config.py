@@ -56,6 +56,21 @@ class Settings(BaseSettings):
     # on nothing but test volume rather than actual abuse.
     rate_limit_enabled: bool = True
 
+    # How many trusted reverse proxies sit in front of this process.
+    # 0 (the default) means "none": the rate limiter keys on the socket
+    # peer, which is then the real client. Behind a proxy the peer is the
+    # *proxy*, so every user in the world shares one bucket -- measured
+    # with the repo's own `infrastructure/nginx/nginx.conf.example`:
+    # twelve distinct client IPs, and the eleventh and twelfth got 429.
+    # Set this to the number of proxies you actually run (1 for that nginx
+    # example) and the limiter reads that many entries back from the right
+    # of `X-Forwarded-For`, which is the address the innermost trusted
+    # proxy observed. It is deliberately opt-in rather than automatic:
+    # trusting the header with no proxy in front lets any client forge its
+    # own address, evading the limiter and locking other users out of
+    # login by forging theirs.
+    trusted_proxy_hops: int = 0
+
     @model_validator(mode="after")
     def _refuse_unsafe_defaults_in_production(self) -> "Settings":
         """`credentials_encryption_key`'s default isn't an obviously-invalid

@@ -110,6 +110,16 @@ For real deployment:
   environment reachable from the internet — it's only ever `false` in
   the test suite (see `tests/conftest.py`), where every request shares
   one client "IP".
+- **`TRUSTED_PROXY_HOPS` must match your topology.** The limiter keys on
+  the socket peer, which behind a reverse proxy is the proxy — the same
+  address for every user — so a per-IP limit silently becomes one global
+  bucket: measured against `infrastructure/nginx/nginx.conf.example`,
+  twelve distinct client addresses under a 10/minute login limit, and the
+  eleventh and twelfth were rejected. Set it to the number of proxies you
+  run (`1` for that nginx example, `2` for a CDN in front of it). Leave it
+  `0` when nothing proxies the API: the header is then ignored outright,
+  because a process with no proxy in front has no way to tell a real
+  `X-Forwarded-For` from one a client made up.
 - **CORS** (`CORS_ORIGINS`) defaults to empty (deny-all). Set it to your
   actual frontend origin(s) — never `*` alongside credentialed requests
   (this app doesn't use cookie auth, so that combination shouldn't come

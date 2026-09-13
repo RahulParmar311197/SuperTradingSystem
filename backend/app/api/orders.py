@@ -137,7 +137,22 @@ async def _stack_for(user: User, db: AsyncSession) -> _UserTradingStack:
         lock = _STACK_LOCKS.setdefault(user.id, asyncio.Lock())
         async with lock:
             if user.id not in _STACKS:
-                broker, broker_account_id = await resolve_broker(db, user)
+                try:
+                    broker, broker_account_id = await resolve_broker(db, user)
+                except BrokerError as exc:
+                    # `resolve_broker` refuses a connected account it
+                    # cannot build a working adapter for -- deliberately,
+                    # rather than falling back to `MockBroker` and making
+                    # a "live" order quietly paper (blueprint §101). Its
+                    # message names the account and the reason, and until
+                    # now nobody ever saw it: this call had no handler, so
+                    # every one of those refusals reached the client as a
+                    # 500. Measured on an Upstox account stored without an
+                    # access_token -- "Connected Upstox account <id> has no
+                    # access_token stored" became an unhandled exception.
+                    # 503, not 502: the broker did not fail, this process
+                    # cannot talk to it at all.
+                    raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
                 stack = _UserTradingStack(broker, broker_account_id)
                 # Rebuild the position book from its DB mirror before this
                 # stack is used for anything. Without it a restarted

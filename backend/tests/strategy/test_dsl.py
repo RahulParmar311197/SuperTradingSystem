@@ -116,3 +116,64 @@ def test_valid_entry_types_are_accepted_and_normalized(supplied, expected):
 def test_the_default_entry_type_is_still_a_market_entry():
     assert EntryConfig().type == "market"
     assert StrategyDefinition(name="S", market="X", timeframe="15m").entry.type == "market"
+
+
+# --- premium_discount needs the zone it compares against -------------------
+
+
+def test_premium_discount_without_a_zone_is_rejected():
+    """A `premium_discount` condition with no `zone` can never match.
+
+    Its evaluator arm ends in `condition.zone is not None and ...`, so the
+    zone-less form is false on every candle forever. Measured against a
+    live dealing range with `current_zone='PREMIUM'`: zone-less returned
+    False, `zone='premium'` returned True.
+
+    Conditions AND implicitly, so one of these zeroes the whole strategy --
+    which stores, lists and backtests like any other and simply never
+    produces a signal. Same ruling as the unfed condition types and the
+    unresolvable entry types above.
+    """
+    with pytest.raises(ValidationError) as excinfo:
+        Condition(type=ConditionType.PREMIUM_DISCOUNT)
+    assert "needs a zone" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_a_blank_zone_is_rejected_too(blank):
+    """Control on the boundary: an empty or whitespace string is the same
+    unusable state as the field being absent, and `.strip()` is what makes
+    them agree."""
+    with pytest.raises(ValidationError):
+        Condition(type=ConditionType.PREMIUM_DISCOUNT, zone=blank)
+
+
+@pytest.mark.parametrize("zone", ["premium", "discount", "equilibrium", "PREMIUM"])
+def test_a_stated_zone_is_accepted(zone):
+    """Control: this validator refuses an absent zone, not a zone it
+    dislikes. Case is left as written -- the evaluator lowercases both
+    sides when it compares."""
+    assert Condition(type=ConditionType.PREMIUM_DISCOUNT, zone=zone).zone == zone
+
+
+def test_an_unrecognised_zone_is_still_accepted():
+    """Control on the scope, and deliberately so.
+
+    A misspelled zone also never matches, but `_validate_bias`'s docstring
+    records leaving free-text `side`/`zone` values to fail closed as an
+    intentional decision. This validator fills the gap that decision does
+    not cover -- a value the author never supplied -- and does not overturn
+    it. If that changes, this test is the one that should be rewritten
+    first, on purpose rather than by accident.
+    """
+    assert Condition(type=ConditionType.PREMIUM_DISCOUNT, zone="premuim").zone == "premuim"
+
+
+@pytest.mark.parametrize(
+    "condition_type", [ConditionType.FVG, ConditionType.ORDER_BLOCK, ConditionType.TREND, ConditionType.SESSION]
+)
+def test_the_other_types_still_treat_an_omitted_optional_as_any(condition_type):
+    """Control: the asymmetry this fixes was real, and only in one arm.
+    Every other type reads an omitted optional as "any" and must keep
+    constructing without one."""
+    assert Condition(type=condition_type).type is condition_type

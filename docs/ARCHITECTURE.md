@@ -7469,6 +7469,51 @@ still want an IST session open. If someone "fixes" the function to convert
 zones internally, those fail — which is the correct outcome, because the
 function's contract is the one thing here that was never broken.
 
+## A `premium_discount` condition with no zone (§33-34)
+
+`Condition.zone` is optional, and the DSL accepted
+`{"type": "premium_discount"}` with nothing in it. The evaluator's arm for
+that type ends in `condition.zone is not None and ...`, so the zone-less
+form is false on every candle forever. Measured directly: with a live
+dealing range and `current_zone='PREMIUM'`, the zone-less condition
+returned `False` where `zone='premium'` returned `True`.
+
+What makes it worth a guard rather than a docstring is that conditions AND
+implicitly (`evaluate_conditions`). One unsatisfiable condition does not
+narrow a strategy — it zeroes it. The strategy still validates, stores,
+lists and backtests like any other; it simply never produces a signal, and
+nothing anywhere says why.
+
+Every *other* condition type reads an omitted optional as "any": an `fvg`
+with no `direction` matches a gap either way, an `order_block` likewise, a
+`session` with no name matches any kill zone. So there were two coherent
+readings — make `premium_discount` match the others, or refuse the form.
+Refusing it is the ruling, chosen deliberately: it is the same call
+`_reject_unfed_condition_types` makes for condition types no data source
+feeds (§88's fix) and `_reject_unknown_entry_types` makes for `entry.type`
+— fail at authoring time rather than look alive and do nothing. Treating
+the omission as "any zone" would instead invent a meaning the author never
+wrote, in the one place where the field *is* the comparison. `POST
+/strategies` now returns 422 naming the field.
+
+A blank or whitespace-only zone is refused on the same grounds; it is the
+same absence with a different spelling.
+
+**Deliberately not widened:** a *misspelled* zone (`zone="premuim"`) is
+still accepted, and still fails closed. That is not an oversight — it is
+the choice `_validate_bias`'s docstring already records for free-text
+`side`/`zone` values, and overturning it is a separate decision from
+filling this gap. `backend/tests/strategy/test_dsl.py` pins it as a
+control: tightening the validator to a zone allow-list breaks that test,
+which is the signal that a wider decision is being made.
+
+One existing test changed.
+`test_lookback_defaults_follow_the_events_formation_time[premium_discount]`
+built a zone-less condition purely to read its `lookback` default, so the
+new validator rejected it. The test was
+wrong, not the change: `zone` has no bearing on the lookback table, and the
+test now passes `zone="premium"` with a comment saying why.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

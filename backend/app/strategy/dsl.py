@@ -162,6 +162,43 @@ class Condition(BaseModel):
             self.lookback = _DEFAULT_LOOKBACK_BY_TYPE.get(self.type, _DEFAULT_LOOKBACK)
         return self
 
+    @model_validator(mode="after")
+    def _reject_premium_discount_without_a_zone(self) -> "Condition":
+        """Rejects `premium_discount` with no `zone`, which can never match.
+
+        Every other condition type reads an omitted optional as "any": an
+        `fvg` with no direction matches a gap either way, an
+        `order_block` likewise, a `session` with no name matches any kill
+        zone. `premium_discount` is the exception -- its evaluator arm ends
+        in `condition.zone is not None and ...`, so leaving the field out
+        makes the condition false on every candle forever. Measured with a
+        live dealing range and `current_zone='PREMIUM'`: the zone-less
+        condition returns False while `zone='premium'` returns True.
+
+        Accepted silently, that is worse than it sounds. Conditions AND
+        implicitly (`evaluate_conditions`), so one of them zeroes the whole
+        strategy -- the strategy stores, lists and backtests like any
+        other, and simply never produces a signal. This is the same ruling
+        `_reject_unfed_condition_types` above makes for the condition types
+        nothing feeds, and `_reject_unknown_entry_types` makes for
+        `entry.type`: fail at authoring time rather than look alive and do
+        nothing.
+
+        Deliberately *not* extended to an unrecognised zone string. Those
+        fail closed too, but `_validate_bias`'s docstring records leaving
+        free-text `side`/`zone` values alone as an intentional choice, and
+        widening it here would overturn that decision rather than fill the
+        gap this validator is for: a value the author never supplied at
+        all.
+        """
+        if self.type is ConditionType.PREMIUM_DISCOUNT and not (self.zone or "").strip():
+            raise ValueError(
+                "a premium_discount condition needs a zone (e.g. zone='premium' or "
+                "zone='discount'); without one it can never match, and because "
+                "conditions AND together it would stop the whole strategy from ever firing"
+            )
+        return self
+
     @field_validator("type")
     @classmethod
     def _reject_unfed_condition_types(cls, v: ConditionType) -> ConditionType:

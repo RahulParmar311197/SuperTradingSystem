@@ -7686,6 +7686,71 @@ validation, *before* the order is registered under its idempotency key,
 so repeated attempts kept failing cleanly rather than poisoning that
 order forever.
 
+## The Sortino ratio's denominator (§48)
+
+`compute_metrics` built Sortino's denominator as `_std` of the *losing*
+returns — the sample standard deviation of the losses about their own
+mean, i.e. how much the losses differed from each other. The Sortino
+ratio is defined against the **downside deviation**: the root-mean-square
+shortfall below the target, over every observation. Those are different
+questions and give different numbers. Below two losing trades the code
+switched to a third formula again, `abs(r)`.
+
+Measured against the textbook value on a 100,000 account:
+
+| run | reported | correct |
+|---|---|---|
+| three wins, three identical −2,000 losses | `None` | 1.0607 |
+| a single losing trade | 1.0 | 2.0 |
+| losses of differing size | 0.8729 | 0.7127 |
+| three identical losses, no wins | `None` | −1.0 |
+
+The first row is the one that matters. `RiskLimits.risk_per_trade_pct`
+sizes every position so that a stop costs the same fixed fraction of the
+account, so **equal-sized losses are the normal shape for this platform's
+own strategies** — and that is exactly when the spread of the losses is
+zero and the old form reported the ratio as undefined. A strategy doing
+precisely what the risk engine asks of it was the case the metric could
+not describe.
+
+`_downside_deviation(values, target=0.0)` replaces both branches. It
+divides by N, every observation, not by the count of losing ones: a
+winning period genuinely contributes zero downside, and dividing by only
+the losers would make a strategy look better the more often it won, which
+inverts the metric. That also keeps it comparable with `sharpe`, which
+divides by the same N. The N versus N−1 difference from `_std` is
+deliberate — this is an RMS about a fixed target, not a dispersion
+estimated about a sample mean. The denominator still yields `None` rather
+than an infinity when nothing fell below the target, for the reason §68
+records: `backtest_metrics.sortino` is `Numeric(10, 4)`, and the replay
+statistics beside it go into a Postgres `json` column that rejects the
+bare `Infinity` token.
+
+**Severity: reporting.** `sortino` is stored and served; it gates
+nothing. But it is a number a person reads when deciding whether to trade
+a strategy, and it is half of what §37's out-of-sample validation puts
+side by side. No test asserted either ratio before this round, which is
+how it survived.
+
+`sharpe` is untouched and now has a control test pinning it as the
+ordinary sample-deviation ratio over all returns, so a future change
+cannot quietly give the two ratios one denominator.
+
+**Negative results from the same survey**, recorded so they are not
+re-run. The kill switch *is* reloaded on the autonomous path — the
+supervisor drives `PaperTradingEngine`, which refreshes it every candle.
+Look-ahead is clean: every `SMCEngine.analyze` caller passes a sliced or
+growing candle list, and `detect_swings` cannot emit an unconfirmed swing
+from a truncated slice by construction, which leaves `visible_swings`
+dead but harmless. `OptionChainSnapshot`, `OptionContract` and
+`OptionSnapshot` have no writers anywhere; both readers handle the
+absence, and the options-execute path tells the caller "no liquidity data
+available — not evaluated" rather than pretending. That last one, and the
+0.0 defaults for `market_data_age_seconds` and `premium_deviation_pct`,
+are the documented "honestly degraded" choice and belong to the open
+question about whether *no* market data should fail closed — not settled
+here.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

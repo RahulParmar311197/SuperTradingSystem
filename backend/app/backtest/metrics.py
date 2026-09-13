@@ -36,6 +36,40 @@ def _std(values: list[float]) -> float:
     return math.sqrt(variance)
 
 
+def _downside_deviation(values: list[float], target: float = 0.0) -> float:
+    """Root-mean-square shortfall below `target`, over **every** value.
+
+    This is the Sortino ratio's denominator, and it is not a standard
+    deviation of the losses. The distinction is the whole bug this
+    replaced: the old code took `_std` of only the negative returns, i.e.
+    how much the losses differed *from each other*, which answers a
+    different question and gives a different number. Measured on a
+    100,000 account:
+
+    * three wins and three identical -2,000 losses -> the old form
+      reported `None` ("undefined", because identical losses have zero
+      spread) where the ratio is 1.0607. That case is not exotic here:
+      `RiskLimits.risk_per_trade_pct` sizes every position so that a stop
+      costs the same fixed fraction, so equal-sized losses are the
+      *normal* shape for this platform's own strategies.
+    * a single losing trade -> 1.0 against a true 2.0, from a third
+      definition (`abs(r)`) the old code switched to below two losses.
+    * losses of differing size -> 0.8729 against a true 0.7127, i.e.
+      flattering by 22%.
+
+    Divided by N, every observation, not by the count of losing ones: a
+    winning period genuinely contributes zero downside, and dividing by
+    only the losers would make a strategy look better the more often it
+    won, which inverts the metric. That also keeps it comparable with
+    `sharpe` above, which divides by the same N. The N vs N-1 difference
+    from `_std` is deliberate too -- this is an RMS about a fixed target,
+    not a dispersion estimated about a sample mean.
+    """
+    if not values:
+        return 0.0
+    return math.sqrt(sum(min(v - target, 0.0) ** 2 for v in values) / len(values))
+
+
 def compute_metrics(trades: list, starting_capital: float) -> BacktestMetricsResult:
     """`trades` is a list of objects with: direction ("LONG"/"SHORT"), pnl,
     r_multiple (optional), closed_at (datetime)."""
@@ -77,9 +111,14 @@ def compute_metrics(trades: list, starting_capital: float) -> BacktestMetricsRes
         std_return = _std(returns_pct)
         sharpe = mean_return / std_return if std_return > 0 else None
 
-        downside = [r for r in returns_pct if r < 0]
-        downside_std = _std(downside) if len(downside) > 1 else (abs(downside[0]) if downside else 0.0)
-        sortino = mean_return / downside_std if downside_std > 0 else None
+        # `None`, never `float("inf")`, when nothing fell below the
+        # target -- `backtest_metrics.sortino` is `Numeric(10, 4)` and the
+        # replay statistics alongside it go into a Postgres `json` column,
+        # neither of which can hold an infinity (see
+        # app/replay/statistics.py's `profit_factor` for the session that
+        # wedged on exactly that).
+        downside_deviation = _downside_deviation(returns_pct)
+        sortino = mean_return / downside_deviation if downside_deviation > 0 else None
 
     monthly_returns: dict[str, float] = defaultdict(float)
     for trade in trades:

@@ -7628,6 +7628,64 @@ only. Whether a broker-side rejection deserves one is a real question and
 a separate one; this round only made sure the order row survives to be
 the record.
 
+## A broker connection that cannot trade (§50-53, §120)
+
+`resolve_broker` picks the most recent ACTIVE `BrokerAccount` for every
+order a user places. An account it cannot build a working adapter from
+therefore does not degrade that user's trading — it stops it. Both of
+these were accepted at **201 ACTIVE** and then broke every subsequent
+order with a 500:
+
+- `{"broker": "DHAN", ...}`. `DhanBroker` is a documented skeleton: every
+  method raises `NotImplementedError`, because per blueprint §51/§120 it
+  has to be written against Dhan's *current* official API rather than a
+  guess baked into this repo. Measured: `POST /orders` returned
+  `NotImplementedError: TODO: implement using Dhan's market quote / LTP
+  endpoint`, from several frames below the endpoint, every time.
+- `{"broker": "UPSTOX", "credentials": {"nope": "x"}}`. Here
+  `resolve_broker` already *had* the diagnosis — it raises
+  `BrokerError("Connected Upstox account <id> has no access_token
+  stored")` on purpose. `_stack_for` simply called it with no handler, so
+  that sentence died in a traceback and the client got a 500.
+
+The resolver's own docstring explains why it refuses rather than falling
+back to `MockBroker`: blueprint §101, never make paper and live look
+identical — "a user who connected a broker and gets an error knows
+something is wrong". The reasoning was right and the delivery was
+missing.
+
+Two layers, because they cover different people:
+
+- **The connect boundary** turns away what cannot trade — DHAN with 501,
+  an Upstox connection with no `access_token` with 422 naming the key —
+  and stores no row, since a stored ACTIVE row is the thing that breaks
+  the orders. Same ruling as the DSL's refusal of conditions nothing can
+  satisfy and entry types the engine cannot resolve: fail where the
+  person can still act on it.
+- **`resolve_broker` and `_stack_for`** cover accounts already stored
+  before that guard existed. The resolver now refuses DHAN outright
+  instead of handing back a skeleton, and `_stack_for` turns any
+  `BrokerError` into **503** carrying the resolver's message — 503 rather
+  than 502 because the broker did not fail; this process cannot talk to
+  it at all. That covers `/orders`, `/positions`, `/portfolio` and
+  `/options/execute`, all of which build their stack through it.
+
+**Not done here: implementing the Dhan adapter.** That needs Dhan's
+current API, which this environment cannot reach, and the adapter's own
+docstring plus §120 are explicit that guessing at it is the wrong move.
+This round makes the gap legible instead of fatal.
+
+**One existing test asserted the opposite** — that a Dhan account
+resolves to a `DhanBroker` — and it did, which was the bug: the assertion
+pinned the handover of an object whose every method raises. It is now
+`test_active_dhan_account_is_refused_rather_than_handed_a_skeleton`, with
+the history in its docstring.
+
+No wedged orders, and the PR says so: the Dhan failure happens in quote
+validation, *before* the order is registered under its idempotency key,
+so repeated attempts kept failing cleanly rather than poisoning that
+order forever.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

@@ -37,13 +37,46 @@ async def list_brokers(user: User = Depends(get_current_user), db: AsyncSession 
     return (await db.execute(stmt)).scalars().all()
 
 
+def _reject_unusable_connection(payload: ConnectBrokerRequest) -> None:
+    """Refuses a broker/credentials pair no adapter could trade with.
+
+    Same ruling the strategy DSL makes for conditions nothing can satisfy
+    and entry types the engine cannot resolve: fail where the person can
+    still act on it, rather than accept, look connected, and fail opaquely
+    later.
+    """
+    if payload.broker is BrokerName.DHAN:
+        raise HTTPException(
+            status.HTTP_501_NOT_IMPLEMENTED,
+            "The Dhan adapter is not implemented yet (app/brokers/dhan/adapter.py is a "
+            "skeleton -- see blueprint §120). Connect an Upstox account, or use paper "
+            "trading, until it is written against Dhan's current API.",
+        )
+    if payload.broker is BrokerName.UPSTOX and not payload.credentials.get("access_token"):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "An Upstox connection needs an 'access_token' in credentials. Prefer the OAuth "
+            "flow (GET /brokers/upstox/authorize), which stores one for you.",
+        )
+    # BrokerName.PAPER needs no credentials at all -- it resolves to
+    # MockBroker, which is the honest default rather than a degraded mode.
+
+
 @router.post("/connect", response_model=BrokerAccountResponse, status_code=status.HTTP_201_CREATED)
 async def connect_broker(
     payload: ConnectBrokerRequest, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
 ) -> BrokerAccount:
-    # NOTE: this only stores credentials encrypted at rest. Before enabling
-    # live trading, the broker adapter (see app/brokers/dhan, app/brokers/upstox)
-    # must actually authenticate with them (blueprint §120 step 3).
+    # This only stores credentials encrypted at rest -- it does not
+    # authenticate with them (blueprint §120 step 3). What it must not do
+    # is accept a connection that cannot possibly trade, because
+    # `resolve_broker` picks the most recent ACTIVE account for every
+    # order the user places afterwards. Measured before this guard: both
+    # `{"broker": "DHAN", ...}` and an Upstox connect with no
+    # `access_token` returned 201 ACTIVE, and every later `POST /orders`
+    # came back 500 -- `NotImplementedError` from the Dhan skeleton's
+    # quote call, and `BrokerError` from the resolver -- with nothing
+    # telling the user their broker connection was the reason.
+    _reject_unusable_connection(payload)
     account = BrokerAccount(
         user_id=user.id,
         broker=payload.broker,

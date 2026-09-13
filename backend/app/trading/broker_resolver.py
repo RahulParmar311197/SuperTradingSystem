@@ -29,7 +29,6 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.brokers.base import Broker, BrokerError
-from app.brokers.dhan.adapter import DhanBroker
 from app.brokers.mock import MockBroker
 from app.brokers.upstox.adapter import UpstoxBroker
 from app.core.encryption import decrypt_credentials
@@ -62,11 +61,26 @@ async def resolve_broker(db: AsyncSession, user: User) -> tuple[Broker, uuid.UUI
         return UpstoxBroker(access_token=access_token), account.id
 
     if account.broker == BrokerName.DHAN:
-        client_id = credentials.get("client_id")
-        access_token = credentials.get("access_token")
-        if not client_id or not access_token:
-            raise BrokerError(f"Connected Dhan account {account.id} is missing client_id/access_token")
-        return DhanBroker(client_id=client_id, access_token=access_token), account.id
+        # `DhanBroker` is a documented skeleton: every method of it raises
+        # `NotImplementedError` (see its module docstring and blueprint
+        # §51/§120 -- it must be written against Dhan's *current* official
+        # API, not a guess). Handing one back meant the failure surfaced
+        # several frames deeper as a raw `NotImplementedError`: measured,
+        # `POST /orders` for a user with a connected Dhan account came back
+        # 500 with "TODO: implement using Dhan's market quote / LTP
+        # endpoint", every time, with nothing telling them their broker is
+        # the reason.
+        #
+        # Refusing here keeps this module's existing rule -- never silently
+        # fall back to `MockBroker`, blueprint §101 "never make paper and
+        # live look identical" -- while making the refusal legible.
+        # `POST /brokers/connect` now turns DHAN away at the door, so this
+        # covers accounts stored before that guard existed.
+        raise BrokerError(
+            f"Connected Dhan account {account.id} cannot trade: the Dhan adapter is not "
+            "implemented yet (app/brokers/dhan/adapter.py). Disconnect it, or connect an "
+            "Upstox account, to place orders."
+        )
 
     # BrokerName.PAPER — an explicit paper-mode "connection" trades mock.
     return MockBroker(starting_balance=100_000.0), account.id

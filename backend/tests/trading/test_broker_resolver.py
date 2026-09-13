@@ -4,7 +4,6 @@ import pytest
 from sqlalchemy import delete
 
 from app.brokers.base import BrokerError
-from app.brokers.dhan.adapter import DhanBroker
 from app.brokers.mock import MockBroker
 from app.brokers.upstox.adapter import UpstoxBroker
 from app.core.encryption import encrypt_credentials
@@ -74,7 +73,19 @@ async def test_active_upstox_account_resolves_to_a_real_upstox_broker(require_in
             await _cleanup(user.id)
 
 
-async def test_active_dhan_account_resolves_to_a_dhan_broker(require_infra):
+async def test_active_dhan_account_is_refused_rather_than_handed_a_skeleton(require_infra):
+    """This test used to assert the opposite -- that a Dhan account
+    resolves to a `DhanBroker`. It did, and that was the bug: every method
+    of `DhanBroker` raises `NotImplementedError` (it is a documented
+    skeleton, blueprint §51/§120), so the failure surfaced several frames
+    later as a raw 500. Measured: `POST /orders` for a user with a
+    connected Dhan account returned "TODO: implement using Dhan's market
+    quote / LTP endpoint", every time.
+
+    Refusing here keeps this module's existing rule -- never fall back to
+    `MockBroker` and make a "live" order quietly paper (blueprint §101) --
+    while making the refusal something a caller can render.
+    """
     async with async_session_factory() as db:
         user = await _make_user(db)
         account = BrokerAccount(
@@ -86,11 +97,10 @@ async def test_active_dhan_account_resolves_to_a_dhan_broker(require_infra):
         db.add(account)
         await db.commit()
         try:
-            broker, broker_account_id = await resolve_broker(db, user)
-            assert isinstance(broker, DhanBroker)
-            assert broker.client_id == "cid-1"
-            assert broker.access_token == "tok-1"
-            assert broker_account_id == account.id
+            with pytest.raises(BrokerError) as excinfo:
+                await resolve_broker(db, user)
+            assert str(account.id) in str(excinfo.value)
+            assert "not implemented" in str(excinfo.value).lower()
         finally:
             await _cleanup(user.id)
 

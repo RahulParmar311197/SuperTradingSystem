@@ -7371,6 +7371,59 @@ fails the live-session control, and one that never returns fails the
 revocation proof. Note that the control cannot run at all against the
 pre-change code, since the constant it pins does not exist there.
 
+## Kill zones were read in the caller's timezone, not UTC
+
+`KillZone` declares `start_hour_utc` / `end_hour_utc`, and
+`app/ict/killzones.py` opens by calling them UTC windows. `active_kill_zones`
+then read `candle.timestamp.hour` — the hour in whatever zone the timestamp
+happens to carry. One instant, two spellings, two answers:
+
+```
+2026-01-05T03:45:00+00:00  ==  2026-01-05T09:15:00+05:30   (Python: True)
+  as UTC  -> ['ASIAN']
+  as IST  -> ['LONDON']
+```
+
+IST is the natural spelling for an NSE client, and `POST /paper/{id}/candle`
+takes the timestamp straight from the request body, so nothing unusual is
+required to hit it. Across one NSE session, three of four sampled times came
+out in the wrong zone:
+
+| NSE clock | reported | actual |
+|---|---|---|
+| 09:15 IST | LONDON | ASIAN |
+| 11:00 IST | — | — |
+| 13:00 IST | NEW_YORK | LONDON |
+| 15:15 IST | LONDON_CLOSE | LONDON |
+
+This is not a display detail. `ConditionType.SESSION`
+(`app/strategy/evaluator.py`) matches a strategy's session condition against
+`ICTContext.current_kill_zones`, so a strategy restricted to the London kill
+zone was firing during the Asian session — silently, and only for clients
+who send their own timezone.
+
+`_utc_hour` normalises before the comparison. A **naive** timestamp is read
+as UTC explicitly rather than handed to `astimezone()`, which would assume
+the *machine's* zone: the same bug one layer down, and one a UTC-configured
+CI could never catch. A control test moves the process `TZ` to
+`Asia/Kolkata` and asserts a naive timestamp still reads as UTC, so that
+shortcut fails the suite rather than passing it.
+
+**Checked and deliberately left alone.** Two neighbours look similar and are
+not the same defect. `detect_opening_ranges` compares a caller-supplied
+`session_open` against `ts.replace(hour=…)`, which is consistent by
+construction: the session open is expressed in the same zone as the candles,
+and the function never claims UTC. `bucket_start`'s weekly anchor reads
+`timestamp.weekday()` the same way, and its inputs come from Postgres, where
+the column is `TIMESTAMP WITH TIME ZONE` and values arrive aware and in UTC.
+Neither contradicts its own declared units the way the kill zones did.
+
+There was no test module for ICT kill zones before this; there is one now,
+`backend/tests/ict/test_killzones.py`. Note that one of the four sampled
+session times (11:00 IST) falls in no zone under either reading, so that
+parametrised case is a control rather than a proof — the other three fail
+on the pre-change code.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

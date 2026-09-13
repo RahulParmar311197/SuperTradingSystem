@@ -20,6 +20,15 @@ class OpeningRange:
 def detect_opening_ranges(
     candles: list[Candle], session_open: time, duration_minutes: int = 15
 ) -> list[OpeningRange]:
+    """`session_open` is a bare clock time, compared against each candle's
+    own `.replace(hour=..., minute=...)`, so it must be expressed in the
+    same timezone the candles carry.
+
+    That contract is the caller's to keep, and `ICTConfig` used to break
+    it: its default was the NSE open written in IST while every candle in
+    this system arrives from Postgres in UTC. See
+    `ICTConfig.session_open_utc`.
+    """
     ranges: list[OpeningRange] = []
     if not candles:
         return ranges

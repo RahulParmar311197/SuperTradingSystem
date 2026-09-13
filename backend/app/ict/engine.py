@@ -18,7 +18,24 @@ class ICTConfig:
     enable_session_levels: bool = True
     enable_opening_range: bool = True
     kill_zones: list[KillZone] = field(default_factory=lambda: list(DEFAULT_KILL_ZONES))
-    session_open: time = time(9, 15)
+    # **UTC**, like `KillZone`'s window bounds, and named so that is
+    # visible at every use site. `detect_opening_ranges` compares this
+    # clock time against the candle's own, so it has to be expressed in
+    # the zone the candles carry -- and every candle in this system comes
+    # from Postgres, where the column is `TIMESTAMP WITH TIME ZONE` and
+    # values arrive in UTC.
+    #
+    # The default used to be `time(9, 15)`: the NSE open, but written in
+    # IST and handed to UTC data. Measured on one NSE day stamped in UTC,
+    # that anchored the "opening range" at 09:15 UTC = 14:45 IST -- the
+    # middle of the afternoon -- reporting ordinary mid-session bars and
+    # missing the real opening fifteen minutes entirely. No caller
+    # overrides this field, so every opening range the system produced was
+    # the wrong bars.
+    #
+    # 03:45 UTC *is* 09:15 IST. A deployment trading anything but NSE has
+    # to set this; there is no session calendar here to derive it from.
+    session_open_utc: time = time(3, 45)
     opening_range_minutes: int = 15
 
 
@@ -54,7 +71,7 @@ class ICTEngine:
         opening_ranges: list[OpeningRange] = []
         if cfg.enable_opening_range:
             opening_ranges = detect_opening_ranges(
-                candles, cfg.session_open, cfg.opening_range_minutes
+                candles, cfg.session_open_utc, cfg.opening_range_minutes
             )
 
         return ICTContext(

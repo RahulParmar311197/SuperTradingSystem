@@ -7424,6 +7424,51 @@ session times (11:00 IST) falls in no zone under either reading, so that
 parametrised case is a control rather than a proof — the other three fail
 on the pre-change code.
 
+## The opening range was anchored five and a half hours late
+
+The round above left a note saying `detect_opening_ranges` is
+zone-consistent by construction: it compares a caller-supplied clock time
+against each candle's own, so the two only have to agree. That is true of
+the **function**, and it was not true of the **default feeding it**.
+
+`ICTConfig.session_open` defaulted to `time(9, 15)` — the NSE open, written
+in IST — while every candle in this system comes from Postgres, where the
+column is `TIMESTAMP WITH TIME ZONE` and values arrive in UTC. Measured on
+one NSE day of 5-minute candles stamped in UTC, with the opening fifteen
+minutes deliberately made the day's extremes:
+
+```
+ICTConfig().session_open = 09:15:00
+  detected opening range: high=150.0 low=140.0
+     starts at 2026-01-05T09:15:00+00:00 = 14:45 IST
+  the real opening 15 minutes: high=200.0 low=100.0 starting 09:15 IST
+```
+
+09:15 UTC is 14:45 IST — the middle of the afternoon session. And none of
+the five `ICTConfig()` construction sites in `app/` passes this field, so
+every opening range the system produced was the wrong bars.
+
+The field is now `session_open_utc`, defaulting to `time(3, 45)`, which
+*is* 09:15 IST. The rename is the point as much as the number: the sibling
+module spells its bounds `start_hour_utc`/`end_hour_utc`, and the unit
+being invisible at the use site is what let an IST literal sit in a UTC
+slot. A deployment trading anything but NSE has to set it — there is no
+session calendar here to derive it from.
+
+**Severity: reporting, not a trade gate.** `opening_ranges` is read by
+`app/api/charts.py`'s ICT serialiser (shared with replay analysis) and by
+the AI proposal context. No `ConditionType` reads it, unlike the kill
+zones, so this was a wrong number on a chart and a wrong input to an AI
+suggestion — not a wrong entry.
+
+`backend/tests/ict/test_opening_range.py` is new; the module had no tests.
+Two of its cases are controls that pass in both directions and exist to
+keep the diagnosis straight: handing the function an IST clock time
+against UTC candles still picks the 14:45 bars, and IST-stamped candles
+still want an IST session open. If someone "fixes" the function to convert
+zones internally, those fail — which is the correct outcome, because the
+function's contract is the one thing here that was never broken.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

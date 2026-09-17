@@ -8267,6 +8267,53 @@ completing rather than on a log line: the app configures its own logging,
 and pinning the message would test that configuration instead of this
 behaviour.
 
+## A Redis outage made login a 500 (§69, §72)
+
+`check_rate_limit` is a bare `redis.incr`/`expire` with no error handling,
+and the `rate_limit` dependency did not catch it. Measured through the
+real app with Redis refusing connections:
+
+```
+POST /auth/login      -> 500   (unhandled ConnectionError)
+POST /auth/register   -> 500   (unhandled ConnectionError)
+```
+
+500 is the wrong answer whichever way the policy goes. It tells the client
+this service has a defect when the truth is that a dependency is
+unreachable, and `app/core/middleware.py` counts an unhandled exception
+into `http_requests_total{status_code="500"}` — so a Redis blip lands in
+the metric an operator watches for real bugs, on the two endpoints most
+likely to be hit while they are trying to diagnose the outage.
+
+The dependency now catches it, logs which way it went, and answers **503
+with `Retry-After: 5`**:
+
+```
+POST /auth/login      -> 503   Retry-After=5
+POST /auth/register   -> 503   Retry-After=5
+```
+
+**The policy is now a setting rather than an accident.** `rate_limit_fail_open`
+defaults to `False`, which keeps exactly what the 500 did — deny — so this
+change fixes the status code without quietly weakening brute-force
+protection. Both readings are defensible and neither is free:
+
+* **Deny** (default): nobody logs in while Redis is down, *including the
+  operator*, who needs the admin endpoints to resume halted accounts and
+  lift the kill switch — and both of those live in Redis too.
+* **Allow**: login stays up, and brute-force protection is gone for the
+  duration, which is precisely when an attacker who caused the outage
+  would want it gone.
+
+Which one this deployment should run is a decision for the operator, not
+one to take inside a bug fix. It is left at the conservative default and
+raised explicitly.
+
+What this does **not** change: the limiter's behaviour when Redis is
+healthy. Under the limit it allows, over it still returns 429, and there
+is a control test pinning that neither the 503 nor the fail-open branch is
+involved on that path.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

@@ -3,10 +3,18 @@ register) — basic brute-force / abuse mitigation."""
 
 from __future__ import annotations
 
+import logging
+
 from fastapi import HTTPException, Request, status
 
 from app.core.config import get_settings
 from app.core.redis import check_rate_limit
+
+logger = logging.getLogger("core.rate_limit")
+
+# What a denied-because-unavailable response tells the client to wait.
+# Short: a Redis blip is usually seconds, and this is the login page.
+_UNAVAILABLE_RETRY_AFTER_SECONDS = 5
 
 
 def client_ip(request: Request, trusted_proxy_hops: int) -> str:
@@ -58,11 +66,36 @@ def rate_limit(limit: int, window_seconds: int, key_prefix: str):
         settings = get_settings()
         if not settings.rate_limit_enabled:
             return
-        allowed = await check_rate_limit(
-            f"{key_prefix}:{client_ip(request, settings.trusted_proxy_hops)}",
-            limit,
-            window_seconds,
-        )
+        try:
+            allowed = await check_rate_limit(
+                f"{key_prefix}:{client_ip(request, settings.trusted_proxy_hops)}",
+                limit,
+                window_seconds,
+            )
+        except Exception:
+            # `check_rate_limit` is a bare `redis.incr`/`expire`
+            # (app/core/redis.py) and nothing used to catch this, so a
+            # Redis outage raised straight through the dependency and
+            # `POST /auth/login` answered 500 -- measured. That is the
+            # wrong answer whichever way the policy goes: it claims this
+            # service has a defect when the truth is that a dependency is
+            # unreachable, and `app/core/middleware.py` counts it into
+            # `http_requests_total{status_code="500"}`, so a Redis blip
+            # shows up in the metric an operator watches for real bugs.
+            logger.exception(
+                "Rate limiter could not reach Redis for %s; %s",
+                key_prefix,
+                "allowing the request (rate_limit_fail_open=True)"
+                if settings.rate_limit_fail_open
+                else "refusing the request (rate_limit_fail_open=False)",
+            )
+            if settings.rate_limit_fail_open:
+                return
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Rate limiting is temporarily unavailable — try again shortly",
+                headers={"Retry-After": str(_UNAVAILABLE_RETRY_AFTER_SECONDS)},
+            ) from None
         if not allowed:
             raise HTTPException(
                 status.HTTP_429_TOO_MANY_REQUESTS,

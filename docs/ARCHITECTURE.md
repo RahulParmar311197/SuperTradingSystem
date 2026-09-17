@@ -7810,6 +7810,70 @@ without touching the transport code around it.
 ("NSE_INDEX|Nifty 50"). `Instrument` has no column for it, so no live call
 can currently name an instrument. That is the next piece.
 
+## Naming an instrument to a market-data provider (§14, §52)
+
+`Instrument.symbol` is a trading symbol — "INFY", "NIFTY". Upstox names
+instruments as `"NSE_EQ|INE009A01021"` or `"NSE_INDEX|Nifty 50"` and
+accepts nothing else; its adapter's own rollout checklist has said so
+since it was written. Nothing in this codebase translated between the two,
+so **no market-data call could name an instrument at all** — the client
+added alongside it had no way to be pointed at anything.
+
+`instruments.broker_instrument_key` (nullable, indexed) holds it.
+Nullable because it is provider-specific and absent for every row until a
+master file is loaded — an instrument without one is still perfectly
+usable for paper trading and for backtests on candles that arrived some
+other way.
+
+`resolve_instrument_key` turns the absence into a legible failure naming
+the instrument and the remedy, rather than returning the plain symbol as a
+fallback. A symbol Upstox does not recognise comes back as an opaque
+rejection several layers from the cause; this is the same ruling §116
+makes for a broker account no adapter can be built from. `backfill_candles`
+resolves **before** it calls the provider, so a missing key costs no
+request.
+
+Matching is **case-insensitive on both sides**, and that is not
+fastidiousness: Upstox's master is not consistent with itself. Equities
+carry an upper-case `trading_symbol` ("INFY") while indices carry a
+title-cased one ("Nifty 50"). Exact matching silently misses every index,
+which on an NSE-focused platform is most of what anyone wants to trade.
+
+`apply_instrument_keys` returns an `InstrumentKeyReport` whose `unmatched`
+list is the point of the type. An instrument the master has no entry for
+stays unusable for market data, and that has to be visible to whoever ran
+the load — a silent partial success is discovered later as a backfill that
+returns nothing and a strategy that never fires. A stored key is **not**
+overwritten by default either: it was loaded from an earlier master or
+corrected by hand, and re-running a load should not quietly replace it.
+
+### The interval that must not be approximated
+
+Upstox serves `1minute`, `30minute`, `day`, `week`, `month`. This
+codebase's `SUPPORTED_TIMEFRAMES` includes `5m`, `15m`, `1h`, `4h`, none
+of which Upstox offers — they are *derived* from 1m by `resample_candles`.
+
+So `backfill_candles` takes **this codebase's timeframe** and derives the
+provider interval itself; there is no parameter through which a caller
+could hand in a mismatched pair. A timeframe Upstox cannot serve is
+refused, naming the ones it can and pointing at the aggregation path.
+
+Approximating instead — fetching `1minute` and storing the rows under
+`"15m"` — is the failure mode this exists to prevent, and it is entirely
+silent: the candles store, the backtest runs, every number it produces is
+wrong. An injection that made `upstox_interval_for` fall back to
+`"1minute"` is caught by four tests.
+
+Writes go through `upsert_candles`, which is a genuine upsert, so a
+backfill re-run over an overlapping range is idempotent rather than a
+`uq_candle_key` crash.
+
+**Still missing before real candles can actually land:** the master file
+has to be fetched. That is one HTTP GET this environment cannot make, so
+parsing and matching are pure functions over already-loaded records and
+the download is the caller's small problem. Nothing here has been
+exercised against Upstox's real master or its real candle payloads.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

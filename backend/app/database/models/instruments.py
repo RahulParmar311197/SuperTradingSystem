@@ -52,5 +52,18 @@ class Instrument(Base):
     tick_size: Mapped[float] = mapped_column(Numeric(18, 6), default=0.05)
     currency: Mapped[str] = mapped_column(String(8), default="INR")
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # The identifier the market-data provider actually accepts. Upstox
+    # names instruments as "NSE_EQ|INE009A01021" or "NSE_INDEX|Nifty 50",
+    # never as the plain trading symbol -- its adapter's own rollout
+    # checklist says so. Without this column every provider call would
+    # have to be handed `symbol` and would simply not resolve.
+    #
+    # Nullable on purpose: it is provider-specific, most rows will not
+    # have one until a master file has been loaded, and an instrument with
+    # no key is still perfectly usable for paper trading and backtests on
+    # candles that arrived some other way. `resolve_instrument_key` turns
+    # the absence into a legible error at the point of use rather than an
+    # opaque rejection from the far end.
+    broker_instrument_key: Mapped[str | None] = mapped_column(String(64), index=True)
 
     __table_args__ = ()

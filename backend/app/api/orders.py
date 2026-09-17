@@ -26,6 +26,7 @@ from app.risk.engine import RiskEngine, TradeRiskProposal, calculate_position_si
 from app.risk.kill_switch import load_kill_switch_state
 from app.trading.protective_stops import ensure_protective_stop
 from app.risk.limits import RiskLimits
+from app.risk.liquidity import assess_equity_liquidity
 from app.risk.portfolio import compute_correlated_exposure, signed_notionals_excluding
 from app.trading.broker_resolver import resolve_broker
 from app.trading.execution import ExecutionEngine
@@ -474,9 +475,21 @@ async def place_order(
         # every exposure, loss and count limit by sending it as a larger
         # opposing order.
         quantity = min(quantity, abs(existing.quantity))
+    # Blueprint §57: the first real equity liquidity gate. Passes a genuine
+    # bool when there is volume history to judge from and `None` when there
+    # is not -- the engine skips an unassessed check rather than recording
+    # it as passed, which is the fabricated audit row this replaces.
+    liquidity_acceptable = await assess_equity_liquidity(
+        db,
+        symbol=payload.symbol,
+        quantity=quantity,
+        max_participation_pct=stack.risk_engine.limits.max_participation_pct,
+    )
+
     proposal = TradeRiskProposal(
         account_id=str(user.id),
         proposed_quantity=quantity,
+        liquidity_acceptable=liquidity_acceptable,
         is_reducing=is_reducing,
         strategy_id=None,
         entry=fill_price,

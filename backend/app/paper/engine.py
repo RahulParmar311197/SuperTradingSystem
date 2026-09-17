@@ -20,6 +20,7 @@ from app.ict.engine import ICTConfig, ICTEngine
 from app.risk.engine import RiskEngine, TradeRiskProposal, calculate_position_size
 from app.risk.kill_switch import load_kill_switch_state
 from app.risk.limits import RiskLimits
+from app.risk.liquidity import assess_equity_liquidity
 from app.risk.portfolio import compute_correlated_exposure, signed_notionals_excluding
 from app.smc.engine import SMCConfig, SMCEngine
 from app.smc.types import Candle
@@ -371,10 +372,21 @@ class PaperTradingEngine:
             result.stop,
             self.risk_engine.limits.max_position_size,
         )
+        # Same gate as the live path, through the same shared assessor.
+        # `db` is optional here, and no session means no assessment means
+        # `None` -- never a fabricated pass.
+        liquidity_acceptable = await assess_equity_liquidity(
+            db,
+            symbol=self.symbol,
+            quantity=quantity,
+            max_participation_pct=self.risk_engine.limits.max_participation_pct,
+        )
+
         proposal = TradeRiskProposal(
             account_id=self.account_id,
             strategy_id=self.strategy_id,
             proposed_quantity=quantity,
+            liquidity_acceptable=liquidity_acceptable,
             entry=result.entry,
             stop=result.stop,
             account_balance=account.balance,

@@ -8911,6 +8911,123 @@ the helper stops excluding the target's own position       -> 1 fail  (control)
 Every control was injection-tested alongside the proofs, including the one
 asserting that a hedge must still consume its full gross allowance.
 
+## Equities finally have a liquidity gate (§57) — a missing feature, not a bug
+
+**A missing feature, built, and the last of the seven parked decisions.**
+Nothing here was broken; something was absent, and an earlier round said
+so explicitly rather than pretending otherwise.
+
+That round found `TradeRiskProposal.liquidity_acceptable` defaulting to
+`True` with no writer, so every equity order's `RiskEvent` recorded a
+passed liquidity check that nothing had performed. It made the field
+`bool | None`, skipped it when unset, and closed with: *"Wiring that up is
+the follow-on; not claiming it happened is this change."* This is the
+follow-on.
+
+### Why a rate, not a floor
+
+The question is not "is this instrument liquid" in the abstract. It is
+*can this order be filled without the order itself moving the price
+against us* — a property of the order and the instrument **together**. So
+the measure is the order's quantity as a share of what typically trades in
+a bar.
+
+An absolute minimum-volume floor gets both ends wrong, and there is a
+control pinning both: it would block a tiny order in a thin name that
+would fill fine, and wave through an enormous one in a liquid name that
+would not. Injecting a floor in place of the rate fails five tests.
+
+The options module (`app/options/liquidity_filter.py`) deliberately does
+not share this. Its thresholds are open interest and bid/ask spread on a
+specific contract — facts about the contract, not about the order — and
+there is no equivalent for an NSE equity here. Reusing option-shaped
+numbers would have been inventing a limit rather than choosing one.
+
+### The number, and what kind of number it is
+
+`RiskLimits.max_participation_pct = 10.0`, and it is worth being exact
+about its status: **reasoned, not calibrated.** There is no licensed feed
+in this environment, so it is not measured against real NSE volume. It
+comes from standard percentage-of-volume execution practice, where
+algorithms that deliberately spread an order over time target 5–25%; a
+single MARKET order consumes visible depth all at once rather than
+spreading, so the low end of that range is the right neighbourhood.
+Against a 15m bar it works out near 0.4% of a day's volume — permissive
+for anything ordinary, and still catching an order that is large relative
+to what the instrument actually trades. It is the first number to revisit
+once real data exists.
+
+### Three outcomes, not two
+
+* **`None` — not assessed.** No candle history, no registered instrument,
+  no database session, or a database error. The check is skipped, exactly
+  as before. Recording `True` here would recreate the fabricated audit row
+  this whole line of work started from, so the injection that does it
+  fails three tests.
+* **`False` — assessed and refused.** Either the order exceeds the cap, or
+  the window traded *zero* volume. Zero is not missing data: it is data
+  saying nothing traded at all, and a participation rate against zero is
+  undefined rather than small.
+* **`True` — assessed and fine.**
+
+The window is the last 20 bars — five hours at 15m, most of an NSE
+session. Long enough that one unusually quiet or busy bar cannot decide
+the verdict, short enough to describe today's market. A proof drives that
+directly: an instrument liquid a month ago and thin today is judged on
+today, because averaging all history would let a dead name keep trading on
+its reputation.
+
+### Ten existing tests failed, and the fixtures were what was wrong
+
+Turning the gate on broke the paper engine's correlation test and the
+whole autonomous end-to-end file. Root cause, measured rather than
+assumed: those fixtures carry `volume=100.0` — a placeholder from when
+nothing read the field — while their setups size to 250–500 shares. They
+were asking the engine to buy **250–500% of a bar's entire traded volume
+in a single order**, which is precisely what the gate exists to refuse.
+
+So the fixtures were unrealistic, not the gate, and they now carry a named
+`LIQUID_BAR_VOLUME` rather than a magic literal, so the assumption is
+visible. No test was skipped, weakened or deleted; each still measures
+what it says it measures.
+
+### The round-132 lesson, applied and then needed again
+
+The previous round found a shared contract broken at both order call sites
+with the entire suite still green. So this round injected the same class
+of break deliberately — and **found the gap again**: breaking the *live*
+path's wiring left everything passing. The paper path had a proof; `POST
+/orders` did not.
+
+It does now, with a control beside it: the same 100-share order is refused
+against an instrument trading 100 shares a bar and placed against one
+trading 50,000, so the test cannot pass by the gate simply refusing
+everything.
+
+Injection, after that:
+
+```
+'not assessed' reported as passed (the original bug's shape) -> 3 fail
+a window that traded nothing treated as 'no data'            -> 1 fail  (control)
+an absolute volume floor instead of a participation rate     -> 5 fail
+averages all history, not the recent window                  -> 1 fail
+the paper path stops passing the verdict                     -> 1 fail
+a database failure reported as passed                        -> 1 fail  (control)
+the live path stops passing the verdict                      -> 1 fail
+the gate refuses everything regardless of volume             -> 1 fail  (control)
+```
+
+All three controls were injection-tested alongside the proofs.
+
+### What it still is not
+
+A participation cap against historical bar volume is not order-book depth.
+It cannot see a wide spread, a thin top of book, or an auction; it knows
+only what traded, after the fact. That is the honest limit of what this
+codebase can assess without a live depth feed, and it is a real
+improvement on assessing nothing while claiming otherwise — not a
+substitute for the real thing.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

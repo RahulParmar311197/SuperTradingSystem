@@ -187,3 +187,77 @@ def test_a_clean_pair_is_unaffected_by_the_pairing_change():
 
     matrix = build_correlation_matrix({"A": series, "B": dict(series)})
     assert matrix[frozenset(("A", "B"))] == pytest.approx(1.0)
+
+
+# --- direction: a hedge is not concentration -------------------------------
+
+
+def test_a_short_against_a_correlated_long_nets_instead_of_stacking():
+    """Behavioural proof. Two instruments correlated at +0.9, held in
+    opposite directions, is as close to a hedge as this system can
+    express. It used to read as *double* concentration, because both call
+    sites `abs()`-ed the notional and this function `abs()`-ed it again --
+    so the gate blocked the trade that reduced the risk.
+    """
+    matrix = {frozenset(("NIFTY", "BANKNIFTY")): 0.9}
+    total = correlated_exposure(
+        target_symbol="NIFTY",
+        target_notional=1000.0,          # long
+        open_position_notionals={"BANKNIFTY": -1000.0},  # short
+        correlation_matrix=matrix,
+        threshold=0.7,
+    )
+    assert total == 0.0
+
+
+def test_an_inversely_correlated_pair_nets_too():
+    """Behavioural proof, and the half that is indefensible either way.
+
+    Matching on `abs(corr) >= threshold` deliberately catches instruments
+    that move *opposite* to each other -- and then the old code counted
+    them as if they moved together. Two longs at -0.9 is a hedge, not a
+    doubled bet.
+    """
+    matrix = {frozenset(("NIFTY", "VIX")): -0.9}
+    total = correlated_exposure(
+        target_symbol="NIFTY",
+        target_notional=1000.0,
+        open_position_notionals={"VIX": 1000.0},
+        correlation_matrix=matrix,
+        threshold=0.7,
+    )
+    assert total == 0.0
+
+
+def test_two_correlated_longs_still_stack():
+    """Control. The gate has to keep biting where it should, or signing it
+    would just be a way of switching it off. Same shape as the hedge above,
+    with the sibling long instead of short.
+    """
+    matrix = {frozenset(("NIFTY", "BANKNIFTY")): 0.9}
+    total = correlated_exposure(
+        target_symbol="NIFTY",
+        target_notional=1000.0,
+        open_position_notionals={"BANKNIFTY": 1000.0},
+        correlation_matrix=matrix,
+        threshold=0.7,
+    )
+    assert total == 2000.0
+
+
+def test_two_correlated_shorts_stack_on_the_other_side():
+    """Control on the sign itself, not just its presence. Two shorts in
+    correlated instruments are exactly as concentrated as two longs -- the
+    book leans the other way, so the total is negative, and it is the
+    *magnitude* the risk engine reads.
+    """
+    matrix = {frozenset(("NIFTY", "BANKNIFTY")): 0.9}
+    total = correlated_exposure(
+        target_symbol="NIFTY",
+        target_notional=-1000.0,
+        open_position_notionals={"BANKNIFTY": -1000.0},
+        correlation_matrix=matrix,
+        threshold=0.7,
+    )
+    assert total == -2000.0
+    assert abs(total) == 2000.0

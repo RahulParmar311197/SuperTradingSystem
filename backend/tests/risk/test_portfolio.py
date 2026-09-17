@@ -9,7 +9,11 @@ from app.database.models.trading import ExecutionMode, Position
 from app.database.models.users import User
 from app.database.session import async_session_factory
 from app.market.repository import upsert_candles
-from app.risk.portfolio import compute_correlated_exposure, compute_portfolio_exposure
+from app.risk.portfolio import (
+    compute_correlated_exposure,
+    compute_portfolio_exposure,
+    signed_notionals_excluding,
+)
 from app.smc.types import Candle
 
 pytestmark = pytest.mark.asyncio
@@ -93,6 +97,20 @@ async def test_compute_correlated_exposure_uses_real_candle_history(require_infr
             )
             # Only the perfectly-correlated position's notional should count.
             assert exposure == pytest.approx(1000.0)
+
+            # ... and the same book held short nets to the other side.
+            # Behavioural proof that the sign survives the whole DB path
+            # (instrument lookup -> candles -> correlation matrix ->
+            # `correlated_exposure`), not just the pure function: an
+            # `abs()` reintroduced anywhere along it returns +1000.0 here.
+            hedged = await compute_correlated_exposure(
+                db,
+                target_symbol=target.symbol,
+                target_notional=0.0,
+                open_position_notionals={correlated.symbol: -1000.0, uncorrelated.symbol: -1000.0},
+                threshold=0.9,
+            )
+            assert hedged == pytest.approx(-1000.0)
         finally:
             from app.database.models.market import Candle as CandleRow
 
@@ -100,3 +118,56 @@ async def test_compute_correlated_exposure_uses_real_candle_history(require_infr
                 await db.execute(delete(CandleRow).where(CandleRow.instrument_id == instrument.id))
             await db.execute(delete(Instrument).where(Instrument.id.in_([target.id, correlated.id, uncorrelated.id])))
             await db.commit()
+
+
+# --- the contract both order paths share -----------------------------------
+
+
+class _FakePosition:
+    """Just the three attributes `signed_notionals_excluding` reads.
+
+    Deliberately not a real `PositionRecord`: the point is the arithmetic
+    on quantity and price, and building an execution stack to get one
+    would test the stack instead.
+    """
+
+    def __init__(self, symbol: str, quantity: float, average_price: float) -> None:
+        self.symbol = symbol
+        self.quantity = quantity
+        self.average_price = average_price
+
+
+async def test_a_short_position_keeps_its_negative_sign():
+    """Behavioural proof, and the only thing that can catch an `abs()`
+    coming back to either order path.
+
+    This was a dict comprehension written out twice, in app/api/orders.py
+    and app/paper/engine.py, whose own comments said the two must mirror
+    each other. Measured: re-adding `abs()` to *both* of them left the
+    whole suite green, because nothing drove either call site with a short
+    position and correlation data at once. The comprehension is now one
+    named function, and this is its test.
+    """
+    notionals = signed_notionals_excluding(
+        [
+            _FakePosition("LONGCO", 100.0, 50.0),
+            _FakePosition("SHORTCO", -200.0, 25.0),
+        ],
+        exclude_symbol="TARGET",
+    )
+    assert notionals == {"LONGCO": 5000.0, "SHORTCO": -5000.0}
+
+
+async def test_the_proposed_symbols_own_position_is_left_out():
+    """Control. The exclusion is what keeps the trade's own existing
+    position from being counted twice -- the engine adds this trade's
+    sized notional itself. Dropping the filter would double it.
+    """
+    notionals = signed_notionals_excluding(
+        [
+            _FakePosition("TARGET", 100.0, 50.0),
+            _FakePosition("OTHER", 100.0, 50.0),
+        ],
+        exclude_symbol="TARGET",
+    )
+    assert notionals == {"OTHER": 5000.0}

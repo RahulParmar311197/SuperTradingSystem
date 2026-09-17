@@ -99,6 +99,32 @@ async def compute_portfolio_exposure(
     )
 
 
+def signed_notionals_excluding(positions, exclude_symbol: str) -> dict[str, float]:
+    """`{symbol: signed notional}` for every open position but one.
+
+    Signed -- negative for a short -- because `correlated_exposure` nets
+    rather than sums, so an `abs()` here turns a hedge into double
+    concentration and blocks the trade that reduced the risk.
+
+    This exists as a function rather than as a dict comprehension inlined
+    at each call site because it was inlined at each call site, in
+    app/api/orders.py and app/paper/engine.py, whose comments already said
+    the two must mirror each other. Nothing could test that claim, and
+    nothing did: re-adding `abs()` to both left the entire suite green.
+    One named contract with one test is what makes the invariant
+    enforceable rather than merely stated.
+
+    `positions` is anything with `.symbol`, `.quantity` and
+    `.average_price` -- `PositionRecord` in both callers. Typed loosely so
+    this module does not have to import the execution layer to name it.
+    """
+    return {
+        p.symbol: p.quantity * p.average_price
+        for p in positions
+        if p.symbol != exclude_symbol
+    }
+
+
 async def compute_correlated_exposure(
     db: AsyncSession,
     target_symbol: str,
@@ -114,7 +140,14 @@ async def compute_correlated_exposure(
     symbol with no registered instrument or too little candle history
     simply contributes no correlation data — never a hard failure, since
     correlation is a refinement on top of the exposure check, not a
-    replacement for it."""
+    replacement for it.
+
+    `open_position_notionals` and the returned value are **signed**:
+    negative for a short, and negative overall when the correlated book
+    leans opposite to the target. Callers must pass the sign through
+    rather than `abs()`-ing it — see
+    `app.risk.correlation.correlated_exposure`, which nets rather than
+    sums so that a hedge is not counted as concentration."""
     symbols = {target_symbol, *open_position_notionals}
     closes_by_symbol: dict[str, dict[datetime, float]] = {}
     for symbol in symbols:

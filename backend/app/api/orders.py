@@ -26,7 +26,7 @@ from app.risk.engine import RiskEngine, TradeRiskProposal, calculate_position_si
 from app.risk.kill_switch import load_kill_switch_state
 from app.trading.protective_stops import ensure_protective_stop
 from app.risk.limits import RiskLimits
-from app.risk.portfolio import compute_correlated_exposure
+from app.risk.portfolio import compute_correlated_exposure, signed_notionals_excluding
 from app.trading.broker_resolver import resolve_broker
 from app.trading.execution import ExecutionEngine
 from app.trading.order_manager import OrderManager
@@ -419,9 +419,12 @@ async def place_order(
     account = await stack.broker.get_account()
     open_positions = stack.position_manager.open_positions(str(user.id))
     current_exposure = sum(abs(p.quantity) * p.average_price for p in open_positions)
-    other_position_notionals = {
-        p.symbol: abs(p.quantity) * p.average_price for p in open_positions if p.symbol != payload.symbol
-    }
+    # Signed deliberately -- negative for a short -- and shared with the
+    # paper path rather than spelled out twice. `correlated_exposure` nets
+    # these against the proposed trade's own direction, so an `abs()` here
+    # would turn a hedge into double concentration. `current_exposure`
+    # above stays unsigned: that is the *gross* limit, and it should be.
+    other_position_notionals = signed_notionals_excluding(open_positions, payload.symbol)
     correlated_exposure = await compute_correlated_exposure(
         db,
         target_symbol=payload.symbol,

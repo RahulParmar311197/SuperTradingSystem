@@ -127,16 +127,49 @@ def correlated_exposure(
     correlation_matrix: dict[frozenset[str], float],
     threshold: float,
 ) -> float:
-    """Notional of `target_symbol`'s new position plus every open
-    position whose |correlation| with it is >= `threshold`. A pair with
-    no entry in `correlation_matrix` (no computable correlation) is
-    treated as uncorrelated — this only flags concentration it actually
-    has evidence for."""
+    """**Signed** exposure to `target_symbol` moving up, summed over every
+    open position whose |correlation| with it is >= `threshold`.
+
+    `open_position_notionals` and `target_notional` are signed: positive
+    for a long, negative for a short. The caller must not `abs()` them --
+    that is the whole point, and both callers used to.
+
+    The sign of each contribution is `sign(correlation) * sign(position)`:
+
+        position long,  corr +0.9 -> target up, it gains  -> +notional
+        position short, corr +0.9 -> target up, it loses   -> -notional
+        position long,  corr -0.9 -> target up, it loses   -> -notional
+        position short, corr -0.9 -> target up, it gains   -> +notional
+
+    The caller takes `abs()` of the total; the magnitude is the
+    concentration, and the sign only says which way the book leans.
+
+    This used to add `abs(notional)` for every correlated position, so a
+    long and a short in two instruments correlated at +0.95 -- as close to
+    a hedge as this system can express -- read as *double* concentration
+    rather than near-zero, and the gate blocked the very trade that
+    reduced the risk. The same went for an inverse pair: matching on
+    `abs(corr) >= threshold` deliberately catches instruments that move
+    *opposite* to each other, and then counted them as if they moved
+    together, which is indefensible either way round.
+
+    Netting is safe here specifically because it is not the only limit.
+    `RiskLimits.max_exposure_pct` caps *gross* notional and is untouched
+    by any of this, so a book cannot grow without bound by claiming to be
+    hedged -- which is the real hazard in netting, since an estimated
+    correlation can break exactly when it is being relied on. Gross and
+    net are two different limits doing two different jobs, and this one is
+    the net one: concentration of *directional* risk.
+
+    A pair with no entry in `correlation_matrix` (no computable
+    correlation) is treated as uncorrelated -- this only flags
+    concentration it actually has evidence for.
+    """
     total = target_notional
     for symbol, notional in open_position_notionals.items():
         if symbol == target_symbol:
             continue
         corr = correlation_matrix.get(frozenset((target_symbol, symbol)))
         if corr is not None and abs(corr) >= threshold:
-            total += abs(notional)
+            total += notional if corr > 0 else -notional
     return total

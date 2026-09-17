@@ -8357,6 +8357,59 @@ safe: the kill-switch and account-halt reads raise, which stops trading,
 and the autonomous supervisor's per-pass guard logs and skips. That is the
 correct direction for a risk gate, and it is left alone deliberately.
 
+## The ICT engine recomputed session levels and dropped them (§21, §54)
+
+This one is a **performance fix, not a correctness fix** — no output
+changes — and it is worth stating that plainly before the numbers.
+
+`ICTEngine.analyze` filled `ICTContext.session_levels` with
+`detect_session_levels(candles, "day") + detect_session_levels(candles, "week")`
+on every call. Nothing read it. Checked across `app/` and `tests/`:
+`app/strategy/evaluator.py` reads `current_kill_zones`,
+`GET /charts/{id}/smc` exposes the kill zones and the opening range, and
+`app/ai/context_builder.py` reads the kill zones — none of the three
+touches `session_levels`.
+
+`SMCEngine.analyze` computes the identical pools into
+`SMCContext.liquidity_pools`, which *is* what the evaluator reads. Measured
+on the same 2000-candle series:
+
+```
+ICTContext.session_levels               : 46 pools (PREVIOUS_DAY/WEEK_HIGH/LOW)
+SMCContext.liquidity_pools, same kinds  : 46 pools
+identical set                           : True
+```
+
+The cost, measured by toggling it off:
+
+```
+  500 candles  0.70ms -> 0.38ms   (45.6% of the call)
+ 2000 candles  3.02ms -> 1.61ms   (46.8%)
+ 6000 candles  8.70ms -> 4.35ms   (50.0%)
+```
+
+`AutoTradeSupervisor` runs one engine per (user, strategy, instrument) and
+calls `ict_engine.analyze` on every pass of the 60-second loop, so this was
+roughly half the ICT budget spent producing a value that was then
+discarded. Rounds on the quadratic SMC loops established that this loop's
+latency budget is a real production property, which is why it is worth
+removing rather than leaving as harmless clutter.
+
+Removed: the computation, the `session_levels` field, and
+`ICTConfig.enable_session_levels` — whose only effect was to gate the
+removed work, so leaving it would have been a switch wired to nothing.
+Anything wanting this data reads `smc.liquidity_pools` and filters on
+`LiquiditySourceType.PREVIOUS_DAY_*` / `PREVIOUS_WEEK_*`.
+
+The duplication is pinned by **call count rather than by a timing
+assertion**, which would be flaky in CI: one `ICTEngine.analyze` +
+`SMCEngine.analyze` pass must detect session levels exactly twice (day and
+week), not four times. An injection that keeps computing the value and
+merely stops storing it fails that test and no other, which is what makes
+it the real proof. A second test pins the property that makes removal safe
+— the same pools are still reachable from the SMC context — and fails when
+the removal is done on the wrong side.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

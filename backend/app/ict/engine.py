@@ -8,14 +8,12 @@ from datetime import time
 
 from app.ict.killzones import DEFAULT_KILL_ZONES, KillZone, active_kill_zones
 from app.ict.opening_range import OpeningRange, detect_opening_ranges
-from app.smc.liquidity import detect_session_levels
-from app.smc.types import Candle, LiquidityPool
+from app.smc.types import Candle
 
 
 @dataclass(slots=True)
 class ICTConfig:
     enable_kill_zones: bool = True
-    enable_session_levels: bool = True
     enable_opening_range: bool = True
     kill_zones: list[KillZone] = field(default_factory=lambda: list(DEFAULT_KILL_ZONES))
     # **UTC**, like `KillZone`'s window bounds, and named so that is
@@ -41,8 +39,26 @@ class ICTConfig:
 
 @dataclass(slots=True)
 class ICTContext:
+    """What the ICT engine contributes on top of `SMCContext`.
+
+    `session_levels` used to sit here, filled by
+    `detect_session_levels(candles, "day") + detect_session_levels(candles, "week")`
+    on every call. Nothing read it -- not `app/strategy/evaluator.py` (which
+    reads `current_kill_zones`), not `GET /charts/{id}/smc` (which exposes
+    the kill zones and the opening range), not `app/ai/context_builder.py`.
+    `SMCEngine.analyze` computes the identical pools into
+    `SMCContext.liquidity_pools`, which *is* what the evaluator reads, and
+    the two were measured byte-identical: 46 pools each, same set.
+
+    Recomputing it cost 46-50% of every `ICTEngine.analyze` call (8.70ms
+    against 4.35ms at 6000 candles), paid once per
+    (user, strategy, instrument) engine on every pass of the 60s
+    autonomous loop. Removing it changes no output: read
+    `smc.liquidity_pools` and filter on `LiquiditySourceType.PREVIOUS_DAY_*`
+    / `PREVIOUS_WEEK_*` for the same data.
+    """
+
     current_kill_zones: list[str]
-    session_levels: list[LiquidityPool]
     opening_ranges: list[OpeningRange]
 
     @property
@@ -64,10 +80,6 @@ class ICTEngine:
         if cfg.enable_kill_zones and candles:
             current_kill_zones = active_kill_zones(candles[-1], cfg.kill_zones)
 
-        session_levels: list[LiquidityPool] = []
-        if cfg.enable_session_levels:
-            session_levels = detect_session_levels(candles, "day") + detect_session_levels(candles, "week")
-
         opening_ranges: list[OpeningRange] = []
         if cfg.enable_opening_range:
             opening_ranges = detect_opening_ranges(
@@ -76,6 +88,5 @@ class ICTEngine:
 
         return ICTContext(
             current_kill_zones=current_kill_zones,
-            session_levels=session_levels,
             opening_ranges=opening_ranges,
         )

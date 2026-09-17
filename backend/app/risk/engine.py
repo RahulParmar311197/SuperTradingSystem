@@ -51,7 +51,36 @@ class TradeRiskProposal:
     # and strategy_allocation are. 0.0, the default, makes the check a
     # no-op, since correlation data isn't always available.
     correlated_exposure: float = 0.0
-    liquidity_acceptable: bool = True
+    # `None` means "no liquidity assessment was made", which is not the
+    # same fact as "liquidity is acceptable" -- the same distinction
+    # `market_data_age_seconds` above draws, and for the same reason. It
+    # defaulted to `True`, and neither of this engine's two callers
+    # (app/api/orders.py, app/paper/engine.py) has ever set it, so every
+    # equity order ever evaluated recorded a passed `liquidity_acceptable`
+    # check in its `RiskEvent` audit row without anything having looked at
+    # volume, spread or quote age. That is a fabricated audit entry: an
+    # operator reading `GET /admin/risk-events` cannot tell a symbol whose
+    # liquidity was checked and was fine from one where the gate was never
+    # wired up.
+    #
+    # `None` is now skipped rather than recorded as passed -- exactly what
+    # `is_reducing` does for the entry-only limits below, so the audit row
+    # lists only the checks that actually governed the decision. It does
+    # NOT reject: an unevaluated gate must not block trading (same
+    # reasoning as `max_correlated_exposure_pct`'s 100.0 no-op default).
+    # A caller that *does* assess liquidity passes a real bool and gets a
+    # real gate: `False` rejects.
+    #
+    # The sibling `OptionsRiskProposal.liquidity_acceptable` is genuinely
+    # computed by app/api/options.py from `OptionSnapshot` data
+    # (`evaluate_liquidity` in app/options/liquidity_filter.py), so it
+    # keeps its `bool` type. There is no equivalent source for equities
+    # here: `evaluate_liquidity`'s thresholds are open-interest and
+    # option-spread shaped, and what a minimum traded volume should be for
+    # an NSE equity is a number to be chosen deliberately, not invented in
+    # passing. Wiring that up is the follow-on; not claiming it happened
+    # is this change.
+    liquidity_acceptable: bool | None = None
 
     proposed_quantity: float | None = None  # if None, engine sizes the position
     # True when this order can only reduce or flatten an existing position
@@ -196,7 +225,8 @@ class RiskEngine:
                 )
             )
 
-        checks.append(RiskCheck("liquidity_acceptable", proposal.liquidity_acceptable))
+        if proposal.liquidity_acceptable is not None:
+            checks.append(RiskCheck("liquidity_acceptable", proposal.liquidity_acceptable))
         checks.append(
             RiskCheck(
                 "market_data_fresh",

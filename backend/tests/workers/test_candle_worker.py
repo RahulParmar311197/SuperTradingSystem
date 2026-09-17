@@ -95,18 +95,23 @@ async def test_derived_timeframe_is_persisted_after_enough_base_candles(db_instr
     assert five_min[0].open == 100.0
 
 
-async def test_derive_timeframe_skips_an_incomplete_bucket_instead_of_corrupting_the_prior_one(db_instrument):
+async def test_an_incomplete_bucket_does_not_corrupt_the_bucket_before_it(db_instrument):
     # Regression test: `_derive_timeframe` used to pick the base-timeframe
     # candles to aggregate by taking the last `window` rows *positionally*
     # (`recent[-window:]`), assuming the base timeframe has no gaps. If a
     # base candle inside the current target bucket is missing (a dropped
-    # tick, a worker restart), the positional slice padded the count out
-    # with candles from the *previous*, already-derived bucket instead --
-    # and then derived the target timestamp from `recent[0]`, which now
-    # belonged to that previous bucket. That silently overwrote the
-    # already-correct, already-persisted candle for the previous bucket
-    # with data spanning two different periods, while the true current
-    # (incomplete) bucket was never derived at all.
+    # tick, a minute in which nothing traded), the positional slice padded
+    # the count out with candles from the *previous*, already-derived
+    # bucket instead -- and then derived the target timestamp from
+    # `recent[0]`, which now belonged to that previous bucket. That
+    # silently overwrote the already-correct, already-persisted candle for
+    # the previous bucket with data spanning two different periods.
+    #
+    # Selecting by bucket timestamp rather than by position is what fixes
+    # that, and it is what this still guards. What changed since is what
+    # happens to the *current* bucket: it used to be dropped, and is now
+    # derived from the base candles that exist (see
+    # `test_an_incomplete_bucket_is_derived_from_the_minutes_that_traded`).
     worker = CandleWorker({db_instrument.symbol: db_instrument.id}, base_timeframe="1m", derived_timeframes=["5m"])
     start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)  # aligned to a 5-minute boundary
 
@@ -120,64 +125,115 @@ async def test_derive_timeframe_skips_an_incomplete_bucket_instead_of_corrupting
     assert five_min[0].open == 100.0
     assert five_min[0].close == 104.0
 
-    # Second 5m bucket (minutes 5-9): minute 7's tick never arrives (a
-    # dropped tick), so this bucket only ever has 4 of its 5 base candles.
-    # The bucket still "completes" by wall-clock boundary (minute 9's
-    # candle closes when minute 10's tick arrives), so derivation still
-    # fires -- it must recognize the gap and skip, not derive from
-    # whatever base candles happen to be nearby.
+    # Second 5m bucket (minutes 5-9): minute 7's tick never arrives, so
+    # this bucket only ever has 4 of its 5 base candles. The bucket still
+    # "completes" by wall-clock boundary (minute 9's candle closes when
+    # minute 10's tick arrives), so derivation still fires.
     for i in (6, 8, 9, 10):
         await worker.process_tick(_tick(db_instrument.symbol, start + timedelta(minutes=i), 100.0 + i))
 
     async with async_session_factory() as db:
         five_min = await get_candles(db, db_instrument.id, "5m")
 
-    # Still exactly one 5m candle: the incomplete second bucket must not
-    # be derived, and the first bucket's already-correct candle must not
-    # have been overwritten with data spanning both buckets.
-    assert len(five_min) == 1
+    # The first bucket's candle is untouched -- not overwritten with data
+    # spanning both periods, and not re-timestamped.
+    assert len(five_min) == 2
+    assert five_min[0].timestamp == start
     assert five_min[0].open == 100.0
     assert five_min[0].close == 104.0
 
+    # And the second bucket is its own bar, at its own timestamp, built
+    # from minutes 5, 6, 8 and 9 -- prices 105, 106, 108, 109.
+    assert five_min[1].timestamp == start + timedelta(minutes=5)
+    assert five_min[1].open == 105.0
+    assert five_min[1].high == 109.0
+    assert five_min[1].low == 105.0
+    assert five_min[1].close == 109.0
 
-async def test_a_skipped_derivation_is_visible_to_an_operator(db_instrument, caplog):
-    """The skip above is a deliberate choice; being silent about it was not.
 
-    A minute in which nothing traded leaves no base candle (the worker is
-    tick-driven), which is routine on an illiquid instrument and
-    indistinguishable here from lost ticks. Skipping keeps a bar that
-    would misrepresent its period out of the series — but it leaves a hole
-    in it, and `ScannerWorker` and `AutoTradeSupervisor` both read 15m.
+async def test_an_incomplete_bucket_is_derived_from_the_minutes_that_traded(db_instrument):
+    """A minute with no trades contributes nothing to an OHLCV bar, so the
+    aggregate of the minutes that did trade *is* the bar.
 
-    Measured before this: one untraded minute dropped the whole bar with
-    no log line, no metric and no error, so an operator could not learn
-    their higher timeframes were incomplete. `SimulatedFeed` emits exactly
-    one tick per candle, which is why nothing in the suite noticed.
+    This used to write nothing at all. The reasoning was that a partial
+    bucket might misrepresent its period; measured, the opposite held. On
+    a bucket whose middle minute never traded, the aggregate of the
+    remaining base candles came out byte-identical to the bar computed
+    from the raw ticks -- the open is the period's first traded price, the
+    high and low its extremes, the close its last, the volume its sum, and
+    an untraded minute supplies none of them.
+
+    Dropping the bar was also not inert. Nothing downstream reads
+    timestamps for adjacency: `detect_swings` and the indexed SMC
+    detectors walk the list positionally, so a missing bar welds two
+    non-adjacent periods together. Measured over a 300-bar series,
+    dropping any single bar changed `detect_swings` output in 82 of 290
+    positions, with real swings vanishing and swings appearing that never
+    happened.
+
+    Asserted against the ticks that were actually fed, not against
+    hand-copied constants, so the bar has to match the period it claims
+    to describe rather than merely be non-empty.
+    """
+    worker = CandleWorker({db_instrument.symbol: db_instrument.id}, base_timeframe="1m", derived_timeframes=["5m"])
+    start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
+
+    # Minutes 0-4 form the first bucket; minute 2 never trades. Minute 5's
+    # tick is what closes minute 4's candle and completes the bucket, so
+    # it is fed but belongs to the *next* bucket.
+    traded_minutes = (0, 1, 3, 4)
+    prices = {m: 100.0 + m for m in traded_minutes}
+    for i in (*traded_minutes, 5):
+        await worker.process_tick(_tick(db_instrument.symbol, start + timedelta(minutes=i), 100.0 + i))
+
+    async with async_session_factory() as db:
+        five_min = await get_candles(db, db_instrument.id, "5m")
+
+    assert len(five_min) == 1, "the bar for a bucket with an untraded minute must still be written"
+    bar = five_min[0]
+    assert bar.timestamp == start
+    assert bar.open == prices[min(traded_minutes)]
+    assert bar.high == max(prices.values())
+    assert bar.low == min(prices.values())
+    assert bar.close == prices[max(traded_minutes)]
+    # `_tick` carries volume 10 and each minute here gets exactly one tick,
+    # so the bar's volume is the traded minutes' and nothing else: the
+    # untraded minute must not be counted as a minute of zero volume that
+    # somehow drags anything, nor must a neighbouring bucket's tick leak in.
+    assert bar.volume == 10.0 * len(traded_minutes)
+
+
+async def test_an_incomplete_bucket_is_visible_to_an_operator(db_instrument, caplog):
+    """Writing the bar does not make the incompleteness uninteresting.
+
+    A bar built from fewer minutes than the period has is either an
+    instrument that barely trades or a feed losing ticks, and from inside
+    this worker the two are indistinguishable. In the second case the bar
+    understates the period's range and volume, so an operator has to be
+    able to see it happening -- climbing on one instrument is the signal.
     """
     import logging
 
-    from app.core.metrics import DERIVED_CANDLE_SKIPPED
+    from app.core.metrics import DERIVED_CANDLE_INCOMPLETE
 
-    def _skipped() -> float:
-        return DERIVED_CANDLE_SKIPPED.labels("5m")._value.get()
+    def _incomplete() -> float:
+        return DERIVED_CANDLE_INCOMPLETE.labels("5m")._value.get()
 
-    before = _skipped()
+    before = _incomplete()
     worker = CandleWorker({db_instrument.symbol: db_instrument.id}, base_timeframe="1m", derived_timeframes=["5m"])
     start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
 
     with caplog.at_level(logging.WARNING, logger="workers.candle"):
-        # Minutes 0-4 complete the first bucket; minute 2 never trades, so
-        # that bucket has 4 of its 5 base candles.
         for i in (0, 1, 3, 4, 5):
             await worker.process_tick(_tick(db_instrument.symbol, start + timedelta(minutes=i), 100.0 + i))
 
-    async with async_session_factory() as db:
-        assert await get_candles(db, db_instrument.id, "5m") == []
-
-    assert _skipped() == before + 1
+    assert _incomplete() == before + 1
     warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
     assert any("4 of 5 base candles" in m for m in warnings), warnings
-    assert any("gap" in m for m in warnings), warnings
+    # The message has to say the bar was written, not that it was skipped:
+    # an operator who reads "not deriving" will go looking for a hole that
+    # is not there.
+    assert any("The bar is written" in m for m in warnings), warnings
 
 
 async def test_a_complete_bucket_logs_nothing_and_counts_nothing(db_instrument, caplog):
@@ -185,9 +241,9 @@ async def test_a_complete_bucket_logs_nothing_and_counts_nothing(db_instrument, 
     # is noise an operator will learn to ignore.
     import logging
 
-    from app.core.metrics import DERIVED_CANDLE_SKIPPED
+    from app.core.metrics import DERIVED_CANDLE_INCOMPLETE
 
-    before = DERIVED_CANDLE_SKIPPED.labels("5m")._value.get()
+    before = DERIVED_CANDLE_INCOMPLETE.labels("5m")._value.get()
     worker = CandleWorker({db_instrument.symbol: db_instrument.id}, base_timeframe="1m", derived_timeframes=["5m"])
     start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
 
@@ -197,5 +253,38 @@ async def test_a_complete_bucket_logs_nothing_and_counts_nothing(db_instrument, 
 
     async with async_session_factory() as db:
         assert len(await get_candles(db, db_instrument.id, "5m")) == 1
-    assert DERIVED_CANDLE_SKIPPED.labels("5m")._value.get() == before
+    assert DERIVED_CANDLE_INCOMPLETE.labels("5m")._value.get() == before
     assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+async def test_a_bucket_with_nothing_traded_in_it_writes_no_bar(db_instrument):
+    """Control, and the one case where writing nothing is still right.
+
+    A bar has to have an open, and an open is a traded price; a period in
+    which nothing traded at all has none, and `aggregate_candles` raises
+    on an empty list rather than inventing one. This branch is defensive
+    rather than reachable through `process_tick` -- that path always calls
+    `_derive_timeframe` just after committing a base candle that lies
+    inside the bucket being derived -- so it is exercised directly, and
+    labelled as defensive rather than dressed up as a scenario.
+    """
+    worker = CandleWorker({db_instrument.symbol: db_instrument.id}, base_timeframe="1m", derived_timeframes=["5m"])
+    start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
+
+    for i in range(6):
+        await worker.process_tick(_tick(db_instrument.symbol, start + timedelta(minutes=i), 100.0 + i))
+
+    async with async_session_factory() as db:
+        before = await get_candles(db, db_instrument.id, "5m")
+    assert len(before) == 1
+
+    # A bucket an hour later, into which no base candle was ever written.
+    await worker._derive_timeframe(
+        db_instrument.id, "5m", 5, start + timedelta(hours=1, minutes=4)
+    )
+
+    async with async_session_factory() as db:
+        after = await get_candles(db, db_instrument.id, "5m")
+    assert [c.timestamp for c in after] == [c.timestamp for c in before], (
+        "an empty bucket must write no bar, and must not disturb the bars around it"
+    )

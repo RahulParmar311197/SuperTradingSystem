@@ -20,7 +20,7 @@ from app.ict.engine import ICTConfig, ICTEngine
 from app.risk.engine import RiskEngine, TradeRiskProposal, calculate_position_size
 from app.risk.kill_switch import load_kill_switch_state
 from app.risk.limits import RiskLimits
-from app.risk.portfolio import compute_correlated_exposure
+from app.risk.portfolio import compute_correlated_exposure, signed_notionals_excluding
 from app.smc.engine import SMCConfig, SMCEngine
 from app.smc.types import Candle
 from app.strategy.context import EvaluationContext
@@ -330,9 +330,10 @@ class PaperTradingEngine:
         # session gets the same "no correlation data available" 0.0
         # `compute_correlated_exposure` itself already falls back to for a
         # symbol with no candle history, never a hard failure.
-        other_position_notionals = {
-            p.symbol: abs(p.quantity) * p.average_price for p in open_positions if p.symbol != self.symbol
-        }
+        # Shared with app/api/orders.py rather than mirrored by hand, so
+        # the two cannot drift. Signed -- negative for a short -- because
+        # `correlated_exposure` nets; the gross limit is separate.
+        other_position_notionals = signed_notionals_excluding(open_positions, self.symbol)
         correlated_exposure = (
             await compute_correlated_exposure(
                 db,

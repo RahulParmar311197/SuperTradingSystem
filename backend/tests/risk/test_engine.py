@@ -278,3 +278,122 @@ def test_liquidity_is_an_execution_sanity_check_not_an_entry_only_limit():
     decision = RiskEngine().evaluate(_tripped_proposal(is_reducing=True, liquidity_acceptable=False))
     assert decision.decision == RiskDecision.REJECT
     assert any(c.name == "liquidity_acceptable" and not c.passed for c in decision.checks)
+
+
+# --- the correlated-exposure gate reads direction ---------------------------
+#
+# Worth recording before any of these: at the shipped defaults this gate
+# is INERT. `max_correlated_exposure_pct` and `max_exposure_pct` are both
+# 100.0, and correlated exposure is a subset of gross exposure, so the
+# correlated check cannot fail unless `exposure_limit` already has --
+# probed over 20,000 random books, 0 independent failures. These tests
+# therefore tighten the limit, which is the only configuration in which
+# the gate does anything at all.
+
+_HEDGE_LIMITS = RiskLimits(max_correlated_exposure_pct=60.0, max_exposure_pct=1000.0)
+
+
+def _correlated_check(proposal, limits=_HEDGE_LIMITS):
+    result = RiskEngine(limits=limits).evaluate(proposal)
+    return next(c for c in result.checks if c.name == "correlated_exposure_limit")
+
+
+def test_a_hedge_passes_a_tightened_correlation_gate():
+    """Behavioural proof, end to end through the engine. A long of 100,000
+    against a correlated short of the same size nets to nothing.
+    """
+    check = _correlated_check(
+        _base_proposal(
+            entry=100.0, stop=95.0,               # long
+            proposed_quantity=1000.0,             # 100,000 notional
+            correlated_exposure=-100_000.0,       # a correlated short
+            current_exposure=100_000.0,
+        )
+    )
+    assert check.passed, check.detail
+
+
+def test_a_one_way_correlated_book_still_fails_it():
+    """Control. Identical to the hedge above but with the sibling long, so
+    the two stack into one 200% bet. If this ever passes, signing the gate
+    turned it off rather than making it read direction.
+    """
+    check = _correlated_check(
+        _base_proposal(
+            entry=100.0, stop=95.0,
+            proposed_quantity=1000.0,
+            correlated_exposure=+100_000.0,
+            current_exposure=100_000.0,
+        )
+    )
+    assert not check.passed, check.detail
+
+
+def test_the_gate_reads_the_proposed_trades_own_direction():
+    """Behavioural proof for `signed_target_notional` specifically.
+
+    Same book both times -- one correlated long already open. Going long
+    alongside it concentrates; going short against it hedges. Nothing but
+    the proposed trade's own stop placement differs, which is how the
+    engine knows the direction (it has already rejected entry == stop).
+    """
+    long_side = _correlated_check(
+        _base_proposal(entry=100.0, stop=95.0, proposed_quantity=1000.0,
+                       correlated_exposure=+100_000.0, current_exposure=100_000.0)
+    )
+    short_side = _correlated_check(
+        _base_proposal(entry=100.0, stop=105.0, proposed_quantity=1000.0,
+                       correlated_exposure=+100_000.0, current_exposure=100_000.0)
+    )
+    assert not long_side.passed, long_side.detail
+    assert short_side.passed, short_side.detail
+
+
+def test_netting_does_not_leak_into_the_gross_exposure_limit():
+    """Control, and the reason netting is safe here at all.
+
+    Netting a correlated book is only defensible because gross size is
+    capped separately: an estimated correlation can break exactly when it
+    is being relied on, so a book that nets to zero must still not be
+    allowed to grow without bound. `exposure_limit` reads
+    `current_exposure`, which is unsigned at both call sites and untouched
+    by any of this. A perfectly hedged book must still consume its full
+    gross allowance.
+    """
+    limits = RiskLimits(max_exposure_pct=150.0, max_correlated_exposure_pct=60.0)
+    result = RiskEngine(limits=limits).evaluate(
+        _base_proposal(
+            entry=100.0, stop=95.0,
+            proposed_quantity=1000.0,        # 100,000 -> 100% of balance
+            current_exposure=100_000.0,      # already 100% gross
+            correlated_exposure=-100_000.0,  # ... and perfectly hedged
+        )
+    )
+    gross = next(c for c in result.checks if c.name == "exposure_limit")
+    correlated = next(c for c in result.checks if c.name == "correlated_exposure_limit")
+    assert correlated.passed, "the hedge should clear the concentration gate"
+    assert not gross.passed, (
+        "200% gross must still fail a 150% gross limit -- netting is a "
+        f"concentration measure, not a size exemption: {gross.detail}"
+    )
+
+
+def test_two_correlated_shorts_are_as_concentrated_as_two_longs():
+    """Control on the magnitude, not just the netting.
+
+    A book leaning hard short is exactly as concentrated as one leaning
+    hard long; only the sign of the net differs. Without the `abs()` in
+    the engine a short-leaning book produces a *negative* percentage,
+    which slips under any positive limit -- a gate that only works in one
+    direction, which is worse than no gate because it reads as one.
+    """
+    check = _correlated_check(
+        _base_proposal(
+            entry=100.0, stop=105.0,          # short
+            proposed_quantity=1000.0,
+            correlated_exposure=-100_000.0,   # a correlated short already open
+            current_exposure=100_000.0,
+        )
+    )
+    assert not check.passed, check.detail
+    assert "200.00%" in check.detail, check.detail

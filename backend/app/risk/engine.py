@@ -53,12 +53,21 @@ class TradeRiskProposal:
     # for why this exists -- entry is otherwise trusted input that both
     # sizes the position and, unchecked, sizes its own notional risk limits.
     entry_deviation_pct: float = 0.0
-    # Blueprint §85: notional of every *other* open position correlated
-    # with this one at or above RiskLimits.correlation_threshold (see
-    # app.risk.correlation.correlated_exposure) — this trade's own sized
-    # notional is added internally below, the same way current_exposure
-    # and strategy_allocation are. 0.0, the default, makes the check a
-    # no-op, since correlation data isn't always available.
+    # Blueprint §85: **signed** exposure of every *other* open position
+    # correlated with this one at or above RiskLimits.correlation_threshold,
+    # expressed relative to this instrument's price going up (see
+    # app.risk.correlation.correlated_exposure). This trade's own sized
+    # notional joins it below, with its own direction, and the magnitude
+    # of the total is what the check reads.
+    #
+    # Signed, because a long and a short in two instruments correlated at
+    # +0.95 is a hedge, and the old unsigned sum read it as double
+    # concentration and blocked it -- rejecting the trade that reduced the
+    # risk. Callers must therefore pass signed notionals (negative for a
+    # short) and must not `abs()` them; both callers used to.
+    #
+    # 0.0, the default, makes the check a no-op, since correlation data
+    # isn't always available.
     correlated_exposure: float = 0.0
     # `None` means "no liquidity assessment was made", which is not the
     # same fact as "liquidity is acceptable" -- the same distinction
@@ -206,8 +215,23 @@ class RiskEngine:
                 )
             )
 
+            # `correlated_exposure` is *signed*, relative to this
+            # instrument's price going up (see
+            # app.risk.correlation.correlated_exposure), so this trade's
+            # own notional joins it with its own sign before the magnitude
+            # is taken. `evaluate` has already returned above unless
+            # `entry != stop`, so the direction is never ambiguous here: a
+            # stop below the entry is a long, a stop above it is a short.
+            #
+            # Netting rather than summing absolute notionals is what makes
+            # this a *concentration* limit instead of a second gross-size
+            # limit. Gross size is `exposure_limit` immediately above,
+            # which is untouched by this and still caps the book.
+            signed_target_notional = (
+                position_notional if proposal.stop < proposal.entry else -position_notional
+            )
             correlated_exposure_pct = (
-                (proposal.correlated_exposure + position_notional) / proposal.account_balance * 100
+                abs(proposal.correlated_exposure + signed_target_notional) / proposal.account_balance * 100
                 if proposal.account_balance
                 else 100.0
             )

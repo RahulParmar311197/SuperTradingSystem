@@ -8806,6 +8806,111 @@ offset used to index but never added back            -> 8 fail
 
 Both controls were injection-tested alongside the proofs.
 
+## The correlated-exposure gate now reads direction (§85) — latent, and measured as such
+
+**A latent bug: the gate is inert at the shipped defaults, so nothing has
+been wrongly rejected in production.** That was probed, not assumed.
+`max_correlated_exposure_pct` and `max_exposure_pct` both default to
+100.0, and correlated exposure is by construction a *subset* of gross
+exposure, so the correlated check cannot fail unless `exposure_limit`
+already has. Over 20,000 random books: **0 cases** where the correlated
+gate failed while the gross one passed.
+
+It becomes live the moment an operator tightens it — which is the only
+configuration in which the check does anything at all, and exactly when a
+risk control should be trusted.
+
+### What it got wrong
+
+Direction never reached the gate. Both call sites built
+`{symbol: abs(quantity) * average_price}`, `correlated_exposure` took
+`abs(notional)` again, and pairs were matched on `abs(corr) >= threshold`.
+Measured with the limit tightened to 60%:
+
+```
+long TGT + long SIB,  corr +0.95 (one bet)   -> REJECT
+long TGT + SHORT SIB, corr +0.95 (a hedge)   -> REJECT
+long TGT + long SIB,  corr -0.90 (a hedge)   -> REJECT
+SHORT TGT + long SIB, corr +0.95 (a hedge)   -> REJECT
+```
+
+All four identical. Three of them are hedges, and the gate was blocking
+the trade that *reduced* the risk — a risk control inverted into a risk
+generator.
+
+The inverse-correlation half is indefensible under any reading. Matching
+on `abs(corr)` deliberately catches instruments that move *opposite* to
+each other, and then the code counted them as though they moved together.
+Either they belong in the sum with the opposite sign, or they should not
+be matched at all; adding them positively is the one option that is wrong
+both ways.
+
+### Why netting is safe here, and where it would not be
+
+The honest objection to netting is real: an estimated correlation can
+break exactly when it is being relied on, and a book that nets to zero
+must not therefore be allowed to grow without bound. That is how hedged
+books blow up.
+
+It does not apply here because netting is not the only limit.
+`RiskLimits.max_exposure_pct` caps **gross** notional, reads
+`current_exposure`, which stays unsigned at both call sites, and is
+untouched by any of this. Gross and net are two limits doing two different
+jobs; this one is the net one, and its job is concentration of
+*directional* risk. There is a control asserting exactly that: a perfectly
+hedged book clears the concentration gate and still fails a tightened
+gross limit.
+
+### The sign convention
+
+Everything is expressed relative to the target instrument's price going
+up, and the contribution of each correlated position is
+`sign(correlation) × signed_notional`:
+
+```
+position long,  corr +0.9 -> target up, it gains -> +notional
+position short, corr +0.9 -> target up, it loses -> -notional
+position long,  corr -0.9 -> target up, it loses -> -notional
+position short, corr -0.9 -> target up, it gains -> +notional
+```
+
+The proposed trade joins the sum with its own direction, which the engine
+reads from the stop's position relative to the entry — unambiguous by the
+time the check runs, since `evaluate` has already rejected `entry == stop`
+several checks earlier. The **magnitude** of the total is the
+concentration; the sign only says which way the book leans, and taking
+`abs()` is what keeps a short-leaning book from producing a negative
+percentage that slips under every positive limit.
+
+### One dict comprehension, written twice, that no test could catch
+
+Injection found a real hole in this round's own tests before it found
+anything else. Re-adding `abs()` to **both** call sites —
+`app/api/orders.py` and `app/paper/engine.py`, whose comments already said
+the two must mirror each other — left the entire suite green, because
+nothing drove either path with a short position and correlation data at
+the same time.
+
+So the comprehension is now one function, `signed_notionals_excluding`,
+with one test. That is not tidying: it is the difference between an
+invariant that is stated and one that is enforceable. Re-running the same
+injection against the shared helper now fails.
+
+Injection, after that fix:
+
+```
+correlated_exposure sums abs() again (the original state)  -> 4 fail
+correlation sign inverted                                  -> 7 fail
+inverse correlations counted as if positive                -> 1 fail
+engine drops the abs(), a short book goes negative         -> 1 fail  (control)
+engine ignores the proposed trade's own direction          -> 2 fail
+the shared helper abs()es the notional again               -> 1 fail
+the helper stops excluding the target's own position       -> 1 fail  (control)
+```
+
+Every control was injection-tested alongside the proofs, including the one
+asserting that a hedge must still consume its full gross allowance.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

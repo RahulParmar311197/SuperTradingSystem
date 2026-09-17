@@ -45,6 +45,20 @@ class Settings(BaseSettings):
     upstox_secret: str | None = None
     upstox_redirect_uri: str = "http://localhost:8000/brokers/upstox/callback"
 
+    # Market data only, and deliberately separate from the per-user
+    # `BrokerAccount` credentials above. `resolve_broker` routes every
+    # order to the most recent ACTIVE BrokerAccount, so a token stored
+    # there to fetch prices would also send that user's orders to Upstox;
+    # this one is process-wide, creates no account row, and is consumed
+    # only by `app.market.providers.upstox.UpstoxMarketData`, which has no
+    # method that could place an order. Unset (the default) means no live
+    # feed -- the workers fall back to the simulated one.
+    #
+    # Upstox issues no read-only market-data token: this value CAN trade
+    # through any other client. Treat it as a trading credential wherever
+    # it is stored, and note Upstox expires it daily (~03:30 IST).
+    upstox_data_access_token: str | None = None
+
     # Empty by default — deny cross-origin browser requests until an
     # operator explicitly lists allowed origins. JWTs travel in the
     # Authorization header (not cookies), so credentialed CORS isn't

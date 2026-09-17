@@ -7751,6 +7751,65 @@ are the documented "honestly degraded" choice and belong to the open
 question about whether *no* market data should fail closed — not settled
 here.
 
+## Real market data, paper execution (§14, §52)
+
+The requirement is real Upstox prices with every execution path staying in
+paper. Taken literally that is not what connecting Upstox gives you:
+`resolve_broker` routes every order to the most recent **ACTIVE**
+`BrokerAccount`, and `_execution_mode_for` stamps anything that is not a
+`MockBroker` as LIVE. So storing an Upstox token as a broker account in
+order to read prices would also send that user's real orders to Upstox.
+The `LIVE_TRADE` permission is a second gate, but the two controls are not
+independent the way the requirement needs.
+
+So market-data credentials are **process-level config**
+(`UPSTOX_DATA_ACCESS_TOKEN`), create no `BrokerAccount` row, and are
+consumed only by `app/market/providers/upstox.py`'s `UpstoxMarketData` —
+which is deliberately **not** a `Broker`, does not subclass it, and has no
+`place_order`, `modify_order` or `cancel_order`. The guarantee is
+structural rather than a convention someone has to remember: there is no
+method on the object that could reach an exchange. `resolve_broker` keeps
+returning `MockBroker`, and execution stays PAPER.
+
+**The credential is still a trading credential.** Upstox issues no
+read-only market-data token, so this value can place orders through any
+other client. What this module guarantees is that *this system* offers no
+path from it to an order — not that it is safe to leak.
+
+Two conversions at the boundary are load-bearing, and both fail silently
+rather than loudly:
+
+- **Order.** Upstox returns candles newest-first. Every consumer here —
+  `detect_swings`, `bucket_start`, the paper engine's `candles[-1]`, the
+  backtest loop — assumes oldest-first. A reversed series raises nothing;
+  it just produces confident nonsense. Sorted ascending at the boundary.
+- **Timezone.** Upstox stamps candles `+05:30`. This codebase is UTC
+  throughout, and two separate regressions already came from an IST clock
+  time reaching a UTC reader (§111 kill zones, §112 the ICT session open).
+  Converted at the boundary so nothing downstream has to know Upstox
+  exists.
+
+The timezone test initially asserted only the instant, and **passed with
+the conversion removed** — `09:15+05:30` and `03:45+00:00` are the same
+instant, and aware datetimes compare by instant. An injection run caught
+that. It now asserts the offset and the hour (3, not 9), which is what
+actually matters: `app/market/aggregation.py`, `app/smc/liquidity.py` and
+`app/ict/opening_range.py` all read `.hour`/`.date()`/`.weekday()`
+straight off the timestamp.
+
+**Not verified against live servers.** This environment cannot reach
+upstox.com, so the endpoint paths and response shapes are written from
+Upstox's documented v2 forms — the same caveat `app/brokers/upstox/
+adapter.py` already carries, and the reason §120 says to implement against
+current official docs. Parsing is isolated in `parse_candles` / `parse_ltp`
+so it is fixture-tested now and correctable from one real call later,
+without touching the transport code around it.
+
+**Still missing before a real backtest can run:** nothing resolves
+`Instrument.symbol` ("NIFTY") to the `instrument_key` Upstox requires
+("NSE_INDEX|Nifty 50"). `Instrument` has no column for it, so no live call
+can currently name an instrument. That is the next piece.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

@@ -7874,6 +7874,88 @@ parsing and matching are pure functions over already-loaded records and
 the download is the caller's small problem. Nothing here has been
 exercised against Upstox's real master or its real candle payloads.
 
+## Where a candle bucket begins (§14, §16)
+
+Two things here, one fixed and one deliberately left open.
+
+### `bucket_start` gave the same input two different answers
+
+A naive timestamp took whichever path the bucket size chose. The weekly
+branch does no timezone arithmetic and silently returned a bucket; the
+sub-weekly branch subtracts an aware epoch and raised `TypeError: can't
+subtract offset-naive and offset-aware datetimes`. Measured:
+`bucket_start(datetime(2026, 9, 16, 9, 15), 15)` raised while the same
+value at `10080` returned `2026-09-14`.
+
+A naive timestamp is now read **as UTC**, which is the convention this
+codebase has already settled twice — §111's `_utc_hour` and PR #137's
+Upstox candle parser both do the same, and both record why `astimezone()`
+is the wrong call: on a naive value it assumes the *machine's* zone, which
+a UTC-configured CI can never catch. Both branches now agree, and every
+bucket start comes back UTC-aware whatever went in, so a naive bucket
+timestamp can no longer flow back into candle data.
+
+Production was never affected: the DB column is `TIMESTAMP WITH TIME
+ZONE` and the Upstox parser guarantees aware timestamps. This was fixtures
+and any future caller.
+
+### `resample_candles` emits a partial trailing bucket, and says so now
+
+Eighteen 1m candles resampled to 15m give one 15-minute bar and one
+3-minute bar — and nothing distinguishes the second from a closed one.
+`detect_swings`, the strategy engine and every `candles[-1]` read it as
+finished. `CandleWorker` avoids exactly this on the live path, and
+deliberately: it only aggregates once `_completes_bucket` confirms the next
+base candle falls outside the bucket.
+
+`resample_candles` cannot make that check, and the reason is worth stating
+rather than papering over: whether more bars are coming is not something
+the input can say, and a market's closed periods make it undecidable from
+wall-clock alone — a weekly bar built from Monday-to-Friday dailies is
+complete in trading terms and short of its wall-clock end. So the caller
+has to know, and the docstring now says so instead of leaving it to be
+discovered.
+
+**This was reachable because of PR #138.** `resample_candles` has *no
+production caller at all* — `CandleWorker` uses `aggregate_candles` plus
+its own completeness check — and #138's backfill pointed operators at it
+as the way to derive 15m from 1m without mentioning the tail. That
+docstring now sends them to the note first. The hazard is bounded and
+self-correcting in practice (`upsert_candles` overwrites, so the next
+overlapping fetch fixes the bar), but a strategy evaluating in between
+sees a forming bar as closed.
+
+### Open: intraday bars are anchored to midnight UTC, not to the session
+
+Epoch anchoring makes every sub-weekly size align with midnight UTC, and
+`bucket_start`'s docstring used to call that "correct for them" because
+they divide a day evenly. The arithmetic is right and the conclusion
+overreaches: aligning with midnight is not aligning with a *session*.
+Measured against the NSE open at 03:45 UTC (09:15 IST):
+
+| size | open lands |
+|---|---|
+| 3m, 5m, 15m | on the boundary |
+| 30m | 15 min into the bucket |
+| 1h | 45 min in |
+| 2h | 105 min in |
+| 4h | 225 min in |
+
+So at 30m and above the first bar of an NSE day is a stub — an "hourly"
+candle holding fifteen minutes of trading and forty-five of nothing.
+Whether an intraday bar on this market should instead be anchored to 09:15
+IST is a semantics decision about what these bars *mean*, not a defect to
+be silently corrected, and it would move every existing stored bar at
+those sizes. Left to the operator; a parametrized test records the current
+answer so that changing it is a visible choice rather than a drift.
+
+Worth noting for the Upstox path specifically: `30m` is one of the two
+intraday timeframes #138 maps to a provider interval Upstox serves
+natively. If Upstox anchors its own 30-minute bars to the session, the
+same `"30m"` timeframe would mean different things depending on whether a
+bar was fetched or derived. Unverified — this environment cannot ask
+Upstox — and worth checking with the first real fetch.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

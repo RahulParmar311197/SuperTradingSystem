@@ -8711,6 +8711,101 @@ log still says the bar was not derived             -> 1 fail
 
 Both controls were injection-tested alongside the proofs.
 
+## Intraday bars are anchored to the session open (§16) — a latent trap, closed
+
+**A latent trap, said plainly: this changes nothing that runs today.** It
+is here because the trap is real, cheap to remove, and was getting more
+expensive to leave — not because anything is currently producing wrong
+output from it.
+
+`bucket_start` anchored every sub-weekly bucket on the Unix epoch, which
+puts its boundaries on midnight UTC. That is not the same claim as
+aligning with a *session*, and the difference shows up as soon as the bar
+is larger than 15 minutes:
+
+```
+size  | midnight-UTC anchored                      | session anchored
+  15m | 25 bars, first=03:45 (15m)                 | 25 bars, first=03:45 (15m)
+  30m | 13 bars, first=03:30 (15m of 30) last full | 13 bars, first=03:45 (full) last 15m
+   1h |  7 bars, first=03:00 (15m of 60) last full |  7 bars, first=03:45 (full) last 15m
+   4h |  3 bars, first=00:00 (15m of 240)          |  2 bars, first=03:45 (full) last 135m
+```
+
+The day's first "4h candle" was stamped **00:00 UTC = 05:30 IST** — a time
+no NSE instrument has ever traded in — and held fifteen minutes of trading
+out of a nominal two hundred and forty.
+
+### The honest version of the trade-off
+
+Neither anchoring gives every bar its full period. An NSE session is 375
+minutes, and 30, 60, 120 and 240 all fail to divide it, so **exactly one
+bar a day is short whichever anchor is chosen.** The decision is only
+about *where that bar sits*, and it is worth stating that rather than
+pretending the change makes the arithmetic come out even.
+
+Session anchoring is the better place for three reasons:
+
+* A bar stamped before the market opened names a period that never
+  existed. A short *final* bar is stamped at a real trading time, and is
+  what every market with an odd session length already produces.
+* The opening range is the most information-dense part of an NSE day.
+  Burying it inside a bar that is mostly closed market is the worst place
+  to lose resolution.
+* The codebase already declares the session opens at 03:45 UTC —
+  `ICTConfig.session_open_utc`, fixed in an earlier round when it was an
+  IST literal handed to UTC candles — and anchors the opening range on it.
+  The candle grid disagreed, so a strategy combining an opening-range
+  condition with 30m structure was reading two different clocks. Those two
+  declarations now have a test asserting they agree.
+
+### Blast radius, measured rather than asserted
+
+Production derives only 5m and 15m (`app/workers/main.py`) and buckets
+ticks at 1m. 225 divides all of those, so the offset is a **no-op for
+every timeframe in the live path**, and there is a parametrised control
+comparing 1m/3m/5m/15m against the old midnight-UTC formula directly, so
+that claim fails loudly if it ever stops being true. `resample_candles`
+has no production caller at all.
+
+What this closes is the trap waiting for whoever first adds "30m" to
+`derived_timeframes` or resamples to "1h": they would get a first bar of
+the day stamped before the market opened, and — if Upstox's own
+30-minute bars are session-aligned, which this environment cannot reach
+their servers to confirm — a stored series in which backfilled and derived
+bars interleave fifteen minutes apart instead of coinciding, since
+`upsert_candles` keys on `(instrument, timeframe, timestamp)` and would
+treat them as different bars rather than the same one.
+
+Daily and weekly keep calendar anchoring, deliberately. A 00:00–24:00 UTC
+day already contains the whole NSE session, so an offset there fixes
+nothing and would restamp every stored daily bar; weekly keeps the Monday
+anchor from an earlier round. Both are asserted as a control, because the
+offset being intraday-only is the part a later change is most likely to
+"tidy up".
+
+The anchor is a named constant with an optional parameter rather than a
+literal, on the same footing as `ICTConfig.session_open_utc`: a deployment
+trading anything but NSE has to set it, and a 24h market wants zero. There
+is no session calendar here to derive it from.
+
+Where the tests are concerned, one existing parametrised test asserted the
+old alignment. It was written in the round that found it, deliberately, to
+"state the current answer so that changing it is a choice" — so it failed
+here exactly as intended, and stating the new answer is the choice it was
+there to force.
+
+Injection, since anchoring is arithmetic with no stashable defect:
+
+```
+midnight-UTC anchoring restored (the original state) -> 5 fail
+offset added where it should be subtracted           -> 9 fail
+offset applied to daily buckets too                  -> 1 fail  (control)
+session open moved off the ICT one                   -> 6 fail  (control)
+offset used to index but never added back            -> 8 fail
+```
+
+Both controls were injection-tested alongside the proofs.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

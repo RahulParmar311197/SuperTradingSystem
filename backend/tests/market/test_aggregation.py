@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from app.market.aggregation import bucket_start, resample_candles
+from app.market.aggregation import SESSION_OPEN_MINUTES_UTC, bucket_start, resample_candles
 from app.market.timeframes import is_valid_upsample, timeframe_to_minutes
 from app.smc.types import Candle
 
@@ -194,24 +194,112 @@ def test_an_incomplete_trailing_bucket_is_emitted_and_looks_closed():
     assert [c.volume for c in out] == [150.0, 30.0]
 
 
-# --- session alignment, recorded rather than decided -----------------------
+# --- session alignment, now decided ----------------------------------------
+
+_NSE_OPEN = datetime(2026, 9, 16, 3, 45, tzinfo=timezone.utc)   # 09:15 IST
+_NSE_CLOSE = datetime(2026, 9, 16, 10, 0, tzinfo=timezone.utc)  # 15:30 IST
+_INTRADAY_SIZES = (3, 5, 15, 30, 60, 120, 240)
 
 
-@pytest.mark.parametrize(
-    ("minutes", "minutes_into_bucket"),
-    [(3, 0), (5, 0), (15, 0), (30, 15), (60, 45), (120, 105), (240, 225)],
-)
-def test_where_the_nse_open_falls_inside_each_bucket_size(minutes, minutes_into_bucket):
-    """NSE opens at 03:45 UTC (09:15 IST). 3m/5m/15m land on a boundary;
-    30m and larger do not, so the first bar of the day is a stub — a "1h
-    candle" holding 15 minutes of trading and 45 of nothing.
+@pytest.mark.parametrize("minutes", _INTRADAY_SIZES)
+def test_the_days_first_intraday_bar_starts_at_the_session_open(minutes):
+    """Every intraday size now opens its first bar of the day at 03:45 UTC.
 
-    Epoch anchoring makes every sub-weekly size align with *midnight UTC*,
-    which is a different claim from aligning with a session. Whether an
-    intraday bar on this market should be anchored to 09:15 IST instead is
-    a semantics decision for the operator, recorded in ARCHITECTURE.md.
-    This test states the current answer so that changing it is a choice.
+    It did not. Epoch anchoring aligned every sub-weekly size with midnight
+    UTC, which is a different claim from aligning with a session: 3m, 5m
+    and 15m happened to land on the open, but 30m started 15 minutes
+    before it, 1h 45 minutes before, 2h 105 and 4h 225 -- so the day's
+    first "4h candle" was stamped 05:30 IST, a time no NSE instrument had
+    traded in, and held 15 minutes of trading out of a nominal 240.
     """
-    nse_open = datetime(2026, 9, 16, 3, 45, tzinfo=timezone.utc)
-    start = bucket_start(nse_open, minutes)
-    assert (nse_open - start) == timedelta(minutes=minutes_into_bucket)
+    assert bucket_start(_NSE_OPEN, minutes) == _NSE_OPEN
+
+
+def test_the_short_bar_moved_from_the_open_to_the_close():
+    """An NSE session is 375 minutes, which 30/60/120/240 all fail to
+    divide, so exactly one bar a day is short whichever anchor is used.
+    This is the whole decision: *where* that bar sits.
+
+    Asserted as a real count over the session rather than as a claim about
+    one timestamp -- the first bar must be full, and the deficit must be at
+    the end.
+    """
+    for minutes in (30, 60, 120, 240):
+        traded: dict = {}
+        cursor = _NSE_OPEN
+        while cursor < _NSE_CLOSE:
+            traded[bucket_start(cursor, minutes)] = traded.get(bucket_start(cursor, minutes), 0) + 1
+            cursor += timedelta(minutes=1)
+        spans = [count for _, count in sorted(traded.items())]
+        assert spans[0] == minutes, (
+            f"the first {minutes}m bar of the day holds {spans[0]} traded minutes, not {minutes}"
+        )
+        assert sum(spans) == 375
+        assert all(s == minutes for s in spans[:-1]), spans
+        assert spans[-1] <= minutes
+
+
+def test_the_candle_grid_and_the_ict_session_open_agree():
+    """These are two declarations of the same fact and used to disagree.
+
+    `ICTConfig.session_open_utc` is 03:45 UTC (fixed in an earlier round,
+    when it was an IST literal handed to UTC candles) and anchors the
+    opening range. The candle grid anchored on midnight UTC. A strategy
+    combining an opening-range condition with 30m structure was therefore
+    reading two different clocks.
+    """
+    from app.ict.engine import ICTConfig
+
+    session_open = ICTConfig().session_open_utc
+    assert SESSION_OPEN_MINUTES_UTC == session_open.hour * 60 + session_open.minute
+
+
+@pytest.mark.parametrize("minutes", [1, 3, 5, 15])
+def test_the_timeframes_production_actually_uses_are_unchanged(minutes):
+    """Control, and the measurement behind "this changes nothing that runs".
+
+    `app/workers/main.py` derives only 5m and 15m and buckets ticks at 1m.
+    225 divides all of those, so the session offset is a no-op for every
+    timeframe in the live path -- this pins that claim instead of asserting
+    it in prose. Compared against the old midnight-UTC formula directly, so
+    it fails if the offset ever starts biting a live timeframe.
+    """
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    for hours in range(0, 48, 7):
+        for extra in (0, 1, 13, 29, 44, 59):
+            ts = datetime(2026, 9, 16, tzinfo=timezone.utc) + timedelta(hours=hours, minutes=extra)
+            since_epoch = int((ts - epoch).total_seconds() // 60)
+            midnight_anchored = epoch + timedelta(minutes=(since_epoch // minutes) * minutes)
+            assert bucket_start(ts, minutes) == midnight_anchored, ts
+
+
+def test_daily_and_weekly_keep_calendar_anchoring():
+    """Control. The offset is deliberately intraday-only.
+
+    A 00:00-24:00 UTC day already contains the whole NSE session, so there
+    is nothing for an offset to fix there, and shifting it would restamp
+    every stored daily bar. Weekly stays on its Monday anchor, fixed in an
+    earlier round when epoch arithmetic made weeks run Thursday-to-Wednesday.
+    """
+    assert bucket_start(_NSE_OPEN, 1440) == datetime(2026, 9, 16, tzinfo=timezone.utc)
+    # 2026-09-16 is a Wednesday; its week starts on Monday the 14th.
+    assert bucket_start(_NSE_OPEN, 10080) == datetime(2026, 9, 14, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize("minutes", [1, 5, 15, 30, 60, 120, 240, 1440])
+def test_a_bucket_always_contains_the_timestamp_that_chose_it(minutes):
+    """Control on the invariant an anchor offset is most likely to break.
+
+    A bucket start must never be *after* its own timestamp, and never more
+    than one bucket before it. An off-by-one in the offset arithmetic --
+    adding it where it should be subtracted, or forgetting the floor -- is
+    exactly the mistake that produces a bar timestamped in its own future,
+    which nothing downstream would report and every indexed reader would
+    silently believe.
+    """
+    base = datetime(2026, 9, 16, tzinfo=timezone.utc)
+    for offset_minutes in range(0, 1440, 7):
+        ts = base + timedelta(minutes=offset_minutes)
+        start = bucket_start(ts, minutes)
+        assert start <= ts, (ts, start)
+        assert ts - start < timedelta(minutes=minutes), (ts, start)

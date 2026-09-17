@@ -8203,6 +8203,70 @@ dead code — it could not change any outcome. The test that guards this
 asserts on a bounded wait rather than a bare `await`, because a supervisor
 that did swallow cancellation would hang the suite instead of failing it.
 
+## The API process had the same worker bug, and it broke shutdown too (§66, §75)
+
+The previous section fixed three loops and missed a fourth.
+`app/trading/live_reconciliation.py` had the identical unguarded
+`await heartbeat("reconciliation")` inside its `while True`, and one
+injected `ConnectionError` ended it after a single pass:
+
+```
+run() DIED: ConnectionError: Redis went away for a moment   (passes completed: 1)
+```
+
+An AST sweep of every `heartbeat` call site now confirms there is exactly
+one class of these and it is closed:
+
+```
+GUARDED   app/trading/live_reconciliation.py
+GUARDED   app/workers/auto_trade_worker.py
+GUARDED   app/workers/main.py
+GUARDED   app/workers/scanner_worker.py
+```
+
+This copy was worse than the worker ones on three counts.
+
+It runs **inside the API process**, so nothing looked ill afterwards: the
+API kept serving requests and `GET /health` kept reporting the process up.
+What died is §75's order-divergence safety net — the loop that notices a
+live broker's order state no longer matches the local journal and halts
+the account.
+
+And the dead task then broke shutdown. `lifespan` cancelled the task and
+awaited it under `except asyncio.CancelledError: pass` — but cancelling a
+task that has *already finished* does nothing, and awaiting it re-raises
+whatever it stored. The original `ConnectionError` propagated out of
+teardown, skipping the engine and Redis disposal immediately below it,
+which exists precisely to stop connections leaking. One transient Redis
+blip therefore cost the safety net, its own visibility, and the cleanup
+that would have contained it.
+
+Three changes. The heartbeat is guarded, as in the workers. `lifespan`
+now wraps the loop in `supervise`, so a loop that ends is logged and
+restarted rather than silently gone. And teardown catches `Exception`
+alongside `CancelledError`, logging it — `supervise` should make that
+unreachable, but teardown is the wrong place to discover it did not.
+
+`supervise` itself moved from `app/workers/main.py` into
+`app/core/supervision.py`. That is the point of this round rather than a
+tidy-up: there were two entrypoints with the same shape, one was fixed and
+the other was missed, and a second copy would have gone the same way. Its
+`stop_event` is now optional, because the API process has no SIGINT/SIGTERM
+event to pass — it shuts the loop down by cancelling the task, which works
+for exactly the reason the handler catches `Exception` and never
+`BaseException`.
+
+One test written for this round was **vacuous and was rewritten**. The
+first version planted its own already-dead task beside the lifespan's and
+asserted teardown completed; injection showed it passed with the
+`except Exception` clause removed, because `lifespan` awaits the task *it*
+created, not one standing next to it. The replacement substitutes
+`supervise` itself, so the task lifespan holds is the dead one, and it
+then fails against that injection. It deliberately asserts on teardown
+completing rather than on a log line: the app configures its own logging,
+and pinning the message would test that configuration instead of this
+behaviour.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

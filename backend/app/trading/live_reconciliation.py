@@ -64,5 +64,15 @@ async def run(interval_seconds: float = 60.0) -> None:
             await reconcile_all_connected_accounts()
         except Exception:
             logger.exception("Live reconciliation pass failed")
-        await heartbeat("reconciliation")
+        # In its own guard. `heartbeat` is a bare `redis.set` with no error
+        # handling (app/core/redis.py), so outside one a single transient
+        # Redis blip raised straight out of this `while True` and ended the
+        # loop after one pass -- measured. This one runs inside the API
+        # process, so nothing looked ill afterwards: the API kept serving,
+        # `GET /health` kept reporting the process up, and §75's
+        # order-divergence safety net was simply gone.
+        try:
+            await heartbeat("reconciliation")
+        except Exception:
+            logger.exception("Reconciliation heartbeat failed (Redis unreachable?) — the loop continues")
         await asyncio.sleep(interval_seconds)

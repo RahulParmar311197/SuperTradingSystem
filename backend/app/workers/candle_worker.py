@@ -10,7 +10,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from app.core.metrics import DERIVED_CANDLE_SKIPPED
+from app.core.metrics import DERIVED_CANDLE_INCOMPLETE
 from app.core.redis import channel_name, publish
 from app.database.session import async_session_factory
 from app.market.aggregation import aggregate_candles
@@ -140,31 +140,66 @@ class CandleWorker:
             # candle with data actually spanning two different periods,
             # while the true current bucket was never written at all.
             bucket_candles = [c for c in recent if compute_bucket_start(c.timestamp, target_minutes) == target_bucket_ts]
-            if len(bucket_candles) != window:
-                # Deliberately conservative, and deliberately loud. The
-                # worker is tick-driven, so a minute in which nothing
-                # traded leaves no base candle -- routine on an illiquid
-                # instrument -- and it is indistinguishable here from a
-                # minute whose ticks were lost. Skipping keeps a bar that
-                # would misrepresent its period out of the series, at the
-                # cost of leaving a hole in it.
-                #
-                # What was wrong was doing that silently. `ScannerWorker`
-                # and `AutoTradeSupervisor` both read 15m, and an operator
-                # had no way to learn their series had gaps: measured, one
-                # untraded minute in a fifteen-minute bucket dropped the
-                # whole 15m bar with no log line, no metric and no error.
-                # `SimulatedFeed` emits exactly one tick per candle, which
-                # is why nothing in the suite ever noticed.
+            if not bucket_candles:
+                # Nothing traded anywhere in the period, so there is no bar
+                # to write -- a bar has to have an open, and an open is a
+                # traded price. Defensive rather than reachable: this runs
+                # from `_on_candle_closed`, which has just persisted and
+                # committed a base candle that lies inside this very
+                # bucket, so the list holds at least that one.
                 logger.warning(
-                    "Not deriving %s candle at %s for instrument %s: bucket has %d of %d base "
-                    "candles (a minute with no trades, or lost ticks). The %s series will have a "
-                    "gap here.",
+                    "Not deriving %s candle at %s for instrument %s: no base candles in the "
+                    "bucket at all.",
                     target_timeframe, target_bucket_ts, instrument_id,
-                    len(bucket_candles), window, target_timeframe,
                 )
-                DERIVED_CANDLE_SKIPPED.labels(target_timeframe).inc()
+                DERIVED_CANDLE_INCOMPLETE.labels(target_timeframe).inc()
                 return
+            if len(bucket_candles) != window:
+                # **Derive from what traded.** This used to `return` here,
+                # writing no bar at all, on the reasoning that a partial
+                # bucket might misrepresent its period. That was wrong in
+                # the routine case and harmful in the rare one.
+                #
+                # It is wrong in the routine case because a minute in which
+                # nothing traded contributes nothing to an OHLCV bar *by
+                # definition*: the open is the period's first traded price,
+                # the high and low its extremes, the close its last, the
+                # volume its sum, and a minute with no trades supplies none
+                # of them. So the aggregate of the minutes that did trade
+                # is not an approximation of the bar -- it IS the bar.
+                # Measured on a 15m bucket whose minute 7 never traded, the
+                # aggregate of the other fourteen base candles came out
+                # byte-identical to the bar computed from the raw ticks.
+                # The old code discarded that provably-correct bar.
+                #
+                # It is harmful in the rare case (ticks genuinely lost)
+                # because dropping the bar amplifies the damage: one lost
+                # minute became a fifteen-minute hole. And the hole is not
+                # inert. Nothing downstream reads timestamps for adjacency
+                # -- `detect_swings` and every indexed SMC detector walk
+                # the list positionally -- so a missing bar silently welds
+                # two non-adjacent periods together. Measured over a
+                # 300-bar series, dropping any single bar changed
+                # `detect_swings` output in 82 of 290 positions, with real
+                # swings vanishing and swings appearing that never
+                # happened. A bar short one minute's ticks is a smaller
+                # error than that, and it is the same degradation the 1m
+                # series already carries -- which this worker writes
+                # without hesitation, rather than dropping its neighbours
+                # too.
+                #
+                # So: write the bar, and record that it was built from
+                # partial data. The counter still matters -- climbing on an
+                # instrument means either it barely trades or ticks are
+                # being lost, and from here those are indistinguishable.
+                logger.warning(
+                    "Deriving %s candle at %s for instrument %s from %d of %d base candles "
+                    "(a minute with no trades, or lost ticks). The bar is written; it may "
+                    "understate the period's range and volume if ticks were lost.",
+                    target_timeframe, target_bucket_ts, instrument_id,
+                    len(bucket_candles), window,
+                )
+                DERIVED_CANDLE_INCOMPLETE.labels(target_timeframe).inc()
             derived = aggregate_candles(bucket_candles)
             derived = Candle(
                 timestamp=target_bucket_ts,

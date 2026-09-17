@@ -13,17 +13,26 @@ REQUEST_LATENCY = Histogram(
 )
 ORDER_COUNT = Counter("orders_total", "Total orders submitted", ["status"])
 RISK_REJECTION_COUNT = Counter("risk_rejections_total", "Total orders rejected by the risk engine")
-# A derived-timeframe candle that was not written because its bucket was
-# missing at least one base candle. This is not an error -- the worker is
-# tick-driven, so a minute in which nothing traded leaves no base candle,
-# and skipping is the deliberate conservative choice (see
-# `CandleWorker._derive_timeframe`). It is, however, a hole in the series
-# the strategies read, and it used to be a bare `return` that no operator
-# could see. Non-zero and climbing on an instrument means its higher
-# timeframes are incomplete.
-DERIVED_CANDLE_SKIPPED = Counter(
-    "derived_candles_skipped_total",
-    "Derived-timeframe candles not written because their bucket had missing base candles",
+# A derived-timeframe candle whose bucket held fewer base candles than the
+# period has minutes. The bar IS written -- see
+# `CandleWorker._derive_timeframe` for why the aggregate of the minutes
+# that traded is the correct bar -- so this counts incompleteness, not a
+# skip, and it is not an error: the worker is tick-driven, so a minute in
+# which nothing traded leaves no base candle, which is routine on an
+# illiquid instrument.
+#
+# Renamed from `derived_candles_skipped_total`, deliberately and with the
+# exported name changed too. It used to count bars the worker refused to
+# write; keeping a metric called "skipped" for something no longer skipped
+# would have been a label that lies about what it measures. Nothing is
+# scraping this yet, so there are no dashboards to migrate.
+#
+# Non-zero and climbing on an instrument means its higher timeframes are
+# built from partial data: either that instrument barely trades, or ticks
+# are being lost. The two are indistinguishable from here.
+DERIVED_CANDLE_INCOMPLETE = Counter(
+    "derived_candles_incomplete_total",
+    "Derived-timeframe candles built from a bucket missing at least one base candle",
     ["timeframe"],
 )
 

@@ -8607,6 +8607,110 @@ deployment where login availability genuinely outranks brute-force
 protection can set it `True`, and should know that is the trade it is
 making.
 
+## Derived candles are built from what traded (§16) — reversing an earlier call
+
+**A real correctness bug, and one this codebase introduced itself.** Round
+119 fixed a genuine corruption in `CandleWorker._derive_timeframe` — it
+was picking base candles *positionally*, so a gap let it aggregate across
+two buckets and overwrite the previous, already-correct bar. That fix
+(select by bucket timestamp) was right and still stands. The other half
+of that change was not: when the selected bucket held fewer base candles
+than the period has minutes, it wrote **no bar at all**, on the reasoning
+that a partial bucket might misrepresent its period.
+
+That reasoning was wrong, and this reverses it.
+
+### Why the partial bar is the correct bar
+
+An OHLCV bar is defined over what traded: the open is the period's first
+traded price, the high and low its extremes, the close its last, the
+volume its sum. A minute in which nothing traded supplies none of those.
+So the aggregate of the minutes that *did* trade is not an approximation
+of the bar — it **is** the bar.
+
+Measured directly. A 15-minute bucket was built whose minute 7 never
+traded, and the bar computed from the raw ticks was compared against the
+aggregate of the fourteen base candles that exist:
+
+```
+ground truth from raw ticks : open=100.47 high=101.93 low=98.02 close=98.80 volume=3429
+aggregate of 14 base candles: open=100.47 high=101.93 low=98.02 close=98.80 volume=3429
+IDENTICAL
+```
+
+The old code threw that bar away. Which is worth stating plainly: on an
+illiquid instrument — exactly the kind where an untraded minute is
+routine — the higher timeframes were being thinned out of a series that
+was available and correct.
+
+### Why the hole was worse than a partial bar
+
+The rare case is different: ticks genuinely lost. There the bar *is*
+short of data, and dropping it was meant to be the conservative choice.
+It is not, for two reasons.
+
+It **amplifies**. One lost minute became a fifteen-minute hole — the
+damage multiplied by the ratio of the timeframes rather than confined to
+the minute that was lost. And the 1m series keeps its own gap regardless:
+the worker writes the surviving 1m bars without hesitation, so refusing
+to derive from them was never consistent with how the same data is
+treated one timeframe down.
+
+And the hole is **not inert**. Nothing downstream reads timestamps for
+adjacency: `detect_swings` and the indexed SMC detectors walk the list
+positionally, so a missing bar silently welds two non-adjacent periods
+together. Measured over a 300-bar series, dropping any single bar changed
+`detect_swings` output in **82 of 290 positions** — with real swings
+vanishing and swings appearing that never happened. A bar built from
+fourteen minutes instead of fifteen is a much smaller error than a
+fabricated swing, and `ScannerWorker` and `AutoTradeSupervisor` both read
+15m, which Upstox does not serve directly and which therefore only ever
+comes from this derive path.
+
+### What it does now
+
+Derive whenever the bucket holds any base candle; write nothing only when
+the whole period had no trades at all — a bar needs an open, and an open
+is a traded price. That empty case is defensive rather than reachable:
+`_derive_timeframe` runs from `_on_candle_closed`, which has just
+committed a base candle lying inside the very bucket being derived.
+
+`derived_candles_skipped_total` is renamed to
+`derived_candles_incomplete_total`, exported name included. It no longer
+counts bars refused; it counts bars built from partial data, and keeping a
+metric called "skipped" for something no longer skipped would be a label
+that lies about what it measures. Nothing scrapes it yet, so there are no
+dashboards to migrate. Climbing on one instrument still means the same
+thing it always did — either that instrument barely trades, or ticks are
+being lost — and from inside the worker those remain indistinguishable.
+
+### On the tests that had to change
+
+Two existing tests asserted the old behaviour (no bar written), so they
+were rewritten rather than deleted, and it is worth being explicit about
+which side was wrong: **the tests were right about what the code did and
+wrong about what it should do.** The property they were really guarding —
+that an incomplete bucket must not corrupt the bar before it — is
+unchanged and still asserted, now alongside the assertion that the current
+bucket gets its own bar at its own timestamp. The new bar is checked
+against the ticks that were actually fed rather than hand-copied
+constants, so it has to match the period it claims to describe rather than
+merely be non-empty.
+
+Injection, since several of these assert behaviour rather than a stash-able
+diff:
+
+```
+old behaviour restored (skip the incomplete bar)   -> 2 fail
+aggregates the lookback window, not this bucket    -> 1 fail
+incomplete bucket no longer counted                -> 1 fail
+every bucket counted as incomplete                 -> 1 fail  (control)
+empty-bucket guard removed                         -> 1 fail  (control)
+log still says the bar was not derived             -> 1 fail
+```
+
+Both controls were injection-tested alongside the proofs.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

@@ -8462,6 +8462,54 @@ That is the fourth vacuous test caught by injection in this sequence of
 rounds, and the reason the discipline is worth its cost: a green tick on a
 test that cannot fail is worse than no test, because it reads as coverage.
 
+## The backtest report, probed and guarded (§48) — no bug found
+
+**The second consecutive clean result**, and worth saying plainly: four
+probes in a row have now come back clean, which is itself a finding about
+where this codebase stands.
+
+`compute_metrics` was probed over 20,000 random trade sets, every reported
+number recomputed independently from the same trades: **0 discrepancies**.
+The equity curve starts at the starting capital and ends at capital plus
+net profit with length `total_trades + 1`; `max_drawdown` equals the worst
+peak-to-trough on that same curve; `monthly_returns` partitions the P&L
+exactly; and no ratio ever goes non-finite.
+
+Route authorization was probed the same way: every route in
+`app/api/admin.py` requires `require_admin`. The one result that looked
+alarming — `POST /trading-permissions/grant` guarded only by
+`get_current_user` — is **by design, checked not assumed**: the module is
+documented as self-service, requires `confirm: true`, writes an audit row,
+and exists because `POST /auto-trading/enable`'s `require_permission` gate
+otherwise had no way to ever be satisfied. It is an opt-in against
+*accidental* activation, not an authorization boundary against the account
+holder, who is trading their own account.
+
+What was thin, again, is coverage. Before this file the only assertions on
+`compute_metrics` output were `win_rate == 1.0` and the equity curve's
+length. `max_drawdown` — the headline number someone reads to decide
+whether a strategy is safe to run — had none at all, nor did the drawdown
+curve, `monthly_returns`, `expectancy` or `average_r`. The risk ratios are
+covered separately and deliberately not repeated here.
+
+Because these tests assert behaviour that was already correct, injection
+is the only honest measurement:
+
+```
+drawdown sign inverted                          -> 2 fail
+peak tracks last equity, not the high-water mark -> 2 fail
+monthly buckets overwrite instead of accumulate  -> 1 fail
+equity curve omits its starting point            -> 3 fail
+profit_factor returns infinity again             -> 2 fail
+```
+
+The control was injection-tested too, not just the proofs — the lesson
+from four vacuous tests caught earlier in this sequence. The last
+injection is the shape of a real bug this codebase already had: an
+infinite `profit_factor` cannot be stored in `Numeric(10, 4)`, and in the
+replay path it wedged a whole session for exactly as long as the user was
+winning.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

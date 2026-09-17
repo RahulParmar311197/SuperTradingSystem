@@ -8018,6 +8018,52 @@ A control test asserts the warning fires on the gap and on nothing else —
 a warning that also fires on the happy path is one an operator learns to
 ignore.
 
+## A backtest position open at the last candle (§46-48, §77-78)
+
+`BacktestEngine.run` kept the position it was holding in a local
+`open_trade` and returned only completed trades. A run that opened a
+position and still held it when the data ran out therefore returned `[]`,
+which is the same value a strategy that never fired returns, and
+`compute_metrics` then reported `total_trades: 0` over it.
+
+Measured before the change, with a stub strategy that fires once on a
+flat 10-candle series whose stop and target are never touched:
+
+```
+candles fed           : 10
+closed trades returned: 0
+engine.open_trade     : (did not exist)
+```
+
+The bias runs one way. A strategy whose stop is wide enough that the
+window ends before price reaches it has exactly those trades omitted,
+while the trades that did close — including its winners — are counted.
+Nothing about the omission is symmetric, and §77-78's out-of-sample
+comparison reads the same numbers off three consecutive splits, so every
+split's trailing position is dropped the same way.
+
+`ReplayEngine` never had this problem: it has always exposed `open_trade`
+as instance state, and both `app/api/replay.py` and
+`app/replay/persistence.py` read it. The backtester is the sibling
+implementation that kept the same state private.
+
+What changed: `BacktestEngine` now publishes an `OpenBacktestPosition`
+(direction, entry, stop, target, quantity, `opened_at`, `last_price`,
+`unrealized_pnl`), resets it at the top of every `run`, and logs a warning
+when a run ends holding one. `backtests.open_position` (migration
+`f3a92b7c5d10`) stores it as nullable JSON, and `POST /backtest` and
+`GET /backtest/{id}` both return it as `open_position`, `null` on the
+runs — most of them — that end flat.
+
+What deliberately did **not** change: the metrics still cover closed
+trades only. `unrealized_pnl` is gross and marked at the final candle's
+close — no exit happened, so no exit cost is charged and no fill price is
+being claimed. Folding an unclosed position into `total_trades`,
+`win_rate` or the equity curve would mean marking it to market and calling
+that a result, which is a decision about what a backtest reports, not one
+to take quietly underneath an existing report. The position is now
+visible; what to do with it is the reader's call.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

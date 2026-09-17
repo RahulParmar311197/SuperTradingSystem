@@ -38,6 +38,14 @@ class Backtest(Base):
     status: Mapped[BacktestStatus] = mapped_column(
         Enum(BacktestStatus, name="backtest_status"), default=BacktestStatus.QUEUED
     )
+    # The position the strategy still held when the data ran out, if any.
+    # `backtest_trades` holds only *closed* trades, and the engine used to
+    # discard this one entirely -- so a run that opened a position and held
+    # it to the last candle was stored as zero trades, indistinguishable
+    # from a strategy that never fired. Persisted so `GET /backtest/{id}`
+    # answers the same as the POST that created it. NULL means the run
+    # ended flat.
+    open_position: Mapped[dict | None] = mapped_column(JSON)
 
     created_at: Mapped[datetime] = created_at_col()
 

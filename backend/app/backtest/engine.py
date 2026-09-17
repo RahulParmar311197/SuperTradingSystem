@@ -8,6 +8,7 @@ implementation of the trading logic.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -20,6 +21,41 @@ from app.smc.types import Candle
 from app.strategy.context import EvaluationContext
 from app.strategy.dsl import StrategyDefinition
 from app.strategy.engine import StrategyEngine
+
+logger = logging.getLogger("backtest.engine")
+
+
+@dataclass(slots=True)
+class OpenBacktestPosition:
+    """A position the strategy opened and the data ran out before closing.
+
+    The backtest used to drop this on the floor: `run` kept `open_trade`
+    local and returned only completed trades, so a run that opened a
+    position and held it to the last candle came back as `[]` --
+    indistinguishable from a strategy that never fired at all, and
+    `compute_metrics` then reported `total_trades: 0`.
+
+    The bias runs one way. A strategy that holds losers -- a stop wide
+    enough that the data window ends before it is touched -- has exactly
+    those trades omitted, while its winners closed and counted. That is
+    the direction that flatters, and §37's out-of-sample comparison reads
+    those same numbers.
+
+    `unrealized_pnl` is marked at the final candle's close and is gross:
+    no exit cost is charged, because no exit happened. It is deliberately
+    *not* folded into the metrics -- whether an open position should be
+    marked to market and counted as a trade is a decision about what a
+    backtest reports, not something to change quietly underneath one.
+    """
+
+    direction: str
+    entry_price: float
+    stop: float
+    target: float
+    quantity: float
+    opened_at: datetime
+    last_price: float
+    unrealized_pnl: float
 
 
 @dataclass(slots=True)
@@ -51,8 +87,14 @@ class BacktestEngine:
         self.ict_engine = ICTEngine(ict_config)
         self.strategy_engine = StrategyEngine()
         self.max_position_size = max_position_size
+        # Mirrors `ReplayEngine.open_trade`, which has always exposed the
+        # position it is holding -- `app/api/replay.py` and
+        # `app/replay/persistence.py` both read it. The backtester kept
+        # the same state private and discarded it.
+        self.open_trade: OpenBacktestPosition | None = None
 
     def run(self, candles: list[Candle], symbol: str) -> list[BacktestTradeRecord]:
+        self.open_trade = None
         trades: list[BacktestTradeRecord] = []
         equity = self.starting_capital
         open_trade: dict | None = None
@@ -100,7 +142,33 @@ class BacktestEngine:
                 if result.matched and candle.low <= result.entry <= candle.high:
                     open_trade = self._open_trade(result, candle, equity)
 
+        if open_trade is not None and candles:
+            self.open_trade = self._describe_open(open_trade, candles[-1])
+            logger.warning(
+                "Backtest ended with an open %s position in %s opened at %s (entry %.4f, stop %.4f): "
+                "it is reported as `open_trade` and is NOT counted in the returned trades or in any "
+                "metric computed from them.",
+                self.open_trade.direction, symbol, self.open_trade.opened_at,
+                self.open_trade.entry_price, self.open_trade.stop,
+            )
+
         return trades
+
+    @staticmethod
+    def _describe_open(open_trade: dict, last: Candle) -> OpenBacktestPosition:
+        sign = 1 if open_trade["direction"] == Direction.LONG else -1
+        return OpenBacktestPosition(
+            direction=open_trade["direction"].value,
+            entry_price=open_trade["entry_price"],
+            stop=open_trade["stop"],
+            target=open_trade["target"],
+            quantity=open_trade["quantity"],
+            opened_at=open_trade["opened_at"],
+            last_price=last.close,
+            # Gross, and marked at the close: no exit happened, so no exit
+            # cost is charged and no fill price is being claimed.
+            unrealized_pnl=(last.close - open_trade["entry_price"]) * open_trade["quantity"] * sign,
+        )
 
     def _open_trade(self, result, candle: Candle, equity: float) -> dict:
         is_long = result.direction.lower() == "bullish"

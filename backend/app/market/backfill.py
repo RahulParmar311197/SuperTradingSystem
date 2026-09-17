@@ -56,8 +56,8 @@ def upstox_interval_for(timeframe: str) -> str:
         raise ValueError(
             f"Upstox does not serve {timeframe!r} directly (it offers "
             f"{sorted(_UPSTOX_INTERVAL_BY_TIMEFRAME)}). Backfill '1m' and derive this one with "
-            "app.market.aggregation.resample_candles rather than storing another interval's "
-            "bars under this label."
+            "app.market.aggregation.resample_candles -- reading its note on the trailing "
+            "bucket first -- rather than storing another interval's bars under this label."
         )
     return interval
 

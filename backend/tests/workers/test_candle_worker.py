@@ -138,3 +138,64 @@ async def test_derive_timeframe_skips_an_incomplete_bucket_instead_of_corrupting
     assert len(five_min) == 1
     assert five_min[0].open == 100.0
     assert five_min[0].close == 104.0
+
+
+async def test_a_skipped_derivation_is_visible_to_an_operator(db_instrument, caplog):
+    """The skip above is a deliberate choice; being silent about it was not.
+
+    A minute in which nothing traded leaves no base candle (the worker is
+    tick-driven), which is routine on an illiquid instrument and
+    indistinguishable here from lost ticks. Skipping keeps a bar that
+    would misrepresent its period out of the series — but it leaves a hole
+    in it, and `ScannerWorker` and `AutoTradeSupervisor` both read 15m.
+
+    Measured before this: one untraded minute dropped the whole bar with
+    no log line, no metric and no error, so an operator could not learn
+    their higher timeframes were incomplete. `SimulatedFeed` emits exactly
+    one tick per candle, which is why nothing in the suite noticed.
+    """
+    import logging
+
+    from app.core.metrics import DERIVED_CANDLE_SKIPPED
+
+    def _skipped() -> float:
+        return DERIVED_CANDLE_SKIPPED.labels("5m")._value.get()
+
+    before = _skipped()
+    worker = CandleWorker({db_instrument.symbol: db_instrument.id}, base_timeframe="1m", derived_timeframes=["5m"])
+    start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
+
+    with caplog.at_level(logging.WARNING, logger="workers.candle"):
+        # Minutes 0-4 complete the first bucket; minute 2 never trades, so
+        # that bucket has 4 of its 5 base candles.
+        for i in (0, 1, 3, 4, 5):
+            await worker.process_tick(_tick(db_instrument.symbol, start + timedelta(minutes=i), 100.0 + i))
+
+    async with async_session_factory() as db:
+        assert await get_candles(db, db_instrument.id, "5m") == []
+
+    assert _skipped() == before + 1
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("4 of 5 base candles" in m for m in warnings), warnings
+    assert any("gap" in m for m in warnings), warnings
+
+
+async def test_a_complete_bucket_logs_nothing_and_counts_nothing(db_instrument, caplog):
+    # Control: the warning must fire on the gap and on nothing else, or it
+    # is noise an operator will learn to ignore.
+    import logging
+
+    from app.core.metrics import DERIVED_CANDLE_SKIPPED
+
+    before = DERIVED_CANDLE_SKIPPED.labels("5m")._value.get()
+    worker = CandleWorker({db_instrument.symbol: db_instrument.id}, base_timeframe="1m", derived_timeframes=["5m"])
+    start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
+
+    with caplog.at_level(logging.WARNING, logger="workers.candle"):
+        for i in range(6):
+            await worker.process_tick(_tick(db_instrument.symbol, start + timedelta(minutes=i), 100.0 + i))
+
+    async with async_session_factory() as db:
+        assert len(await get_candles(db, db_instrument.id, "5m")) == 1
+    assert DERIVED_CANDLE_SKIPPED.labels("5m")._value.get() == before
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == []

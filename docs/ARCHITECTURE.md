@@ -7956,6 +7956,68 @@ same `"30m"` timeframe would mean different things depending on whether a
 bar was fetched or derived. Unverified — this environment cannot ask
 Upstox — and worth checking with the first real fetch.
 
+## A quiet minute and the derived candle it costs (§16, §66)
+
+`CandleWorker._derive_timeframe` writes a higher-timeframe candle only
+when its bucket holds exactly `window` base candles — fifteen 1m bars for
+a 15m one. The worker is tick-driven, so **a minute in which nothing
+traded produces no base candle at all**, and the bucket comes up one
+short. Measured:
+
+```
+every minute traded (0..14)   -> 15m candle written: YES
+minute 7 had no trades        -> 15m candle written: NO
+```
+
+This is the only writer for derived timeframes and it only fires on the
+tick that completes the bucket, so that 15m bar is missing permanently.
+`ScannerWorker` and `AutoTradeSupervisor` both run at 15m, so the hole
+lands directly under the strategies, and `detect_swings` then reads a
+discontinuous series as if it were continuous.
+
+Nothing in the suite noticed because `SimulatedFeed` emits exactly one
+tick per candle, with no gaps — the shape of test data hid a property of
+real data.
+
+### Why the skip stays, for now
+
+The obvious fix — require the bucket's *opening* slot instead of a full
+count, so later gaps read as quiet minutes — was written, measured
+working, and **reverted**. It breaks
+`test_derive_timeframe_skips_an_incomplete_bucket_instead_of_corrupting_the_prior_one`,
+which records skipping a gapped bucket as a deliberate choice.
+
+That test is right to exist, and the conflict is real rather than
+accidental: **this layer cannot distinguish a minute with no trades from a
+minute whose ticks were lost.** Both leave no base candle. The two
+readings trade off against each other —
+
+- *assume quiet, derive anyway*: correct for an illiquid instrument, where
+  gaps are constant; wrong during a feed outage, where it publishes a bar
+  built from partial data without saying so.
+- *assume loss, skip* (today): correct during an outage; loses bars
+  routinely on anything thinly traded.
+
+Neither is strictly right, and the choice changes what the strategies see.
+That makes it the operator's call, not one to take silently while they are
+away. Worth noting the reverted fix did **not** reintroduce the
+positional-slicing bug that test was originally written for — the previous
+bucket stayed intact under it; only the skip-versus-derive policy moved.
+
+### What did change: the skip is no longer silent
+
+Whichever policy wins, dropping a bar the strategies depend on should be
+observable. It was a bare `return`: no log line, no metric, no error, and
+no way for an operator to learn their 15m series had holes. It now logs a
+warning naming the instrument, the bucket and how many of the expected
+base candles were found, and increments
+`derived_candles_skipped_total{timeframe}`. Non-zero and climbing on an
+instrument means its higher timeframes are incomplete.
+
+A control test asserts the warning fires on the gap and on nothing else —
+a warning that also fires on the happy path is one an operator learns to
+ignore.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

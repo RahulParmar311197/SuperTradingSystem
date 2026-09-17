@@ -10,6 +10,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
+from app.core.metrics import DERIVED_CANDLE_SKIPPED
 from app.core.redis import channel_name, publish
 from app.database.session import async_session_factory
 from app.market.aggregation import aggregate_candles
@@ -140,6 +141,29 @@ class CandleWorker:
             # while the true current bucket was never written at all.
             bucket_candles = [c for c in recent if compute_bucket_start(c.timestamp, target_minutes) == target_bucket_ts]
             if len(bucket_candles) != window:
+                # Deliberately conservative, and deliberately loud. The
+                # worker is tick-driven, so a minute in which nothing
+                # traded leaves no base candle -- routine on an illiquid
+                # instrument -- and it is indistinguishable here from a
+                # minute whose ticks were lost. Skipping keeps a bar that
+                # would misrepresent its period out of the series, at the
+                # cost of leaving a hole in it.
+                #
+                # What was wrong was doing that silently. `ScannerWorker`
+                # and `AutoTradeSupervisor` both read 15m, and an operator
+                # had no way to learn their series had gaps: measured, one
+                # untraded minute in a fifteen-minute bucket dropped the
+                # whole 15m bar with no log line, no metric and no error.
+                # `SimulatedFeed` emits exactly one tick per candle, which
+                # is why nothing in the suite ever noticed.
+                logger.warning(
+                    "Not deriving %s candle at %s for instrument %s: bucket has %d of %d base "
+                    "candles (a minute with no trades, or lost ticks). The %s series will have a "
+                    "gap here.",
+                    target_timeframe, target_bucket_ts, instrument_id,
+                    len(bucket_candles), window, target_timeframe,
+                )
+                DERIVED_CANDLE_SKIPPED.labels(target_timeframe).inc()
                 return
             derived = aggregate_candles(bucket_candles)
             derived = Candle(

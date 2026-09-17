@@ -39,6 +39,30 @@ class RunBacktestRequest(BaseModel):
     cost_model: dict = {}
 
 
+class OpenPositionResponse(BaseModel):
+    """A position the strategy still held when the data ran out.
+
+    Separate from the metrics below on purpose. `total_trades` and every
+    number beside it are computed over *closed* trades, and folding an
+    unclosed one in would mean marking it to market and calling that a
+    result -- a decision about what a backtest reports, not one to take
+    silently. What was wrong was that this position was dropped entirely,
+    so a run that opened one and held it came back as `total_trades: 0`,
+    indistinguishable from a strategy that never fired.
+    """
+
+    direction: str
+    entry_price: float
+    stop: float
+    target: float
+    quantity: float
+    opened_at: datetime
+    last_price: float
+    # Gross and marked at the final candle's close: no exit happened, so
+    # no exit cost is charged and no fill price is being claimed.
+    unrealized_pnl: float
+
+
 class BacktestMetricsResponse(BaseModel):
     backtest_id: uuid.UUID
     total_return: float
@@ -58,6 +82,8 @@ class BacktestMetricsResponse(BaseModel):
     equity_curve: list[float]
     drawdown_curve: list[float]
     monthly_returns: dict[str, float]
+    # None when the run ended flat, which is most of them.
+    open_position: OpenPositionResponse | None = None
 
 
 @router.post("", response_model=BacktestMetricsResponse)
@@ -76,6 +102,9 @@ async def run_backtest(
     engine = BacktestEngine(strategy, starting_capital=payload.starting_capital, cost_model=CostModel(**payload.cost_model))
     trades = engine.run(candles, symbol=str(payload.instrument_id))
     metrics = compute_metrics(trades, payload.starting_capital)
+    open_position = (
+        OpenPositionResponse(**dataclasses.asdict(engine.open_trade)) if engine.open_trade is not None else None
+    )
 
     backtest_row = BacktestRow(
         user_id=user.id,
@@ -87,6 +116,7 @@ async def run_backtest(
         starting_capital=payload.starting_capital,
         cost_model=payload.cost_model,
         status=BacktestStatus.COMPLETED,
+        open_position=(open_position.model_dump(mode="json") if open_position is not None else None),
     )
     db.add(backtest_row)
     await db.flush()
@@ -133,7 +163,9 @@ async def run_backtest(
     # BacktestMetricsResult is `@dataclass(slots=True)` — no `__dict__`
     # attribute; POST /backtest had never had a test hit it, so it 500'd
     # on every call that reached this line.
-    return BacktestMetricsResponse(backtest_id=backtest_row.id, **dataclasses.asdict(metrics))
+    return BacktestMetricsResponse(
+        backtest_id=backtest_row.id, open_position=open_position, **dataclasses.asdict(metrics)
+    )
 
 
 class ValidateBacktestRequest(BaseModel):
@@ -257,4 +289,9 @@ async def get_backtest(
         equity_curve=metrics_row.equity_curve,
         drawdown_curve=metrics_row.drawdown_curve,
         monthly_returns=metrics_row.monthly_returns,
+        open_position=(
+            OpenPositionResponse(**backtest_row.open_position)
+            if backtest_row.open_position is not None
+            else None
+        ),
     )

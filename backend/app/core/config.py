@@ -70,6 +70,29 @@ class Settings(BaseSettings):
     # on nothing but test volume rather than actual abuse.
     rate_limit_enabled: bool = True
 
+    # What to do when the limiter cannot reach Redis. This used to be an
+    # accident rather than a choice: `check_rate_limit` is a bare
+    # `redis.incr`/`expire`, the dependency did not catch it, and a Redis
+    # outage therefore turned `POST /auth/login` and `POST /auth/register`
+    # into unhandled 500s -- measured. Both the deny and the allow reading
+    # are defensible and neither is free:
+    #
+    #   False (default, and what the 500 effectively did): deny. Nobody
+    #     logs in while Redis is down, including the operator who needs
+    #     the admin endpoints to resume halted accounts and lift the kill
+    #     switch -- both of which live in Redis (see
+    #     app/risk/kill_switch.py).
+    #   True: allow. Login stays up, and brute-force protection is gone
+    #     for the duration, which is also exactly when an attacker who
+    #     caused the outage would want it gone.
+    #
+    # Defaulting to False keeps today's security posture unchanged; the
+    # bug being fixed is the 500, not the decision. Whichever way this is
+    # set, the request now gets an honest 503 with `Retry-After` rather
+    # than a traceback counted as a server defect in
+    # `http_requests_total{status_code="500"}`.
+    rate_limit_fail_open: bool = False
+
     # How many trusted reverse proxies sit in front of this process.
     # 0 (the default) means "none": the rate limiter keys on the socket
     # peer, which is then the real client. Behind a proxy the peer is the

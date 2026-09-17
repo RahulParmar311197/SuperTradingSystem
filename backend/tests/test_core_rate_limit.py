@@ -182,3 +182,98 @@ async def test_forging_a_fresh_address_each_try_does_not_evade_the_limit(require
     # one it saw. If the limiter read the left of the chain this would be
     # twelve 200s and the guard would be decorative.
     assert codes == [200] * 10 + [429, 429]
+
+
+# --- Redis unreachable: an honest 503, not a 500 -------------------------
+
+
+class _DeadRedis:
+    """Every call raises the way redis-py does when nothing is listening."""
+
+    async def incr(self, *args, **kwargs):
+        raise ConnectionError("Error 111 connecting to redis:6379. Connection refused.")
+
+    async def expire(self, *args, **kwargs):
+        raise ConnectionError("Error 111 connecting to redis:6379. Connection refused.")
+
+
+def _limited_app(monkeypatch, **setting_overrides):
+    """A minimal app carrying the real dependency, with Redis dead."""
+    import app.core.redis as core_redis
+    from fastapi import Depends, FastAPI
+    from fastapi.testclient import TestClient
+
+    from app.core.config import get_settings
+    from app.core.rate_limit import rate_limit
+
+    monkeypatch.setattr(core_redis, "get_redis", lambda: _DeadRedis())
+    settings = get_settings()
+    monkeypatch.setattr(settings, "rate_limit_enabled", True)
+    for key, value in setting_overrides.items():
+        monkeypatch.setattr(settings, key, value)
+
+    api = FastAPI()
+
+    @api.post("/login", dependencies=[Depends(rate_limit(limit=10, window_seconds=60, key_prefix="auth:login"))])
+    async def _login() -> dict:
+        return {"ok": True}
+
+    return TestClient(api, raise_server_exceptions=False)
+
+
+def test_a_redis_outage_answers_503_not_500(monkeypatch):
+    """The bug. Measured through the real app before this: `POST /auth/login`
+    and `POST /auth/register` both returned 500 on an unhandled
+    `ConnectionError`.
+
+    500 is wrong whichever way the fail-open/fail-closed policy goes. It
+    claims this service has a defect when a dependency is merely
+    unreachable, and `app/core/middleware.py` counts it into
+    `http_requests_total{status_code="500"}` — so a Redis blip lands in the
+    metric an operator watches for real bugs.
+    """
+    with _limited_app(monkeypatch, rate_limit_fail_open=False) as client:
+        response = client.post("/login")
+
+    assert response.status_code == 503
+    assert response.headers.get("Retry-After") == "5"
+
+
+def test_the_default_still_refuses_so_the_security_posture_is_unchanged(monkeypatch):
+    # The 500 effectively denied the request. Defaulting `rate_limit_fail_open`
+    # to False keeps that, so this change fixes the status code without
+    # quietly weakening brute-force protection.
+    from app.core.config import get_settings
+
+    assert get_settings().rate_limit_fail_open is False
+
+    with _limited_app(monkeypatch) as client:
+        assert client.post("/login").status_code == 503
+
+
+def test_fail_open_lets_the_request_through(monkeypatch):
+    # The other half of the choice, so the setting is not decorative.
+    with _limited_app(monkeypatch, rate_limit_fail_open=True) as client:
+        response = client.post("/login")
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+
+
+def test_a_healthy_redis_is_untouched_by_any_of_this(monkeypatch):
+    # Control: the ordinary path must still allow under the limit and 429
+    # over it, with neither 503 nor the fail-open branch involved.
+    import app.core.rate_limit as rl
+
+    calls = {"n": 0}
+
+    async def fake_check(key, limit, window_seconds):
+        calls["n"] += 1
+        return calls["n"] <= 2
+
+    monkeypatch.setattr(rl, "check_rate_limit", fake_check)
+
+    with _limited_app(monkeypatch, rate_limit_fail_open=True) as client:
+        assert client.post("/login").status_code == 200
+        assert client.post("/login").status_code == 200
+        assert client.post("/login").status_code == 429

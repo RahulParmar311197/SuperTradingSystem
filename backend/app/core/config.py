@@ -86,11 +86,24 @@ class Settings(BaseSettings):
     #     for the duration, which is also exactly when an attacker who
     #     caused the outage would want it gone.
     #
-    # Defaulting to False keeps today's security posture unchanged; the
-    # bug being fixed is the 500, not the decision. Whichever way this is
-    # set, the request now gets an honest 503 with `Retry-After` rather
-    # than a traceback counted as a server defect in
-    # `http_requests_total{status_code="500"}`.
+    # DECIDED: deny. This was left as an open question when the 500 was
+    # fixed; it is now settled on merit rather than on caution.
+    #
+    # The limiter's job on `/auth/login` is to blunt credential stuffing.
+    # Failing open during a Redis outage hands an attacker exactly the
+    # window they would engineer if they could -- take out the shared
+    # cache, then brute-force unthrottled -- which makes the outage an
+    # amplifier rather than a nuisance.
+    #
+    # The operator-lockout argument is real but weaker than it first
+    # looks: with Redis down, `account_halt_reason` and the kill switch
+    # cannot be read either (app/core/redis.py), so the admin actions
+    # someone would log in to perform would not work regardless. The
+    # remedy for "Redis is down" is to restore Redis, which
+    # docker-compose.yml's `restart: unless-stopped` now does on its own.
+    #
+    # Set it True only for a deployment where login availability genuinely
+    # outranks brute-force protection, and know that is the trade.
     rate_limit_fail_open: bool = False
 
     # How many trusted reverse proxies sit in front of this process.

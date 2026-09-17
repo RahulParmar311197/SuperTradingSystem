@@ -432,5 +432,13 @@ class AutoTradeSupervisor:
                 await self.run_once()
             except Exception:
                 logger.exception("Auto-trade pass failed")
-            await heartbeat("auto_trade")
+            # See ScannerWorker.run: `heartbeat` is a bare `redis.set`, and
+            # outside this guard one transient Redis error ended the task
+            # after a single pass -- silently stopping unattended
+            # autonomous trading (§54) while the process stayed up and
+            # looked healthy.
+            try:
+                await heartbeat("auto_trade")
+            except Exception:
+                logger.exception("Auto-trade heartbeat failed (Redis unreachable?) — the loop continues")
             await asyncio.sleep(self.interval_seconds)

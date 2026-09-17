@@ -243,5 +243,18 @@ class ScannerWorker:
                 await self.run_once()
             except Exception:
                 logger.exception("Scanner pass failed")
-            await heartbeat("scanner")
+            # In its own guard, and NOT outside the try it used to sit
+            # outside of. `heartbeat` is a bare `redis.set` with no error
+            # handling (app/core/redis.py), so one transient Redis blip --
+            # a failover, a restart, a dropped connection -- used to raise
+            # straight out of this `while True`, ending the task. Measured:
+            # a single ConnectionError killed the loop after one pass. The
+            # process stayed alive and apparently healthy, so nothing
+            # restarted it and the scanner simply stopped, permanently.
+            # The call that exists to report liveness must not be the one
+            # that ends it.
+            try:
+                await heartbeat("scanner")
+            except Exception:
+                logger.exception("Scanner heartbeat failed (Redis unreachable?) — the loop continues")
             await asyncio.sleep(self.interval_seconds)

@@ -8123,6 +8123,86 @@ NSE equity is a number to choose deliberately against real data, not to
 invent in passing — so it is left for the operator to decide, and until
 then the audit row says nothing rather than something false.
 
+## A worker could die without anything noticing (§54, §66, §117)
+
+Two defects, one failure. `app/core/redis.py`'s `heartbeat` is a bare
+`redis.set` with no error handling, and both worker loops called it
+**outside** the `try` that guards each pass:
+
+```python
+while True:
+    try:
+        await self.run_once()
+    except Exception:
+        logger.exception("Auto-trade pass failed")
+    await heartbeat("auto_trade")      # <- outside the guard
+    await asyncio.sleep(self.interval_seconds)
+```
+
+Measured by injecting one `ConnectionError` into `heartbeat`:
+
+```
+ScannerWorker          run() DIED: ConnectionError   (passes completed: 1)
+AutoTradeSupervisor    run() DIED: ConnectionError   (passes completed: 1)
+```
+
+A single transient Redis blip — a failover, a restart, a dropped
+connection — raised straight out of `while True` and ended the task after
+one pass. The call whose entire job is to report that a worker is alive
+was the call that killed it.
+
+Nothing then noticed. `app/workers/main.py` created each worker with
+`asyncio.create_task` and sat in `await stop_event.wait()`, which only
+SIGINT/SIGTERM ever sets:
+
+```
+task 'autotrade' done=True  stop_event set=False
+main() would still be sitting in `await stop_event.wait()`
+at shutdown, gather(return_exceptions=True) hands back:
+    [ConnectionError('Redis went away for a moment')]
+...and main() discards it without looking.
+```
+
+So the process stayed alive and the container stayed up with the worker
+gone, and the cause was collected at shutdown and thrown away without
+ever being logged. For unattended autonomous trading (§54) that is the
+failure mode you must not have quietly: the account simply stops trading,
+with open positions still held, and the only symptom is a heartbeat that
+stopped — from the one code path that was already broken.
+
+Both halves are fixed. The heartbeat now sits in its own guard in all
+three loops (`ScannerWorker.run`, `AutoTradeSupervisor.run`, and
+`_bridge_market_data_to_candles`), so a Redis error is logged and the loop
+continues; a pass that fails is still tolerated exactly as before, and
+still heartbeats, because the loop is in fact alive. And `main` now wraps
+each worker in `_supervise`, which logs a worker that ends — **raised or
+simply returned** — and restarts it after a bounded backoff (5s, doubling
+to 60s), standing down as soon as `stop_event` is set.
+
+The plain-return case is the one no exception handler would ever have
+caught: `_bridge_market_data_to_candles` ends by returning when its feed
+stops yielding, which is exactly what a dropped market-data WebSocket
+looks like from inside that loop.
+
+Restarting in-process rather than exiting is deliberate, and it is the
+one place this had to choose. Exiting is the tidier answer for a
+supervised container — but `docker-compose.yml` sets no `restart:` policy
+on **any** service, so a clean exit would turn a recoverable fault into a
+permanent outage. Adding that policy is a deployment decision, not one to
+take inside a bug fix, so it is left for the operator; the backoff is also
+why the restart delay is not zero, since the shipped
+`SimulatedFeed(candles_by_symbol={})` returns immediately and a zero-delay
+restart would spin it into a hot loop.
+
+One thing measured and then deliberately not changed: `_supervise` catches
+`Exception`, never `BaseException`. `asyncio.CancelledError` derives from
+`BaseException` precisely so a broad handler cannot swallow it, which is
+what makes shutdown work. An explicit `except asyncio.CancelledError:
+raise` was written first and then removed once injection showed it was
+dead code — it could not change any outcome. The test that guards this
+asserts on a bounded wait rather than a bare `await`, because a supervisor
+that did swallow cancellation would hang the suite instead of failing it.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

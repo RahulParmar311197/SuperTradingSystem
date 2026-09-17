@@ -20,7 +20,7 @@ import asyncio
 import pytest
 
 import app.workers.auto_trade_worker as auto_trade_module
-import app.workers.main as worker_main
+import app.core.supervision as supervision
 import app.workers.scanner_worker as scanner_module
 from app.workers.auto_trade_worker import AutoTradeSupervisor
 from app.workers.scanner_worker import ScannerWorker
@@ -92,8 +92,8 @@ async def test_a_failing_pass_still_heartbeats_and_keeps_looping(monkeypatch, mo
 
 
 async def test_supervise_restarts_a_worker_that_raises(monkeypatch):
-    monkeypatch.setattr(worker_main, "_RESTART_DELAY_SECONDS", 0.01)
-    monkeypatch.setattr(worker_main, "_MAX_RESTART_DELAY_SECONDS", 0.01)
+    monkeypatch.setattr(supervision, "RESTART_DELAY_SECONDS", 0.01)
+    monkeypatch.setattr(supervision, "MAX_RESTART_DELAY_SECONDS", 0.01)
     starts = {"n": 0}
     stop_event = asyncio.Event()
 
@@ -101,7 +101,7 @@ async def test_supervise_restarts_a_worker_that_raises(monkeypatch):
         starts["n"] += 1
         raise ConnectionError("Redis went away for a moment")
 
-    task = asyncio.create_task(worker_main._supervise("autotrade", dies, stop_event))
+    task = asyncio.create_task(supervision.supervise("autotrade", dies, stop_event))
     await asyncio.sleep(0.2)
     stop_event.set()
     task.cancel()
@@ -116,15 +116,15 @@ async def test_supervise_restarts_a_worker_that_merely_returns(monkeypatch):
     # `_bridge_market_data_to_candles` ends by *returning* when its feed
     # stops yielding, which is what a dropped market-data connection looks
     # like from here.
-    monkeypatch.setattr(worker_main, "_RESTART_DELAY_SECONDS", 0.01)
-    monkeypatch.setattr(worker_main, "_MAX_RESTART_DELAY_SECONDS", 0.01)
+    monkeypatch.setattr(supervision, "RESTART_DELAY_SECONDS", 0.01)
+    monkeypatch.setattr(supervision, "MAX_RESTART_DELAY_SECONDS", 0.01)
     starts = {"n": 0}
     stop_event = asyncio.Event()
 
     async def returns_immediately():
         starts["n"] += 1
 
-    task = asyncio.create_task(worker_main._supervise("market_data", returns_immediately, stop_event))
+    task = asyncio.create_task(supervision.supervise("market_data", returns_immediately, stop_event))
     await asyncio.sleep(0.2)
     stop_event.set()
     task.cancel()
@@ -137,8 +137,8 @@ async def test_supervise_stops_restarting_once_shutdown_is_requested(monkeypatch
     # Control: this must not fight the shutdown path. SIGTERM sets
     # `stop_event`, and the supervisor has to stand down rather than
     # resurrect workers while the process is trying to exit.
-    monkeypatch.setattr(worker_main, "_RESTART_DELAY_SECONDS", 0.01)
-    monkeypatch.setattr(worker_main, "_MAX_RESTART_DELAY_SECONDS", 0.01)
+    monkeypatch.setattr(supervision, "RESTART_DELAY_SECONDS", 0.01)
+    monkeypatch.setattr(supervision, "MAX_RESTART_DELAY_SECONDS", 0.01)
     starts = {"n": 0}
     stop_event = asyncio.Event()
 
@@ -147,7 +147,7 @@ async def test_supervise_stops_restarting_once_shutdown_is_requested(monkeypatch
         stop_event.set()
         raise RuntimeError("boom")
 
-    await asyncio.wait_for(worker_main._supervise("scanner", dies, stop_event), timeout=1.0)
+    await asyncio.wait_for(supervision.supervise("scanner", dies, stop_event), timeout=1.0)
     assert starts["n"] == 1
 
 
@@ -163,13 +163,13 @@ async def test_supervise_lets_cancellation_through(monkeypatch):
     does catch is someone later widening that handler to `BaseException`,
     which would make the process unkillable.
     """
-    monkeypatch.setattr(worker_main, "_RESTART_DELAY_SECONDS", 0.01)
+    monkeypatch.setattr(supervision, "RESTART_DELAY_SECONDS", 0.01)
     stop_event = asyncio.Event()
 
     async def forever():
         await asyncio.sleep(3600)
 
-    task = asyncio.create_task(worker_main._supervise("scanner", forever, stop_event))
+    task = asyncio.create_task(supervision.supervise("scanner", forever, stop_event))
     await asyncio.sleep(0.05)
     task.cancel()
 

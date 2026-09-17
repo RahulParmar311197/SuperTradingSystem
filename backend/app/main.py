@@ -38,6 +38,7 @@ from app.core.redis import get_redis
 from app.database.session import get_engine
 from app.monitoring.health import check_database, check_redis
 from app.monitoring.health import router as health_router
+from app.core.supervision import supervise
 from app.trading.live_reconciliation import run as run_live_reconciliation
 
 settings = get_settings()
@@ -57,13 +58,30 @@ async def lifespan(_app: FastAPI):
 
     # Runs in this process, not the separate `worker` process — see
     # app.trading.live_reconciliation's module docstring for why.
-    reconciliation_task = asyncio.create_task(run_live_reconciliation(), name="live_reconciliation")
+    #
+    # Wrapped in `supervise` for the same reason `app/workers/main.py`
+    # wraps its workers: this was a bare `create_task` nothing ever looked
+    # at, so a loop that ended took §75's order-divergence safety net with
+    # it while the API kept serving and `GET /health` kept reporting the
+    # process up.
+    reconciliation_task = asyncio.create_task(
+        supervise("live_reconciliation", run_live_reconciliation), name="live_reconciliation"
+    )
     yield
     reconciliation_task.cancel()
     try:
         await reconciliation_task
     except asyncio.CancelledError:
         pass
+    except Exception:
+        # A task that had already *died* stores its exception, and
+        # `await`ing it here re-raises that -- not `CancelledError`. With
+        # only the clause above, the original error escaped this teardown
+        # and skipped the engine/redis disposal below, which exists
+        # precisely to stop connections leaking. `supervise` should make
+        # this unreachable; teardown is the wrong place to find out it
+        # didn't.
+        logger.exception("Live reconciliation task ended with an error before shutdown")
 
     # `get_engine()`/`get_redis()` cache one client per *running* event
     # loop (see their module docstrings). That loop is normally this

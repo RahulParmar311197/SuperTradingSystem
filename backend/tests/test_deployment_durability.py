@@ -82,3 +82,45 @@ def test_postgres_is_still_durable_too(compose):
     assert [parts for parts in mounts if len(parts) >= 2 and parts[0] in named_volumes], (
         f"postgres lost its named volume: {postgres.get('volumes')!r}"
     )
+
+
+# --- a dead container must come back -------------------------------------
+
+_LONG_RUNNING = ("postgres", "redis", "api", "worker")
+
+
+def test_every_long_running_service_restarts_on_its_own(compose):
+    """`docker-compose.yml` set no `restart:` policy on anything.
+
+    The in-process supervisor (`app/core/supervision.py`) brings a dead
+    *loop* back, but nothing brought back a dead *process*: an OOM kill, an
+    unhandled exception escaping `main`, or a host reboot left the API or
+    the worker down until someone noticed by hand. For a system whose whole
+    point is running unattended (§54), that is the wrong default — and it
+    is why `supervise` restarts loops in-process rather than exiting, a
+    workaround this makes unnecessary as a last line of defence.
+
+    Asserted as a property, not an exact spelling: any policy that brings
+    the container back counts.
+    """
+    for name in _LONG_RUNNING:
+        policy = compose["services"][name].get("restart")
+        assert policy in {"always", "unless-stopped", "on-failure"}, (
+            f"service {name!r} has no restart policy ({policy!r}), so a crash or host "
+            "reboot leaves it down until a human notices"
+        )
+
+
+def test_the_one_shot_migration_job_does_not_restart(compose):
+    """Control, and the reason this is not a blanket policy.
+
+    `migrate` runs `alembic upgrade head` once, and `api`/`worker` wait on
+    it with `service_completed_successfully`. A restart policy there would
+    turn a failed migration into a restart loop that never completes, so
+    the two services waiting on it would never start at all — a worse
+    failure than the one the policy above prevents.
+    """
+    assert compose["services"]["migrate"].get("restart") is None, (
+        "migrate is a one-shot job: a restart policy would loop a failed migration "
+        "forever and block api and worker from ever starting"
+    )

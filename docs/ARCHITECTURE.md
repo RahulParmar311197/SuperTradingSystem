@@ -8510,6 +8510,103 @@ infinite `profit_factor` cannot be stored in `Numeric(10, 4)`, and in the
 replay path it wedged a whole session for exactly as long as the user was
 winning.
 
+## Nothing restarted a dead container, and two carried questions settled (§54)
+
+**One real deployment gap, and two open questions closed on merit.** The
+gap is small in diff and large in consequence; the two decisions changed
+no behaviour at all, and are recorded here because leaving them open was
+itself becoming a cost.
+
+### A dead process stayed dead
+
+`docker-compose.yml` set no `restart:` policy on any service. The
+in-process supervisor added earlier (`app/core/supervision.py`) brings a
+dead *loop* back inside a living process, and that is where most of the
+failure modes live — but it can do nothing about the process itself. An
+OOM kill, an unhandled exception escaping `main`, a segfault in a C
+extension, or simply a host reboot left the API or the worker down until
+a human noticed. For a system whose entire premise is running unattended
+overnight and through a session (§54), "until a human notices" is the
+wrong answer, and it is worth naming the inversion: `supervise` restarts
+loops in-process partly *because* nothing outside would have restarted
+the process. That is a workaround for a missing policy, not a substitute
+for one.
+
+`restart: unless-stopped` now covers `postgres`, `redis`, `api` and
+`worker`. `unless-stopped` rather than `always` so that a deliberate
+`docker compose stop` survives a host reboot instead of being undone by
+it.
+
+`migrate` deliberately gets **no** policy, and the asymmetry is the whole
+reason this is not a blanket setting. It runs `alembic upgrade head`
+once, and both `api` and `worker` wait on it with
+`service_completed_successfully`. A restart policy there would turn a
+failed migration into a restart loop that never completes, so the two
+services waiting on it would never start at all — strictly worse than
+the failure the policy on them prevents.
+
+Both properties are asserted in `tests/test_deployment_durability.py`,
+on the shape of the configuration rather than its exact spelling, so a
+deployment can change *how* it restarts without failing this spuriously.
+Measured by injection, because the code under test is configuration and
+a stash proves nothing:
+
+```
+restart policies stripped (the original state)     -> 1 fail
+a restart policy added to the one-shot migrate job -> 1 fail  (the control)
+only the worker loses its policy                   -> 1 fail
+```
+
+The control was injection-tested alongside the proofs, not assumed.
+
+Still not a substitute for exercising the real thing: there is no Docker
+in this environment, so no container has ever actually been killed and
+watched to come back. What is verified is that the configuration says to.
+
+### `market_data_age_seconds is None` rejects — decided, not defaulted
+
+Carried for several rounds as an open question in `TradeRiskProposal`.
+It is now settled: **`None` rejects, and should.**
+
+A live order is sized from a price, and the notional gates are computed
+from that price. With no feed for the symbol there is nothing against
+which to say our view of the market is current — and "we don't know how
+stale this is" is not the same claim as "it is fine". The paper engine
+and anything trading against `MockBroker` pass `0.0` explicitly rather
+than `None` (`_market_data_age_for` in `app/api/orders.py`), so the
+rejection lands only where it should: a live order on a symbol the
+market-data worker is not following.
+
+The cost is real and is the right cost. Live trading on a symbol now
+requires the market-data worker to be running *for that symbol*. That is
+a precondition to satisfy, not a limitation to design around. No code
+changed — the behaviour was already this, and is already covered at
+`tests/risk/test_engine.py` — what changed is that it is now a decision
+with a reason rather than an accident nobody had ruled on.
+
+### Rate limiting fails **closed** — decided
+
+When the 500-on-Redis-outage bug was fixed, `rate_limit_fail_open`
+defaulted to `False` explicitly to keep the security posture unchanged;
+the bug being fixed was the traceback, not the policy. The policy is now
+decided on its own merits, and the answer is the same: **deny**.
+
+The limiter's job on `/auth/login` is to blunt credential stuffing.
+Failing open during a Redis outage hands an attacker precisely the window
+they would engineer if they could — take out the shared cache, then
+brute-force unthrottled — which turns an outage from a nuisance into an
+amplifier.
+
+The counter-argument, that an operator could be locked out of their own
+system exactly when they need to intervene, is real but weaker than it
+looks. With Redis down, `account_halt_reason` and the kill switch cannot
+be read either, so the admin actions someone would log in to perform do
+not work regardless. The remedy for "Redis is down" is to restore Redis,
+which the `restart: unless-stopped` above now does without a human. A
+deployment where login availability genuinely outranks brute-force
+protection can set it `True`, and should know that is the trade it is
+making.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

@@ -1,6 +1,10 @@
 services:
   postgres:
     image: postgres:16-alpine
+    # Long-running daemon: a process that exits should come back.
+    # `unless-stopped` rather than `always` so a deliberate
+    # `docker compose stop` sticks across a host reboot.
+    restart: unless-stopped
     environment:
       POSTGRES_USER: trading
       POSTGRES_PASSWORD: trading
@@ -17,6 +21,10 @@ services:
 
   redis:
     image: redis:7-alpine
+    # Long-running daemon: a process that exits should come back.
+    # `unless-stopped` rather than `always` so a deliberate
+    # `docker compose stop` sticks across a host reboot.
+    restart: unless-stopped
     # Account halts (`halt:*`) and the blueprint §58 kill switch live only
     # in Redis, and both are controls that must stay engaged until a human
     # deliberately lifts them. With no volume and no persistence the
@@ -44,6 +52,10 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://trading:trading@postgres:5432/trading
     command: ["alembic", "upgrade", "head"]
+    # Deliberately NO `restart:` policy. This is a one-shot job that the
+    # api and worker wait on via `service_completed_successfully`; a
+    # restart policy would turn a failed migration into a restart loop
+    # and never let either of them start.
     depends_on:
       postgres:
         condition: service_healthy
@@ -58,6 +70,10 @@ services:
       REDIS_URL: redis://redis:6379/0
     ports:
       - "8000:8000"
+    # Long-running daemon: a process that exits should come back.
+    # `unless-stopped` rather than `always` so a deliberate
+    # `docker compose stop` sticks across a host reboot.
+    restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
@@ -77,6 +93,10 @@ services:
       DATABASE_URL: postgresql+asyncpg://trading:trading@postgres:5432/trading
       REDIS_URL: redis://redis:6379/0
     command: ["python", "-m", "app.workers.main"]
+    # Long-running daemon: a process that exits should come back.
+    # `unless-stopped` rather than `always` so a deliberate
+    # `docker compose stop` sticks across a host reboot.
+    restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy

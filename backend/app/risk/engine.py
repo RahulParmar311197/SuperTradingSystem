@@ -34,6 +34,15 @@ class TradeRiskProposal:
     # expected and harmless (the paper engine, or a stack trading against
     # `MockBroker`) passes 0.0 explicitly instead -- see
     # `_market_data_age_for` in app/api/orders.py.
+    #
+    # DECIDED, after being carried for several rounds as an open question:
+    # `None` rejects, and should. A live order is sized from a price and
+    # gated on notionals computed from it; with no feed for the symbol
+    # there is nothing against which to say our view of the market is
+    # current, and "we don't know" is not "it's fine". The cost is that
+    # live trading on a symbol requires the market-data worker to be
+    # running for it -- which is the correct precondition, not a
+    # limitation to design around.
     market_data_age_seconds: float | None
     broker_healthy: bool
     repeated_rejections: int = 0

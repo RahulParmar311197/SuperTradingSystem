@@ -8410,6 +8410,58 @@ it the real proof. A second test pins the property that makes removal safe
 — the same pools are still reachable from the SMC context — and fails when
 the removal is done on the wrong side.
 
+## The position P&L math, probed and guarded (§60) — no bug found
+
+**A clean result, stated as one.** This round found no defect; it is
+recorded because "we checked and it holds" is worth as much as a fix when
+the thing checked is the money math under every risk gate.
+
+Two property probes, each 20,000 random cases:
+
+* `PositionManager.apply_fill` / `mark_to_market` against a cash-flow
+  ledger that cannot be wrong by construction (cash paid and received,
+  plus the mark value of whatever is still held) — **0 mismatches** across
+  random long/short fill sequences.
+* `CostModel` across random brokerage / slippage / spread / tax
+  configurations — **0 cases where friction improved P&L**, and slippage
+  is directionally correct on both sides: a long pays more on entry and
+  receives less on exit, a short the reverse.
+
+What *was* thin is coverage. The only assertions behind this math were two
+hardcoded numbers in `tests/trading/test_execution.py` —
+`average_price == 25000.0` and `realized_pnl == 100.0` — both for a single
+long round trip. Nothing covered the short side at all, which is half of
+what the autonomous loop trades. The probe is now a seeded test, reduced
+to a CI-sized 400 sequences, plus explicit short-side cases.
+
+Recorded so nobody assumes otherwise: `apply_fill`'s **direction-flip
+branch is not reachable in production today**. `POST /orders` computes
+`is_reducing` itself from the open position and clamps an opposing order
+to `min(quantity, abs(existing.quantity))`, so it can only reduce or
+flatten; the paper engine closes with the exact open quantity. The branch
+is defensive, and the test exercises it directly rather than through a
+caller that cannot produce it. That was checked, not assumed — the first
+reading of it was wrong.
+
+Because these tests assert behaviour that was already correct, a
+stash-verify proves nothing and injection is the only honest measurement.
+Eight injections were run; five are recorded in the PR, and three deserve
+mention here because they were aimed at the tests rather than the code:
+
+* dropping `mark_to_market`'s `is_open` guard changed **nothing**, which
+  exposed the first version of this file's control as vacuous;
+* so did a rewrite of that control asserting a mark leaves `realized_pnl`
+  alone — a flat position has quantity 0, so `(price - average) * 0` is 0
+  whatever else is broken, and no assertion about marking a flat position
+  can fail;
+* the control was replaced with one about **sign** — a losing trade must
+  report a negative realized P&L on both sides — and an injected `abs()`
+  in the realized calculation fails it.
+
+That is the fourth vacuous test caught by injection in this sequence of
+rounds, and the reason the discipline is worth its cost: a green tick on a
+test that cannot fail is worse than no test, because it reads as coverage.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

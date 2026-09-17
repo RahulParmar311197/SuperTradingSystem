@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from enum import StrEnum
 
 from fastapi import APIRouter
@@ -10,6 +11,8 @@ from sqlalchemy import text
 from app.core.redis import ping as redis_ping
 from app.core.redis import worker_is_alive
 from app.database.session import get_engine
+
+logger = logging.getLogger("monitoring.health")
 
 router = APIRouter(tags=["monitoring"])
 
@@ -47,8 +50,30 @@ async def check_workers() -> dict[str, str]:
     separate `worker` process (see app/workers/main.py) has heartbeated at
     least once within the last 30s — this can legitimately read DOWN in
     an environment where the worker process was never started, which is
-    the honest answer, not a false HEALTHY."""
-    return {name: (ComponentStatus.HEALTHY if await worker_is_alive(name) else ComponentStatus.DOWN).value for name in _WORKER_NAMES}
+    the honest answer, not a false HEALTHY.
+
+    Guarded, because `worker_is_alive` is a bare `redis.exists`
+    (app/core/redis.py) and heartbeats live in Redis. Unguarded, a Redis
+    outage raised out of here and `GET /health` answered 500 -- measured,
+    while `check_database` and `check_redis` both degraded politely to
+    DOWN beside it. That is the worst possible moment for this endpoint to
+    die: it is what a load balancer polls, what an uptime monitor pages
+    on, and the first thing an operator opens during an outage, and the
+    `redis: DOWN` line it would have shown is the whole explanation.
+
+    DOWN is the honest answer here rather than a new "unknown" state. The
+    contract this function already has is "no heartbeat observed in the
+    last 30s", and an unreachable heartbeat store is exactly that: no
+    evidence of life. Reporting HEALTHY would be a claim nothing supports.
+    """
+    try:
+        return {
+            name: (ComponentStatus.HEALTHY if await worker_is_alive(name) else ComponentStatus.DOWN).value
+            for name in _WORKER_NAMES
+        }
+    except Exception:
+        logger.exception("Could not read worker heartbeats (Redis unreachable?); reporting every worker DOWN")
+        return {name: ComponentStatus.DOWN.value for name in _WORKER_NAMES}
 
 
 @router.get("/health")

@@ -8314,6 +8314,49 @@ healthy. Under the limit it allows, over it still returns 429, and there
 is a control test pinning that neither the 503 nor the fail-open branch is
 involved on that path.
 
+## /health died during the outage it exists to report (§72, §117)
+
+Continuing the previous section's probe — other bare Redis calls in
+request paths — `check_workers` calls `worker_is_alive`, which is a bare
+`redis.exists`, and nothing caught it. Measured with Redis refusing
+connections:
+
+```
+check_database   -> DOWN
+check_redis      -> DOWN
+check_workers    -> RAISED ConnectionError
+GET /health      -> 500
+```
+
+Its two siblings degrade politely; this one raised, and took the whole
+endpoint with it. That is the worst possible moment for `/health` to die:
+it is what a load balancer polls, what an uptime monitor pages on, and the
+first thing an operator opens during an outage — and the `redis: DOWN`
+line it would have shown is the entire explanation. The intent was clearly
+graceful degradation, since `check_database` already catches and the
+Redis ping is already guarded; one of the three was left unwrapped.
+
+`check_workers` is now guarded and reports every worker DOWN. **DOWN is
+the honest answer, not a new "unknown" state.** The contract this function
+already has is "no heartbeat observed in the last 30 seconds", and an
+unreachable heartbeat store is exactly that: no evidence of life.
+Reporting HEALTHY would be a claim nothing supports — there is a test
+pinning that, because a guard that returns HEALTHY would have been the
+easy mistake.
+
+The control matters as much as the fix: with Redis reachable, a worker
+that has heartbeated must still read HEALTHY while one that has not reads
+DOWN. A guard that flattened everything to DOWN would have traded a 500
+for a permanently useless answer, and an injection doing exactly that
+fails two tests.
+
+This closes the probe. Every `heartbeat` call site is guarded (previous
+section), every `asyncio.create_task` in `app/` is supervised, and the
+remaining bare Redis calls are in paths where an outage already fails
+safe: the kill-switch and account-halt reads raise, which stops trading,
+and the autonomous supervisor's per-pass guard logs and skips. That is the
+correct direction for a risk gate, and it is left alone deliberately.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

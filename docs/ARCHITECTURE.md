@@ -8064,6 +8064,65 @@ that a result, which is a decision about what a backtest reports, not one
 to take quietly underneath an existing report. The position is now
 visible; what to do with it is the reader's call.
 
+## The equity liquidity gate had no writer (§40, §56)
+
+`TradeRiskProposal.liquidity_acceptable` defaulted to `True`, and neither
+of `RiskEngine.evaluate`'s two callers has ever set it. Checked
+mechanically over `app/`:
+
+```
+TradeRiskProposal construction sites in app/:
+   app/paper/engine.py:373  passes liquidity_acceptable = False
+   app/api/orders.py:474    passes liquidity_acceptable = False
+
+RiskEvent.checks recorded for an equity order on a symbol with zero volume:
+   liquidity_acceptable = True   (approved = True)
+```
+
+So every equity order ever evaluated — manual (`POST /orders`), paper, and
+autonomous (`AutoTradeSupervisor` drives the same `PaperTradingEngine`) —
+wrote a passed `liquidity_acceptable` row into its `RiskEvent` audit
+record without anything having looked at volume, spread or quote age. An
+operator reading `GET /admin/risk-events` could not distinguish a symbol
+whose liquidity was assessed and found fine from one where the gate was
+never wired up. That is a fabricated audit entry, and §56 makes the risk
+engine the only authority that can veto a trade — the record of what it
+checked has to be true.
+
+The sibling path does it properly: `OptionsRiskProposal.liquidity_acceptable`
+is genuinely computed in `app/api/options.py` from `OptionSnapshot` rows
+through `evaluate_liquidity` (`app/options/liquidity_filter.py`), and a leg
+with no snapshot produces an explicit "no liquidity data available — not
+evaluated" warning. The equity engine is the sibling that declared the
+same field and never fed it.
+
+`liquidity_acceptable` is now `bool | None`, defaulting to `None` for "no
+assessment was made", the same distinction `market_data_age_seconds`
+already draws between "fresh" and "no data at all" in the same dataclass.
+`None` is **skipped** rather than recorded as passed — precisely what
+`is_reducing` already does for the entry-only limits, so the audit row
+lists only the checks that actually governed the decision. It does not
+reject: a gate nobody has wired up must not block trading, which is the
+same choice `max_correlated_exposure_pct`'s 100.0 no-op default makes.
+A caller that *does* assess liquidity passes a real bool and gets a real
+gate — `False` rejects, on reducing orders too, since an illiquid symbol
+is illiquid whichever way the order goes.
+
+One existing test changed with it. `test_a_reducing_proposal_skips_only_the_entry_limits`
+asserted `liquidity_acceptable` was among the checks a reducing order
+always runs. That expectation encoded the bug rather than a requirement:
+the name appeared in every decision because the default put it there, not
+because anything had been assessed. The check still runs, and is still on
+the execution-sanity side of the fence, whenever a caller supplies an
+assessment; there is a test pinning exactly that.
+
+What this does **not** do is give equities a liquidity gate. Nothing yet
+computes one. `evaluate_liquidity`'s thresholds are open-interest and
+option-spread shaped, and what a minimum traded volume should be for an
+NSE equity is a number to choose deliberately against real data, not to
+invent in passing — so it is left for the operator to decide, and until
+then the audit row says nothing rather than something false.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

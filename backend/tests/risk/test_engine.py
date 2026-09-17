@@ -171,12 +171,18 @@ def test_a_reducing_proposal_skips_only_the_entry_limits():
         "kill_switch",
         "valid_stop_distance",
         "entry_matches_market",
-        "liquidity_acceptable",
         "market_data_fresh",
         "broker_healthy",
         "no_repeated_rejections",
         "no_abnormal_price_jump",
     }
+    # `liquidity_acceptable` is deliberately absent: `_tripped_proposal`
+    # does not supply one, and an unsupplied assessment is now skipped
+    # rather than recorded as passed. This set previously listed it, which
+    # encoded the bug -- no caller of this engine has ever supplied a
+    # liquidity assessment, so the name appeared in every audit row with
+    # nothing behind it. A proposal that *does* supply one still runs the
+    # check on both paths; see the three tests below.
 
     entry_decision = RiskEngine().evaluate(_tripped_proposal())
     assert entry_decision.decision == RiskDecision.REJECT
@@ -223,3 +229,52 @@ def test_a_caller_that_knows_the_data_is_fresh_still_passes():
     decision = RiskEngine(limits=RiskLimits()).evaluate(_base_proposal(market_data_age_seconds=0.0))
 
     assert next(c for c in decision.checks if c.name == "market_data_fresh").passed
+
+
+# --- liquidity_acceptable: evaluated, not evaluated, and failed ----------
+
+
+def test_an_unevaluated_liquidity_assessment_is_not_recorded_as_a_passed_check():
+    # The bug. `liquidity_acceptable` defaulted to True and neither
+    # app/api/orders.py nor app/paper/engine.py has ever set it, so every
+    # equity order's RiskEvent recorded `liquidity_acceptable: true`
+    # without anything having looked at volume, spread or quote age.
+    # "Not assessed" and "assessed and fine" are different facts and the
+    # audit row must not spell them the same way.
+    decision = RiskEngine().evaluate(_base_proposal())
+
+    assert decision.decision == RiskDecision.APPROVE
+    assert "liquidity_acceptable" not in {c.name for c in decision.checks}
+
+
+def test_an_unevaluated_liquidity_assessment_does_not_block_the_order():
+    # Control, and the reason this is a skip rather than a rejection: a
+    # gate nobody has wired up must not stop trading -- the same choice
+    # `max_correlated_exposure_pct`'s 100.0 no-op default makes.
+    decision = RiskEngine().evaluate(_base_proposal())
+    assert decision.decision == RiskDecision.APPROVE
+    assert decision.reason is None
+
+
+def test_a_caller_that_assesses_liquidity_gets_a_real_gate():
+    # The capability has to survive the fix, or this traded a false audit
+    # entry for a missing one. A caller that does the work and reports
+    # unacceptable liquidity must be rejected, and one that reports
+    # acceptable must have that recorded as a genuinely passed check.
+    rejected = RiskEngine().evaluate(_base_proposal(liquidity_acceptable=False))
+    assert rejected.decision == RiskDecision.REJECT
+    assert any(c.name == "liquidity_acceptable" and not c.passed for c in rejected.checks)
+
+    approved = RiskEngine().evaluate(_base_proposal(liquidity_acceptable=True))
+    assert approved.decision == RiskDecision.APPROVE
+    assert any(c.name == "liquidity_acceptable" and c.passed for c in approved.checks)
+
+
+def test_liquidity_is_an_execution_sanity_check_not_an_entry_only_limit():
+    # An assessed-and-unacceptable symbol is illiquid whether the order
+    # opens or closes a position, so unlike the exposure/loss/count caps
+    # this one must still run for a reducing order. Pinning the side of
+    # the fence, the same way the reducing-order test above does.
+    decision = RiskEngine().evaluate(_tripped_proposal(is_reducing=True, liquidity_acceptable=False))
+    assert decision.decision == RiskDecision.REJECT
+    assert any(c.name == "liquidity_acceptable" and not c.passed for c in decision.checks)

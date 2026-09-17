@@ -9,9 +9,39 @@ from app.smc.types import Candle
 
 
 _WEEK_MINUTES = 10080
+_DAY_MINUTES = 1440
+
+# Minutes past midnight UTC at which the trading session opens, and the
+# anchor for every intraday bucket. 225 = 03:45 UTC = 09:15 IST, the NSE
+# open -- the same value, for the same reason, as
+# `app.ict.engine.ICTConfig.session_open_utc`, which this used to disagree
+# with. A deployment trading anything but NSE has to change it; there is no
+# session calendar here to derive it from, and a 24h market wants 0.
+#
+# Why anchor to the session rather than to midnight UTC. Neither choice
+# gives every bar its full period: an NSE session is 375 minutes, which 30,
+# 60, 120 and 240 all fail to divide, so exactly one bar a day is short
+# whatever we do. The choice is *where that bar sits*, and midnight
+# anchoring put it at the open:
+#
+#     30m  first bar 03:30 UTC (09:00 IST), holding 15 of its 30 minutes
+#     1h   first bar 03:00 UTC (08:30 IST), holding 15 of its 60 minutes
+#     4h   first bar 00:00 UTC (05:30 IST), holding 15 of its 240 minutes
+#
+# Each of those is stamped at a time the market had not opened -- 05:30 IST
+# is not a period any NSE instrument traded in -- and each buries the
+# opening range, the most information-dense part of the day, inside a bar
+# that mostly is not trading. Session anchoring moves the short bar to the
+# close, where every market already has one and where traders expect it,
+# and makes the day's first bar a real first bar.
+SESSION_OPEN_MINUTES_UTC = 225
 
 
-def bucket_start(timestamp: datetime, target_minutes: int) -> datetime:
+def bucket_start(
+    timestamp: datetime,
+    target_minutes: int,
+    session_open_minutes_utc: int = SESSION_OPEN_MINUTES_UTC,
+) -> datetime:
     """The start of the `target_minutes` bucket containing `timestamp`.
 
     Weekly buckets are anchored on Monday, not on the Unix epoch. Epoch
@@ -25,15 +55,23 @@ def bucket_start(timestamp: datetime, target_minutes: int) -> datetime:
     whose open is Thursday's open disagrees with both, and with what a
     weekly bar means to anyone reading it.
 
-    Sub-weekly buckets keep epoch anchoring. Every one of them divides a
-    day evenly, so their boundaries coincide with midnight UTC -- but note
-    what that does and does not settle. It does not make them align with a
-    *session*: NSE opens at 03:45 UTC, which is a boundary for 3m, 5m and
-    15m but lands 15 minutes into a 30m bucket, 45 into an hourly one and
-    225 into a 4h one. The first bar of an NSE day at those sizes is
-    therefore a stub. That is a deliberate open question about what a
-    "1h candle" should mean on this market, recorded in docs/ARCHITECTURE.md
-    rather than decided here.
+    Daily buckets also keep calendar anchoring: a 00:00-24:00 UTC day
+    contains the whole NSE session (03:45-10:00), so there is nothing for
+    an offset to fix, and Upstox serves "day" bars directly with their own
+    stamps.
+
+    **Intraday buckets are anchored to the session open**, not to midnight
+    UTC -- see `SESSION_OPEN_MINUTES_UTC` for why, and for what it costs.
+    This was carried as an open question for several rounds and is now
+    decided. It is worth being exact about the blast radius: production
+    derives only 5m and 15m (`app/workers/main.py`) and buckets ticks at
+    1m, and 225 divides all of those, so **this changes nothing that runs
+    today**. What it closes is the trap waiting for whoever first adds
+    "30m" to `derived_timeframes` or resamples to "1h" -- who would
+    otherwise get a first bar of the day stamped before the market opened,
+    and, if Upstox's own 30-minute bars are session-aligned, a stored
+    series in which backfilled and derived bars interleave 15 minutes
+    apart instead of coinciding.
 
     A naive `timestamp` is read as UTC rather than rejected or passed to
     `astimezone()`. Before this, the two branches disagreed about the same
@@ -56,8 +94,12 @@ def bucket_start(timestamp: datetime, target_minutes: int) -> datetime:
 
     epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
     minutes_since_epoch = int((timestamp - epoch).total_seconds() // 60)
-    bucket_index = minutes_since_epoch // target_minutes
-    return epoch + timedelta(minutes=bucket_index * target_minutes)
+
+    # Daily and larger stay on the calendar grid; only intraday sizes take
+    # the session offset.
+    offset = 0 if target_minutes >= _DAY_MINUTES else session_open_minutes_utc % target_minutes
+    bucket_index = (minutes_since_epoch - offset) // target_minutes
+    return epoch + timedelta(minutes=bucket_index * target_minutes + offset)
 
 
 def aggregate_candles(candles: list[Candle]) -> Candle:

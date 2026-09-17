@@ -26,6 +26,28 @@ class RiskLimits:
     # trading where it hasn't been computed.
     max_correlated_exposure_pct: float = 100.0
     correlation_threshold: float = 0.7
+    # Blueprint §57: the largest share of a typical bar's traded volume one
+    # order may be, measured over `app.risk.liquidity`'s recent window. The
+    # gate this feeds asks whether *this order* can fill without moving the
+    # price against itself, which is a property of the order and the
+    # instrument together -- so a participation rate, never an absolute
+    # floor on volume. A floor gets both ends wrong: it blocks a tiny order
+    # in a thin name that would fill fine, and waves through an enormous
+    # one in a liquid name that would not.
+    #
+    # 10% is REASONED, NOT CALIBRATED, and that distinction matters. There
+    # is no licensed feed in this environment, so this is not a number
+    # measured against real NSE volume; it comes from standard
+    # percentage-of-volume execution practice, where algorithms that
+    # deliberately spread an order over time target 5-25%. A single MARKET
+    # order consumes visible depth all at once rather than spreading, so
+    # the low end of that range is the right neighbourhood. Against a 15m
+    # bar it works out near 0.4% of a day's volume, which is permissive
+    # for anything ordinary and still catches an order that is large
+    # relative to what the instrument actually trades.
+    #
+    # It is the first number to revisit once real market data exists.
+    max_participation_pct: float = 10.0
 
     # System-level
     market_data_max_staleness_seconds: float = 10.0

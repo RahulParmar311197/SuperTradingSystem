@@ -1,6 +1,6 @@
 import asyncio
 import uuid
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -16,6 +16,8 @@ from app.database.models.risk import AuditLog, RiskEvent
 from app.database.models.trading import ExecutionMode, Order, OrderEvent, OrderStatus, Position, Trade
 from app.database.models.users import BrokerAccount, BrokerAccountStatus, BrokerName, User, UserSession
 from app.database.session import async_session_factory
+from app.market.repository import upsert_candles
+from app.smc.types import Candle as SMCCandle
 from app.main import app
 import app.api.orders as orders_api
 from app.risk.engine import RiskEngine
@@ -2021,4 +2023,121 @@ async def test_an_ordinary_price_still_places_an_order(require_infra):
             assert r.status_code == 201, r.text
         finally:
             orders_api._STACKS.pop(user_id, None)
+            await _cleanup(user_id, instrument_id)
+
+
+async def test_a_thin_instrument_is_rejected_by_the_live_order_path(require_infra):
+    """Behavioural proof that the equity liquidity gate is wired into
+    `POST /orders`, not only into the paper engine beside it.
+
+    This test exists because its absence was measured. The preceding round
+    found a shared contract broken at both order call sites with the whole
+    suite still green, so this round injected the same break here -- the
+    live path silently passing `liquidity_acceptable=None` -- and nothing
+    failed. The paper path had a proof; this one did not. It does now.
+
+    The instrument trades 100 shares per 15m bar. A 0.5%-of-100,000 risk
+    budget over a 5-point stop sizes 100 shares, which is a full bar's
+    entire volume in one order -- ten times the 10% participation cap.
+    """
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        async with async_session_factory() as db:
+            instrument = Instrument(
+                symbol=f"ORDTHIN{uuid.uuid4().hex[:5].upper()}",
+                exchange="NSE",
+                market=MarketType.EQUITY,
+                instrument_type="EQ",
+            )
+            db.add(instrument)
+            await db.commit()
+            await db.refresh(instrument)
+            instrument_id = instrument.id
+            start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
+            await upsert_candles(
+                db,
+                instrument_id,
+                "15m",
+                [
+                    SMCCandle(start + timedelta(minutes=15 * i), 100.0, 101.0, 99.0, 100.0, 100.0)
+                    for i in range(25)
+                ],
+            )
+            await db.commit()
+
+        try:
+            r = client.post(
+                "/orders",
+                json={"symbol": instrument.symbol, "direction": "LONG", "entry": 100.0, "stop": 95.0},
+                headers=headers,
+            )
+            assert r.status_code == 403, r.text
+
+            async with async_session_factory() as db:
+                events = (
+                    await db.execute(select(RiskEvent).where(RiskEvent.user_id == user_id))
+                ).scalars().all()
+                assert len(events) == 1
+                # `checks` is stored as {name: passed} -- see app/api/orders.py.
+                assert events[0].checks.get("liquidity_acceptable") is False, events[0].checks
+        finally:
+            async with async_session_factory() as db:
+                from app.database.models.market import Candle as CandleRow
+
+                await db.execute(delete(CandleRow).where(CandleRow.instrument_id == instrument_id))
+                await db.commit()
+            await _cleanup(user_id, instrument_id)
+
+
+async def test_a_liquid_instrument_still_places_the_same_order(require_infra):
+    """Control for the test above. Identical order, identical size, only
+    the instrument's traded volume differs. Without this, the test above
+    would pass just as happily if the gate rejected everything.
+    """
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        async with async_session_factory() as db:
+            instrument = Instrument(
+                symbol=f"ORDLIQ{uuid.uuid4().hex[:6].upper()}",
+                exchange="NSE",
+                market=MarketType.EQUITY,
+                instrument_type="EQ",
+            )
+            db.add(instrument)
+            await db.commit()
+            await db.refresh(instrument)
+            instrument_id = instrument.id
+            start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
+            await upsert_candles(
+                db,
+                instrument_id,
+                "15m",
+                [
+                    SMCCandle(start + timedelta(minutes=15 * i), 100.0, 101.0, 99.0, 100.0, 50_000.0)
+                    for i in range(25)
+                ],
+            )
+            await db.commit()
+
+        try:
+            r = client.post(
+                "/orders",
+                json={"symbol": instrument.symbol, "direction": "LONG", "entry": 100.0, "stop": 95.0},
+                headers=headers,
+            )
+            # Same 100-share order the thin instrument refused: 100 shares
+            # of a 50,000-share bar is 0.2% participation, well inside the
+            # 10% cap, so it places.
+            assert r.status_code == 201, r.text
+            assert r.json()["quantity"] == 100.0, r.text
+        finally:
+            async with async_session_factory() as db:
+                from app.database.models.market import Candle as CandleRow
+
+                await db.execute(delete(CandleRow).where(CandleRow.instrument_id == instrument_id))
+                await db.commit()
             await _cleanup(user_id, instrument_id)

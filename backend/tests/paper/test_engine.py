@@ -13,7 +13,26 @@ from app.paper.engine import PaperTradingEngine
 from app.risk.limits import RiskLimits
 from app.strategy.dsl import Condition, ConditionType, EntryConfig, RiskConfig, StrategyDefinition
 from app.trading.position_manager import PositionManager
-from tests.smc.conftest import make_candles
+from tests.smc.conftest import make_candles as _raw_make_candles
+
+# These execution tests size real orders against a 100,000 balance, so the
+# volume their candles carry is no longer decorative: an equity liquidity
+# gate (app/risk/liquidity.py) now caps an order at a share of what the
+# instrument actually trades. `make_candles` defaults to volume=100.0,
+# which was fine while nothing read it -- but it describes an instrument
+# trading 100 shares per 15m bar, and these setups size to 250-500 shares.
+# Buying 250-500% of a bar's entire traded volume in one order is exactly
+# what the new gate exists to refuse, so the fixture, not the gate, is what
+# was unrealistic. Named rather than left as a literal so the assumption is
+# visible: a liquid NSE mid-cap, comfortably clear of the participation cap
+# so these tests keep measuring what they say they measure.
+LIQUID_BAR_VOLUME = 50_000.0
+
+
+def make_candles(ohlc, volume: float = LIQUID_BAR_VOLUME):
+    """`tests.smc.conftest.make_candles` with a tradeable default volume."""
+    return _raw_make_candles(ohlc, volume=volume)
+
 
 SETUP = [
     (100, 100, 99, 100),
@@ -540,3 +559,91 @@ async def test_paper_trading_matches_the_backtester_on_the_same_candles():
     # Default CostModel and MockBroker are both frictionless, so with the
     # same entry, quantity and exit these must agree exactly.
     assert paper_pnl == pytest.approx(backtest_trades[0].pnl, rel=1e-6)
+
+
+@pytest.mark.asyncio
+async def test_a_thin_instrument_blocks_the_order_through_the_paper_path(require_infra):
+    """Behavioural proof that the equity liquidity gate is actually wired
+    into this engine, not merely implemented beside it.
+
+    The immediately preceding round taught this the hard way: a
+    contract broken at *both* order call sites left the entire suite
+    green, because every test exercised the pure function and none
+    exercised the wiring. So this drives the real engine against a real
+    instrument with real stored candles, and asserts on the check name the
+    `RiskEvent` audit row will carry.
+
+    The candles here deliberately keep `make_candles`'s original
+    `volume=100.0` -- an instrument trading a hundred shares per 15m bar,
+    against a setup that sizes to several hundred. Buying multiples of a
+    bar's entire traded volume in one order is what the gate is for.
+    """
+    strategy = _strategy()
+    limits = RiskLimits(max_participation_pct=10.0)
+    engine = PaperTradingEngine(
+        strategy, symbol="THINCO", account_id="thin-acct", starting_balance=100_000, risk_limits=limits
+    )
+
+    async with async_session_factory() as db:
+        instrument = Instrument(symbol="THINCO", exchange="NSE", market=MarketType.EQUITY, instrument_type="EQ")
+        db.add(instrument)
+        await db.flush()
+        instrument_id = instrument.id
+        await upsert_candles(db, instrument_id, "15m", make_candles(SETUP, volume=100.0))
+        await db.commit()
+
+    try:
+        outcome = None
+        async with async_session_factory() as db:
+            for candle in make_candles(SETUP, volume=100.0)[:9]:
+                outcome = await engine.on_candle(candle, db)
+
+        assert outcome is not None
+        assert outcome.risk_rejected_reason is not None, "a thin instrument must not be tradeable at this size"
+        assert outcome.risk_failed_check == "liquidity_acceptable", outcome.risk_failed_check
+    finally:
+        from app.database.models.market import Candle as CandleRow
+
+        async with async_session_factory() as db:
+            await db.execute(delete(CandleRow).where(CandleRow.instrument_id == instrument_id))
+            await db.execute(delete(Instrument).where(Instrument.id == instrument_id))
+            await db.commit()
+
+
+@pytest.mark.asyncio
+async def test_a_liquid_instrument_is_not_blocked_by_the_liquidity_gate(require_infra):
+    """Control for the test above, and the one that keeps it honest.
+
+    Same engine, same setup, same order size -- only the instrument's
+    traded volume differs. If this ever fails, the gate is not measuring
+    participation, it is just refusing to trade.
+    """
+    strategy = _strategy()
+    limits = RiskLimits(max_participation_pct=10.0)
+    engine = PaperTradingEngine(
+        strategy, symbol="LIQUIDCO", account_id="liquid-acct", starting_balance=100_000, risk_limits=limits
+    )
+
+    async with async_session_factory() as db:
+        instrument = Instrument(symbol="LIQUIDCO", exchange="NSE", market=MarketType.EQUITY, instrument_type="EQ")
+        db.add(instrument)
+        await db.flush()
+        instrument_id = instrument.id
+        await upsert_candles(db, instrument_id, "15m", make_candles(SETUP))
+        await db.commit()
+
+    try:
+        order_created = False
+        async with async_session_factory() as db:
+            for candle in make_candles(SETUP)[:9]:
+                outcome = await engine.on_candle(candle, db)
+                order_created = order_created or outcome.order_created
+
+        assert order_created is True, "a liquid instrument must still trade at the same size"
+    finally:
+        from app.database.models.market import Candle as CandleRow
+
+        async with async_session_factory() as db:
+            await db.execute(delete(CandleRow).where(CandleRow.instrument_id == instrument_id))
+            await db.execute(delete(Instrument).where(Instrument.id == instrument_id))
+            await db.commit()

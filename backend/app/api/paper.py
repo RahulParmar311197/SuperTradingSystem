@@ -21,7 +21,7 @@ from app.database.session import get_db
 from app.notifications.service import create_notification
 from app.paper.engine import PaperTradingEngine
 from app.smc.types import Candle
-from app.strategy.dsl import StrategyDefinition
+from app.api.stored_strategies import parse_stored_definition
 from app.trading.persistence import abandon_position_mirrors, persist_position
 
 router = APIRouter(prefix="/paper", tags=["paper"])
@@ -110,7 +110,7 @@ async def create_paper_session(
     strategy_row = await db.get(StrategyRow, payload.strategy_id)
     if strategy_row is None or strategy_row.user_id != user.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Strategy not found")
-    strategy = StrategyDefinition.model_validate(strategy_row.definition)
+    strategy = parse_stored_definition(strategy_row)
     instrument = await _get_instrument_by_symbol(db, payload.symbol)
 
     session_id = uuid.uuid4()

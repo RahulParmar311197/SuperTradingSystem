@@ -20,7 +20,7 @@ from app.database.models.strategy import Strategy as StrategyRow
 from app.database.models.users import User
 from app.database.session import get_db
 from app.market.repository import get_candles
-from app.strategy.dsl import StrategyDefinition
+from app.api.stored_strategies import parse_stored_definition
 
 router = APIRouter(prefix="/backtest", tags=["backtest"])
 
@@ -129,7 +129,7 @@ async def run_backtest(
     strategy_row = await db.get(StrategyRow, payload.strategy_id)
     if strategy_row is None or strategy_row.user_id != user.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Strategy not found")
-    strategy = StrategyDefinition.model_validate(strategy_row.definition)
+    strategy = parse_stored_definition(strategy_row)
 
     candles = await get_candles(db, payload.instrument_id, payload.timeframe, payload.start_date, payload.end_date)
     if len(candles) < 10:
@@ -262,7 +262,7 @@ async def validate_backtest(
     strategy_row = await db.get(StrategyRow, payload.strategy_id)
     if strategy_row is None or strategy_row.user_id != user.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Strategy not found")
-    strategy = StrategyDefinition.model_validate(strategy_row.definition)
+    strategy = parse_stored_definition(strategy_row)
 
     candles = await get_candles(db, payload.instrument_id, payload.timeframe, payload.start_date, payload.end_date)
     if len(candles) < 30:

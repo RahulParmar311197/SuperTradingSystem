@@ -9861,6 +9861,90 @@ call round 84 made when it required `strike` and `option_type` for
 `market=OPTIONS` and left `expiry` alone. It should become a real
 constraint when something finally prices against it.
 
+## Two ways a strategy looks alive and does nothing (§91, §9)
+
+### A `lookback` below 1 can never match
+
+`evaluate_condition` asks `context.current_index - event.index <
+condition.lookback` for `bos`, `mss`, `choch` and `liquidity_sweep`. On
+the bar the event printed, that difference is 0 — so **1 is the smallest
+value that can ever be true**, and it means "only on the event bar".
+
+Measured through `StrategyEngine.evaluate` against a real BOS at index 7,
+evaluated one bar later:
+
+| lookback | result |
+|---|---|
+| 2 | `satisfied=['bos']` |
+| 1 | `missing=['bos']` — correct, the event is a bar old |
+| 0 | `missing=['bos']` |
+| -5 | `missing=['bos']` |
+
+and directly at the evaluator, on the event bar itself: `lookback=1` →
+True, `lookback=0` → False, `lookback=-1000` → False.
+
+`POST /strategies` answered **201** for the `lookback=0` version. Because
+conditions AND implicitly (`evaluate_conditions`), one such condition
+zeroes the whole strategy: it stores, lists, backtests and auto-trades
+like any other and simply never produces a signal — and a validation
+backtest reporting zero trades is indistinguishable from "this history
+had no setups", so blueprint §77's graduation path cannot catch it at any
+stage.
+
+That is exactly the ruling `app/strategy/dsl.py` already makes three
+times in its own words, for unfed condition types, for `premium_discount`
+with no zone, and for unknown entry types: fail at authoring time rather
+than look alive and do nothing. `Condition` now refuses `lookback < 1`.
+
+No upper bound. A very large `lookback` means "this event never expires",
+which is a defensible authoring choice — it is what every structure
+condition did before the expiry window existed — and `lookback` lives
+inside a JSON column, so there is no width to overflow. Only the end that
+cannot match is refused.
+
+Writing the injections found one more thing, in the fix itself: the
+guard was originally `if self.lookback is not None and self.lookback < 1`,
+and injecting a change into that `None` branch left the suite green. It
+was unreachable — `_default_lookback_per_condition_type` is declared
+above and pydantic runs `mode="after"` validators in declaration order,
+so the field always holds an int by then. The dead half is gone, and the
+ordering dependency is stated where it matters.
+
+### A stored definition that no longer validates was a 500
+
+`strategies.definition` is a JSON column written by whatever version of
+the DSL was current when the row was saved, and re-validated against
+whatever version is current when it is read. **Every validator this
+codebase has added widened that gap.** A row written before the unfed-type
+rule, before the `premium_discount` zone rule, or before the `lookback`
+floor above, is stored data that no longer parses.
+
+Measured by planting a definition that trips the unfed-type rule and
+posting a backtest for it:
+
+    POST /backtest -> pydantic_core.ValidationError, uncaught,
+                      app/api/backtest.py:132
+
+which the catch-all turns into a 500 with a traceback — for stored data
+that is merely out of date, on the endpoint whose whole job is to tell
+the author whether a strategy is any good.
+
+`ScannerWorker` and `AutoTradeSupervisor` already get this right: both
+wrap the same call per strategy in `try/except`, log "Strategy %s has an
+invalid definition; skipping", and carry on with everyone else's
+strategies. The six API call sites did not. They now all go through
+`app/api/stored_strategies.py`, which answers **422** naming the
+strategy, what is wrong with it, and that re-saving fixes it.
+
+422 rather than 500 because the request is well-formed and the server is
+healthy — the stored strategy is what is unusable. Not 200 with an empty
+result, because a strategy that could not be loaded has not been
+evaluated, and reporting "no signals" for it would be the same fabricated
+claim several earlier rounds removed from the risk paths.
+
+The two halves belong together: without the second, the first would turn
+every already-stored `lookback=0` strategy from silently-dead into a 500.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

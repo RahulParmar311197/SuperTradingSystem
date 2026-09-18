@@ -26,6 +26,7 @@ from app.market.repository import get_candles
 from app.smc.engine import SMCConfig, SMCEngine
 from app.strategy.context import EvaluationContext
 from app.strategy.dsl import StrategyDefinition
+from app.api.stored_strategies import parse_stored_definition
 from app.strategy.engine import StrategyEngine
 
 router = APIRouter(prefix="/ai", tags=["ai"])
@@ -100,7 +101,7 @@ async def explain_trade(
     strategy_row = await db.get(StrategyRow, payload.strategy_id)
     if strategy_row is None or strategy_row.user_id != user.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Strategy not found")
-    strategy = StrategyDefinition.model_validate(strategy_row.definition)
+    strategy = parse_stored_definition(strategy_row)
 
     context = await _build_context(db, payload.instrument_id, payload.timeframe)
     result = StrategyEngine().evaluate(strategy, context)
@@ -164,7 +165,7 @@ async def propose_trade(
     strategy_row = await db.get(StrategyRow, payload.strategy_id)
     if strategy_row is None or strategy_row.user_id != user.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Strategy not found")
-    strategy = StrategyDefinition.model_validate(strategy_row.definition)
+    strategy = parse_stored_definition(strategy_row)
 
     instrument = await db.get(Instrument, payload.instrument_id)
     if instrument is None:

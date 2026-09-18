@@ -10020,6 +10020,69 @@ Recorded so they are not repeated:
   `active_broker_connections` really does count active broker accounts,
   and `total_realized_pnl` still comes from the persisted rows.
 
+## A halt stopped the stop being enforced (§54, §57, §75)
+
+`AutoTradeSupervisor.run_once` `continue`d past any halted user. For
+entries that is exactly right. For exits it was the opposite of right,
+because **there is no broker-side protective order behind an auto-traded
+position**: `ensure_protective_stop` is called only from `POST /orders`,
+so `PaperTradingEngine._maybe_exit`, run on the candles this loop feeds
+it, *is* the stop.
+
+Measured on the stop-loss fixture in
+`tests/workers/test_auto_trade_worker.py`, halting the account after the
+entry filled and before the bar that breaks the stop:
+
+| | trades | open position |
+|---|---|---|
+| not halted | 1 | none |
+| halted | **0** | **still open, stop 99.70, on a bar whose low was 90** |
+
+The ruling this now follows is already made twice in this codebase, in
+these words: reconciliation halts an account precisely when its positions
+look wrong, which is "the worst moment to forbid closing them". `POST
+/orders` and `POST /options/execute` both exempt a reducing order from the
+halt for that reason, and `RiskEngine.evaluate`'s own comment draws the
+same line — everything outside its entry-only block "applies to exits just
+as much". This path had the exemption **missing rather than declined**.
+
+A halted account is now still driven, with entries suppressed. The
+suppression is precise rather than broad: `PaperTradingEngine.on_candle`
+returns immediately after `_maybe_exit` whenever a position is open, so
+feeding it with a position open can only ever close one — and with nothing
+open the supervisor does not feed it at all, because that call *would*
+evaluate an entry. A test drives a halted account through the whole setup
+and asserts it opens nothing.
+
+### Three gates that are left as they are, but no longer silent
+
+The same abandonment happens when `auto_trading_enabled` is turned off,
+when the AUTO_TRADE permission is revoked, and when the strategy that
+opened the position is deactivated. Those are **not** changed here.
+Whether the loop should keep honouring a stop it placed after the operator
+switched the robot off has two defensible answers — `POST /orders`
+requires the LIVE_TRADE permission for *every* order including a reducing
+one, which argues for stopping; a stop that silently stops existing argues
+for continuing — and that is a decision to make explicitly rather than
+infer, the same call rounds 142 and 144 made on their own open questions.
+
+What is not in question is that it must not be silent. Any open
+auto-traded position that no pass fed a candle to is now reported once —
+an error naming the position and its stop, and a `RECONCILIATION_REQUIRED`
+notification telling the holder that nothing is evaluating it and there is
+no broker-side order behind it. Once per position, not once per pass: this
+loop runs every 60 seconds, and an operator who has to filter a warning
+will not read it.
+
+### A defect in the fix, found by its own control
+
+The managed-position marker was first recorded where the *already open*
+position is read. But the pass that **opens** a position sees none
+beforehand, so every fresh entry reported itself as unmanaged on its own
+pass — one spurious notification per trade, measured, which is precisely
+how a real warning becomes noise. What makes a position managed is that a
+candle reached its engine, so that is where the marker belongs now.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

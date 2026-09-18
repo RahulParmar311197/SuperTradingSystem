@@ -9734,6 +9734,63 @@ Guessing would produce a plausible-looking but wrong risk number — the
 exact failure the three rounds above spent their effort removing. The
 netting model is a decision to make explicitly, not a detail to infer.
 
+## A symbol with no instrument id had every candle silently discarded (§66)
+
+`CandleWorker` builds a base candle per symbol per minute and, when the
+symbol has an entry in `WORKER_INSTRUMENT_IDS`, stores it. When it does
+not, there is no `Instrument` row to hang the candle on, so nothing is
+stored — correctly. What it did not do was say so.
+
+Measured before this change, feeding one closed candle for a symbol that
+is in `WORKER_SYMBOLS` but absent from `WORKER_INSTRUMENT_IDS`:
+
+    stored:       []
+    published to: channel:chart:INFY:1m
+    log records:  []
+
+Nothing stored, nothing logged, nothing counted — while the worker kept
+building a candle a minute and streaming every one of them. The streaming
+is what makes the failure hard to see rather than merely quiet:
+`/ws/chart` takes its `instrument_id` as a `str`, so a client subscribed
+by symbol really does receive these, and every externally visible sign
+says the pipeline works.
+
+It does not. `ScannerWorker`, `AutoTradeSupervisor`, the backtest engine
+and the replay engine all read the `candles` table. A symbol that never
+reaches it is invisible to all four for as long as the deployment runs —
+no signals, no autonomous entries, and a backtest over that symbol
+returning an empty result rather than an error. The same family as the
+market-data bridge that restarted forever without ever yielding a tick
+(§66 above): a worker that looks busy and achieves nothing.
+
+Two places now report it, because they answer different questions.
+
+`app/workers/main.py` reports it **at startup**, listing every symbol in
+`WORKER_SYMBOLS` with no id. That is the moment an operator is still
+watching output and can fix the environment before the process settles
+into its loop.
+
+`CandleWorker` reports it **the first time a candle is actually dropped**,
+which is the ground truth — the startup list is derived from configuration,
+this is derived from a candle that existed and was thrown away. Once per
+symbol, not once per candle: at one base candle a minute an undeduplicated
+line would be 1,440 identical errors a day per misconfigured symbol, which
+is how a real warning gets filtered out of a log. The Prometheus counter
+`candles_dropped_unknown_instrument_total{symbol}` is **not** deduplicated
+— it counts every drop, so the log says *what is wrong* and the metric
+says *how much data has been lost since*.
+
+The publish is deliberately kept for unmapped symbols. Dropping it would
+have been a tempting tidy-up, and it would have broken the one thing on
+this path that genuinely works.
+
+One unrelated defect surfaced while testing the startup check through the
+real `main()`: its shutdown (`task.cancel()` for each supervised worker,
+then `gather`) sat after `await stop_event.wait()` with no `try`/`finally`,
+so cancelling `main()` itself skipped the shutdown entirely and left every
+supervised task running detached — asyncio's "Task was destroyed but it is
+pending" is exactly that. Moved into a `finally`.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

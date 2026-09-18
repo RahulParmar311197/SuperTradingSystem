@@ -115,6 +115,55 @@ class _UserTradingStack:
 _STACKS: dict[uuid.UUID, _UserTradingStack] = {}
 _STACK_LOCKS: dict[uuid.UUID, asyncio.Lock] = {}
 
+# Serializes a user's *trading* -- distinct from `_STACK_LOCKS`, which only
+# guards building the stack in the first place (round 58's TOCTOU fix).
+# That lock is released the moment the stack exists, and everything that
+# actually enforces a risk limit runs afterwards, unprotected.
+#
+# Every entry-side gate in `RiskEngine.evaluate` is check-then-act: the
+# handler reads `open_positions`, `current_exposure`, `trades_today` and
+# the daily/weekly P&L, awaits its way through the broker quote, the
+# liquidity read and the kill-switch load, then evaluates and fills.
+# Between the read and the fill there are many `await` points, and on a
+# single event loop another request for the same user runs in every one of
+# them -- reading the same pre-fill state and reaching the same verdict.
+#
+# Measured against the real ASGI app with `asyncio.gather`, one user, ten
+# orders on ten symbols, `max_open_positions=5`:
+#
+#     sequential:  201 201 201 201 201 403 403 403 403 403  -> 5 positions
+#     concurrent:  201 201 201 201 201 201 201 201 201 201  -> 10 positions
+#
+# The limit is not "approximately 5 under load"; it is simply absent. The
+# same mechanism defeats `max_trades_per_day`, `exposure_limit` and the
+# loss limits, and `POST /options/execute` shares this stack, so both
+# routes take this lock.
+#
+# Per user, so one account's orders queue behind each other -- which is
+# what a risk limit means -- while other accounts are untouched. This is an
+# in-process lock: it makes a single API process correct, which is the
+# topology docker-compose.yml deploys. Two replicas would still race, the
+# same documented limitation the rest of this in-memory stack already
+# carries (see docs/ARCHITECTURE.md's "Multiple API replicas for the
+# manual /orders path").
+_TRADE_LOCKS: dict[uuid.UUID, asyncio.Lock] = {}
+
+
+async def serialize_user_trading(user: User = Depends(get_current_user)):
+    """Held for the whole of any handler that trades this user's stack.
+
+    A dependency rather than an `async with` inside each handler: FastAPI
+    resolves every dependency before the handler body runs and exits them
+    after it returns, so the critical section cannot accidentally start
+    late or end early as the handler is edited. `setdefault` is safe
+    without its own lock -- plain dict access between two `await` points
+    cannot interleave on one event loop, the same argument `_stack_for`
+    already makes for `_STACK_LOCKS`.
+    """
+    lock = _TRADE_LOCKS.setdefault(user.id, asyncio.Lock())
+    async with lock:
+        yield
+
 
 async def _stack_for(user: User, db: AsyncSession) -> _UserTradingStack:
     """Resolves (and caches) the trading stack for `user`. The broker is
@@ -372,6 +421,7 @@ async def place_order(
     payload: PlaceOrderRequest,
     user: User = Depends(require_permission(TradingPermission.LIVE_TRADE)),
     db: AsyncSession = Depends(get_db),
+    _serialized: None = Depends(serialize_user_trading),
 ) -> OrderResponse:
     instrument = await _get_instrument_by_symbol(db, payload.symbol)
 

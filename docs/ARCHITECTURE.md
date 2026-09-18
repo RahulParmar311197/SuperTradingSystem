@@ -10289,6 +10289,60 @@ Non-finite values are a different matter and are already handled —
 infinity when their denominator is zero (round 128), and `win_rate` is a
 fraction in [0, 1], which `Numeric(6, 4)` holds comfortably.
 
+## Concurrent orders walked through every entry-side risk gate (§56-57)
+
+`RiskEngine.evaluate` is check-then-act, and nothing serialized it.
+`POST /orders` reads `open_positions`, `current_exposure`, `trades_today`
+and the daily/weekly P&L, then awaits its way through the broker quote,
+the liquidity assessment and the kill-switch load before evaluating and
+filling. On a single event loop another request for the same user runs
+inside every one of those awaits, reads the same pre-fill state, and
+reaches the same verdict.
+
+Round 58 added `_STACK_LOCKS`, and it is worth being precise about why
+that was not enough: it guards *building* the stack, and is released the
+moment the stack exists — which is before anything that enforces a limit.
+
+Measured against the real ASGI app with `asyncio.gather` — one user, ten
+orders on ten distinct symbols, `max_open_positions=5`:
+
+| | statuses | open positions |
+| --- | --- | --- |
+| sequential | `201 ×5`, `403 ×5` | 5 |
+| concurrent | `201 ×10` | **10** |
+
+The limit was not "approximately five under load"; it was absent. The same
+mechanism defeats `max_trades_per_day`, `exposure_limit` and the daily and
+weekly loss limits — every gate `evaluate` applies to an entry. This is
+not a synthetic stress: `asyncio.gather` on one event loop is exactly how
+uvicorn serves two concurrent requests, and a double-clicked button, a
+retrying mobile client or two open devices all produce it.
+
+The fix is one per-user `asyncio.Lock`, held for the whole of any handler
+that trades that user's stack, as a FastAPI dependency rather than an
+`async with` inside each handler: dependencies are entered before the
+handler body and exited after it returns, so the critical section cannot
+drift as the handler is edited. `POST /options/execute` resolves the same
+stack through `_stack_for`, so it takes the same lock.
+
+Per user, so one account's orders queue behind each other — which is what
+a risk limit means — while other accounts are untouched. It is an
+in-process lock: it makes a single API process correct, which is the
+topology docker-compose.yml deploys. Two replicas would still race, the
+same documented limitation the rest of this in-memory stack carries.
+
+Two things about the tests are worth recording. Injecting a lock that is
+acquired and never released — the fix's own worst failure mode, which
+would wedge an account's trading permanently — made the first version of
+these tests **hang for the full CI budget instead of failing**, because
+their awaits had no deadline. A control that hangs reports nothing, so
+every request in that file now goes through a bounded helper and the same
+injection now fails in minutes with a message naming the cause. And the
+options route is covered *structurally*, not behaviourally: proving its
+race end to end needs registered contracts and fresh `option_snapshots`
+rows, so what is asserted there is that it is wired to the same mechanism,
+with the mechanism itself proven behaviourally on `/orders`.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

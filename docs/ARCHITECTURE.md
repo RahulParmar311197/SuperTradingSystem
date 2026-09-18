@@ -9378,6 +9378,80 @@ directly would), and asserts the route answers 422 rather than letting the
 raise become a 500. This is the fourth round in six where a call site,
 not the logic, was the uncovered half.
 
+## Option chains: three readers, no writer (§40, §52)
+
+`option_snapshots` was read in four places and written in none.
+
+`POST /options/execute` reads it for **all three** of its options-specific
+gates — liquidity (volume, open interest, spread), premium deviation
+against the real bid/ask mid, and quote staleness — and
+`app/trading/portfolio_snapshots.py` reads it to mark option positions to
+market. Nothing in `app/` had ever inserted a row. An earlier round found
+this and did the honest half: it stopped the endpoint recording those
+three checks as *passed* when nothing had looked, so the audit row says
+"not assessed" instead of lying. Honest, and completely inert — an
+operator could execute a multi-leg strategy against a contract nobody had
+ever quoted, and the Greeks on every option position read 0.
+
+This is the other half: `POST /admin/option-chain`, the options analogue
+of `POST /admin/backfill`. Admin-gated and on demand rather than a
+background loop, because which expiry to fetch is a judgement call and
+provider chains are rate-limited. `UpstoxMarketData` gains
+`get_option_chain`, with the response shape parsed by a pure
+`parse_option_chain` so it is fixture-testable here and correctable from
+one real call later — the same arrangement `parse_candles` has, and for
+the same reason: this environment cannot reach Upstox's servers.
+
+Deliberately append-only. Each run writes a new `option_chains` row with
+fresh contracts and snapshots beneath it, because a snapshot *is* a
+timestamped quote — yesterday's is not wrong, only old, and the staleness
+gate downstream only means anything if the store keeps when each quote was
+taken. Every quote in one fetch shares one timestamp, not a per-row clock,
+so a strategy's legs cannot appear to differ in freshness because of the
+order the writer happened to insert them.
+
+Three things it refuses to do, each because the alternative would put
+something false in the store:
+
+- A chain that comes back without `underlying_spot_price` is refused, not
+  stored with `spot_price` 0.0.
+- A chain row with no `strike_price` is skipped, not stored at strike 0.0
+  — which is a real strike, deep in the money, that the gates would read
+  as one.
+- A contract the provider quotes but this deployment has no `Instrument`
+  row for is **reported**, not auto-created. Registering an instrument is
+  `POST /instruments`' job; minting rows here would let a provider's
+  spelling of a symbol quietly become this system's.
+
+### The writer would have broken the readers
+
+Both consumers resolved the instrument's `OptionContract` with
+`.scalar_one_or_none()`. Nothing enforced one contract row per instrument,
+and an ingestion run creates a fresh one under each new chain — so **the
+second chain fetch of the day would have turned `POST /options/execute`
+into a 500.** Measured directly against Postgres before any of this was
+written:
+
+    two contracts for one instrument -> MultipleResultsFound
+
+The fix is one shared `app/options/snapshots.latest_option_snapshot`,
+which joins contract to snapshot and takes the newest quote across every
+fetch — the question both callers were actually asking. It replaces two
+inlined copies of the same two queries, which is the deduplication an
+earlier round learned to do the hard way: breaking *both* copies of a
+duplicated helper at once had left the whole suite green.
+
+So the feature and the trap ship together, and the trap is not
+hypothetical — it is precisely what the feature's second run produces.
+
+### What this does and does not deliver
+
+Chains reach the store when an operator asks for them. That is enough for
+the three execution gates to be real and for option Greeks to be marked to
+market, and it is **not** a live quote stream: the freshness a strategy is
+judged against is the freshness of the last fetch. As with equities, the
+system can now be fed; it cannot yet feed itself.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

@@ -15,7 +15,7 @@ from app.core.redis import account_halt_reason, halt_account
 from app.database.models.instruments import Instrument
 from app.database.models.instruments import MarketType as InstrumentMarketType
 from app.database.models.notifications import NotificationType
-from app.database.models.options import OptionContract, OptionSnapshot
+from app.options.snapshots import latest_option_snapshot
 from app.database.models.risk import RiskDecision as RiskEventDecision
 from app.database.models.risk import RiskEvent
 from app.database.models.strategy import Direction
@@ -196,22 +196,6 @@ class ExecuteOptionsStrategyResponse(BaseModel):
     # What was done about it, in the order it was done. Empty when the
     # strategy is intact.
     remediation: list[str] = []
-
-
-async def _latest_option_snapshot(db: AsyncSession, instrument_id: uuid.UUID) -> OptionSnapshot | None:
-    contract = (
-        await db.execute(select(OptionContract).where(OptionContract.instrument_id == instrument_id))
-    ).scalar_one_or_none()
-    if contract is None:
-        return None
-    return (
-        await db.execute(
-            select(OptionSnapshot)
-            .where(OptionSnapshot.option_contract_id == contract.id)
-            .order_by(OptionSnapshot.snapshot_at.desc())
-            .limit(1)
-        )
-    ).scalar_one_or_none()
 
 
 # A leg counts as established only when it is completely filled. Anything
@@ -588,7 +572,7 @@ async def execute_options_strategy(
     # data that does not exist.
     market_data_age_seconds: float | None = None
     for leg in payload.legs:
-        snapshot = await _latest_option_snapshot(db, instruments[leg.symbol].id)
+        snapshot = await latest_option_snapshot(db, instruments[leg.symbol].id)
         if snapshot is None:
             liquidity_warnings.append(f"{leg.symbol}: no liquidity data available — not evaluated")
             continue

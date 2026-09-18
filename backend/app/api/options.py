@@ -26,7 +26,12 @@ from app.notifications.service import create_notification
 from app.options.greeks import OptionType, black_scholes_greeks, black_scholes_price
 from app.options.liquidity_filter import evaluate_liquidity
 from app.options.payoff import OptionLeg, compute_payoff_summary
-from app.options.strategies import BIAS_STRATEGIES, build_strategy
+from app.options.strategies import (
+    BIAS_STRATEGIES,
+    RESERVED_ARGUMENTS,
+    build_strategy,
+    required_arguments,
+)
 from app.risk.kill_switch import load_kill_switch_state
 from app.risk.options_risk import OptionsRiskProposal, evaluate_options_risk
 from app.trading.order_manager import OrderRecord
@@ -69,6 +74,14 @@ async def compute_greeks(payload: GreeksRequest, user: User = Depends(get_curren
     return GreeksResponse(price=price, **dataclasses.asdict(greeks))
 
 
+# Typo guards, not trading limits, and REASONED rather than CALIBRATED --
+# matching `_MAX_PREMIUM` below, which the execution path already uses for
+# the same purpose. A lot size in the millions and a position of 1e12 lots
+# are both a slipped decimal point rather than an order anyone means.
+_MAX_QUANTITY = 1e12
+_MAX_LOT_SIZE = 1_000_000
+
+
 class StrategyLegInput(BaseModel):
     strike: float
     premium_call: float | None = None
@@ -78,8 +91,22 @@ class StrategyLegInput(BaseModel):
 class BuildStrategyRequest(BaseModel):
     strategy_name: str
     legs_by_strike: dict[float, StrategyLegInput]
-    quantity: float = 1
-    lot_size: int = 1
+    # Both were unbounded, and this endpoint answers a question rather than
+    # placing a trade -- so what they produced was a wrong number rather
+    # than a bad fill, which is worse to leave in place than it sounds: a
+    # payoff summary is what someone reads *before* choosing a strategy.
+    # Measured on a 25000/25200 bull call spread:
+    #
+    #   quantity=-5  -> 200, net_premium=-17500 (a debit spread reported as a credit)
+    #   lot_size=0   -> 200, every number 0.0 (a position of no contracts, "analysed")
+    #   lot_size=-50 -> 200, every number inverted
+    quantity: float = Field(default=1, gt=0, le=_MAX_QUANTITY)
+    lot_size: int = Field(default=1, ge=1, le=_MAX_LOT_SIZE)
+    # The strike arguments the chosen strategy needs, e.g.
+    # `{"long_strike": 25000, "short_strike": 25200}`. **Every** builder
+    # requires at least one, so the empty default below cannot succeed for
+    # any strategy -- which is why it used to be a 500 rather than a 422.
+    # `GET /options/strategies` now reports what each one wants.
     strategy_kwargs: dict = {}
 
 
@@ -102,7 +129,19 @@ class PayoffResponse(BaseModel):
 
 @router.get("/strategies")
 async def list_available_strategies(user: User = Depends(get_current_user)) -> dict:
-    return {"by_bias": BIAS_STRATEGIES}
+    """The strategies this system can build, and what each one needs.
+
+    `requires` is new, and it is the half that was missing. Every builder
+    takes at least one strike argument, supplied through
+    `POST /options/strategy`'s `strategy_kwargs` -- and nothing anywhere
+    told a caller which, so the only way to find out was a 500. Read from
+    the builders' own signatures, so this cannot drift from what they
+    accept.
+    """
+    return {
+        "by_bias": BIAS_STRATEGIES,
+        "requires": {name: required_arguments(name) for names in BIAS_STRATEGIES.values() for name in names},
+    }
 
 
 @router.post("/strategy", response_model=PayoffResponse)
@@ -111,6 +150,18 @@ async def build_option_strategy(payload: BuildStrategyRequest, user: User = Depe
         strike: {"CALL": leg.premium_call, "PUT": leg.premium_put}
         for strike, leg in payload.legs_by_strike.items()
     }
+    reserved = sorted(RESERVED_ARGUMENTS & set(payload.strategy_kwargs))
+    if reserved:
+        # Checked here rather than inside `build_strategy`, which receives
+        # the route's own `quantity`/`lot_size` through the same `**kwargs`
+        # and so cannot tell them apart. Passing them twice was
+        # "multiple values for argument" -- a `TypeError`, and a 500.
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"{reserved} may not be passed in `strategy_kwargs`: they are set by this request's own "
+            "fields, and passing them twice is an error rather than an override.",
+        )
+
     try:
         legs = build_strategy(
             payload.strategy_name, chain, quantity=payload.quantity, lot_size=payload.lot_size, **payload.strategy_kwargs
@@ -118,6 +169,16 @@ async def build_option_strategy(payload: BuildStrategyRequest, user: User = Depe
         summary = compute_payoff_summary(legs)
     except (ValueError, KeyError) as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+    except TypeError as exc:
+        # Defence in depth. `build_strategy` now turns every bad
+        # `strategy_kwargs` into a `ValueError` naming what the strategy
+        # wants, so reaching here means a builder's signature changed
+        # under it -- which must still be a 422 rather than the 500 this
+        # whole change is about.
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"Options strategy {payload.strategy_name!r} could not be built from these arguments: {exc}",
+        ) from exc
 
     return PayoffResponse(
         legs=[

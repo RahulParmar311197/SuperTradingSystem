@@ -10139,6 +10139,57 @@ suite would have noticed.
   8,000 0.074s, against a 60-second loop interval. The growth is real and
   super-linear; the magnitude is not a problem at any plausible uptime.
 
+## Every number on the replay order endpoint was unvalidated (§41-45)
+
+`POST /replay/{id}/order` took `action: str`, `quantity: float | None` and
+`price: float | None` with no constraint on any of them, and spent them as
+`engine.buy(payload.quantity or 1)` and `engine.set_stop(payload.price)`.
+Six things measured against the live endpoint:
+
+| request | answer before |
+| --- | --- |
+| `{"action": "buy", "quantity": 0}` | 200, a **1-unit LONG** opened — `or 1` |
+| `{"action": "buy", "quantity": -5}` | 200, a LONG of −5 units: entry 100, exit 90, balance **up** 50, scored `win_rate: 1.0` |
+| `{"action": "buy", "quantity": 1e308}` | 500 `NumericValueOutOfRangeError` |
+| `{"action": "buy", "quantity": NaN}` | 200, and then the close 500s |
+| `{"action": "set_stop"}` | 200, and the stop is **cleared** |
+| `{"action": "close", "price": -1e6}` | 200, balance −900100.0 |
+
+The stop one is the one that costs a user something. A long with a stop at
+99.5, stepped five bars through a low of 96, closes at 99.5 for a small
+loss; the same long after one no-price `set_stop` is still open and
+unprotected at the end of those same five bars — and the call that
+disarmed it answered 200. The money is imaginary, this being a replay
+session; what is not imaginary is that this is the endpoint blueprint §43
+trains a user's stop discipline on, and it was quietly teaching that a
+stop can be set and then not be there.
+
+`ReplayOrderRequest` now carries the bounds `app/api/orders.py` already
+established for the live path: `gt=0, lt=1e12`, which is what a
+`Numeric(18, 6)` column holds and which rejects `NaN` and `inf` for free.
+`set_stop`/`set_target` — the two actions where the price *is* the
+instruction, so there is nothing to fall back to — require one.
+
+A per-field bound is not sufficient on its own, and that is the second
+half of this round. P&L is a **product**: a 1e11-unit position fits the
+`quantity` column, and closing it 100 points from its entry books 1e13,
+which still overflowed `replay_orders.pnl` and 500'd the request with the
+trade already closed in the engine's memory and no row written for it.
+`ReplayEngine` now refuses such a fill where the product is formed, and
+refuses it at `set_stop`/`set_target` time as well — a stop fires from
+inside `advance()`, which has no request to answer 422 to, so the level
+has to be rejected when it is placed rather than when it is hit.
+
+Two things were deliberately **not** changed. A close price outside the
+candle's traded range is still accepted: a manual replay session is a
+simulation the user drives, and round 105 settled the same question for
+`POST /paper/{id}/candle` — the bounds assert only that the numbers are
+prices at all. And `ReplayEngine.buy()` itself still accepts a negative
+quantity; `app/api/replay.py` is its only caller in `app/`, so the
+reachable harm is closed at the request, and a second guard nobody could
+reach would be a bound with no measured failure behind it. Both absences
+have their own tests so they cannot be quietly filled in later.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

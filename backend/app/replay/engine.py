@@ -22,6 +22,28 @@ class ReplayError(Exception):
     pass
 
 
+# Every number this engine produces is journalled by
+# `app/replay/persistence.py` into `Numeric(18, 6)` columns --
+# `replay_orders.pnl` and `replay_sessions.balance` -- which hold at most
+# 999999999999.999999.
+#
+# `ReplayOrderRequest` bounds the numbers a client *supplies*, and that is
+# not enough, because P&L is a product of two of them. Measured after
+# those field bounds were in place: a 1e11-unit position (accepted: 1e11
+# fits the `quantity` column) closed 100 points from its entry is a P&L of
+# 1e13, which reached Postgres as NumericValueOutOfRangeError and 500'd
+# the request -- with the trade already closed in this engine's memory and
+# nothing written for it, the same engine/journal divergence
+# `PlaceOrderRequest`'s bounds were added to close on the live path.
+#
+# The guard is here rather than at the route because this is where the
+# product is formed, and because a stop can fire from `advance()`, which
+# has no request to reject. `set_stop`/`set_target` therefore refuse a
+# level they could not be filled at, so by the time `advance()` runs the
+# arithmetic is already known to fit.
+_MAX_JOURNALLED = 1e12
+
+
 @dataclass(slots=True)
 class ReplayTrade:
     direction: Direction
@@ -92,9 +114,27 @@ class ReplayEngine:
     def sell(self, quantity: float) -> ReplayTrade:
         return self._open(Direction.SHORT, quantity)
 
+    def _pnl_at(self, exit_price: float) -> float:
+        """The P&L this open trade would book at `exit_price`. One
+        formula, used by `close` and by the two guards below, so a level
+        can never be accepted at a price the close would then reject."""
+        trade = self.open_trade
+        sign = 1 if trade.direction == Direction.LONG else -1
+        return (exit_price - trade.entry_price) * trade.quantity * sign
+
+    def _refuse_a_price_the_journal_cannot_hold(self, exit_price: float) -> None:
+        pnl = self._pnl_at(exit_price)
+        if abs(pnl) >= _MAX_JOURNALLED or abs(self.balance + pnl) >= _MAX_JOURNALLED:
+            raise ReplayError(
+                f"A fill at {exit_price} on {self.open_trade.quantity} units entered at "
+                f"{self.open_trade.entry_price} would book a P&L of {pnl:.2f}, which this "
+                "session cannot record. Use a smaller position or a price nearer the entry."
+            )
+
     def set_stop(self, price: float) -> None:
         if self.open_trade is None:
             raise ReplayError("No open position")
+        self._refuse_a_price_the_journal_cannot_hold(price)
         self.open_trade.stop = price
         if self.open_trade.initial_stop is None:
             self.open_trade.initial_stop = price
@@ -102,6 +142,7 @@ class ReplayEngine:
     def set_target(self, price: float) -> None:
         if self.open_trade is None:
             raise ReplayError("No open position")
+        self._refuse_a_price_the_journal_cannot_hold(price)
         self.open_trade.target = price
 
     move_stop = set_stop
@@ -112,12 +153,16 @@ class ReplayEngine:
             raise ReplayError("No open position")
         candle = self.clock.current_candle
         exit_price = price if price is not None else candle.close
+        # Before the first mutation below, never after: a close that
+        # raised halfway would leave this engine holding a trade the
+        # journal has no row for.
+        self._refuse_a_price_the_journal_cannot_hold(exit_price)
         trade = self.open_trade
         sign = 1 if trade.direction == Direction.LONG else -1
         trade.exit_price = exit_price
         trade.closed_index = self.clock.cursor
         trade.closed_at = candle.timestamp
-        trade.pnl = (exit_price - trade.entry_price) * trade.quantity * sign
+        trade.pnl = self._pnl_at(exit_price)
         # Against the stop as first placed, not wherever it has since been
         # moved to. Measuring against the current stop makes R mean
         # something different for every trade and silently drops the most

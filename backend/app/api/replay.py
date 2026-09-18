@@ -2,7 +2,7 @@ import dataclasses
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.dependencies import get_current_user
@@ -182,10 +182,55 @@ async def reset_replay(
     return await _publish_state(session_id, engine)
 
 
+# Every number on this request is written to `replay_orders`, whose
+# quantity/price/stop/target columns are `Numeric(18, 6)` -- the same
+# ceiling `app/api/orders.py`'s `_MAX_PRICE` was measured against, for the
+# same reason. Measured on the live endpoint before this bound:
+# `quantity=1e308` and `quantity=Infinity` both 500 with
+# NumericValueOutOfRangeError from `sync_replay_session`, `set_stop` with
+# `price=1e308` does the same, and `quantity=NaN` is accepted at entry and
+# then 500s on the close -- leaving the engine's trade closed in memory
+# with nothing written for it.
+_MAX_REPLAY_NUMERIC = 1e12
+
+# `close` takes an optional price (no price means "at this candle's
+# close", which is the documented behaviour). These two do not: a stop or
+# a target *is* the price, so there is nothing for the engine to fall back
+# to -- see `_require_a_price_where_the_action_is_the_price`.
+_ACTIONS_THAT_ARE_A_PRICE = ("set_stop", "set_target")
+
+
 class ReplayOrderRequest(BaseModel):
     action: str  # "buy" | "sell" | "close" | "set_stop" | "set_target"
-    quantity: float | None = None
-    price: float | None = None
+    # `gt=0` rejects the non-finite values too: `NaN` fails every
+    # comparison and `inf` fails `lt`, both verified against this pydantic
+    # version rather than assumed. It also closes the second half of the
+    # quantity bug -- `quantity=0` used to reach `payload.quantity or 1`
+    # below and be *silently traded as 1 unit*, so a client that asked for
+    # nothing got a position.
+    quantity: float | None = Field(default=None, gt=0, lt=_MAX_REPLAY_NUMERIC)
+    price: float | None = Field(default=None, gt=0, lt=_MAX_REPLAY_NUMERIC)
+
+    @model_validator(mode="after")
+    def _require_a_price_where_the_action_is_the_price(self) -> "ReplayOrderRequest":
+        """`set_stop`/`set_target` with no price used to answer 200 and
+        silently *clear* the stop.
+
+        `engine.set_stop(payload.price)` assigns whatever it is given, so
+        `{"action": "set_stop"}` set `stop = None`. Measured: a long with
+        a stop at 99.5, stepped five bars through a low of 96, closes at
+        99.5 for a 0.5 loss; the same long after one no-price `set_stop`
+        is still open and unprotected at the end of those five bars, and
+        the call that disarmed it reported success.
+
+        Rejecting it rather than treating it as "clear the stop": there is
+        no clear-the-stop action in blueprint §43's flow (SET SL, MOVE SL),
+        and an accidental one must not be spelled the same way as setting
+        one.
+        """
+        if self.action in _ACTIONS_THAT_ARE_A_PRICE and self.price is None:
+            raise ValueError(f"{self.action} requires a price")
+        return self
 
 
 @router.post("/{session_id}/order", response_model=ReplayStateResponse)
@@ -194,10 +239,15 @@ async def submit_replay_order(
 ) -> ReplayStateResponse:
     engine = await _get_owned_session(session_id, user, db)
     try:
+        # `is not None`, not `or 1`: with the bound above a zero quantity
+        # is now a 422, but the `or` spelling is what turned it into a
+        # silent 1-unit trade in the first place and should not survive as
+        # the thing standing between that bug and this endpoint.
+        quantity = payload.quantity if payload.quantity is not None else 1
         if payload.action == "buy":
-            engine.buy(payload.quantity or 1)
+            engine.buy(quantity)
         elif payload.action == "sell":
-            engine.sell(payload.quantity or 1)
+            engine.sell(quantity)
         elif payload.action == "close":
             engine.close(payload.price)
         elif payload.action == "set_stop":

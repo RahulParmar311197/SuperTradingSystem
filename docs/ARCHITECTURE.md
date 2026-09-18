@@ -9945,6 +9945,81 @@ claim several earlier rounds removed from the risk paths.
 The two halves belong together: without the second, the first would turn
 every already-stored `lookback=0` strategy from silently-dead into a 500.
 
+## The rate limiter could lock an address out permanently (§69)
+
+`check_rate_limit` was `INCR`, then — only when the count came back 1 —
+`EXPIRE`: two round trips with an `await` between them. Anything that
+interrupted that gap left the key with **no expiry at all**, and because
+`EXPIRE` is only reached at count 1, no later call ever set one.
+
+Measured against a live Redis by doing the `INCR` without the `EXPIRE`,
+which is exactly what a crash, a cancellation or a dropped connection on
+that second call leaves behind:
+
+    ttl after the interrupted call:        -1        (no expiry)
+    next six calls (limit 3, window 1s):   True True False False False False
+    after the window has passed:           False
+    ttl:                                   -1
+
+False forever. The keys are `auth:login:<client ip>` and
+`auth:register:<client ip>`, so that is one address permanently unable to
+log in or sign up — there is no other login path, nothing expires to
+recover it, and the only remedy is a human deleting the key in Redis by
+hand. Redis now has persistence (§109), so the poisoned key survives a
+restart too; that earlier fix makes this failure more durable, not less.
+
+The gap is not exotic. It is one `await` between two round trips, and
+`app/core/rate_limit.py` **already catches a Redis error there** and
+answers 503 — which is precisely the interleaving that poisons the key.
+The blip looks transient and leaves a permanent 429 behind it.
+
+### The fix
+
+One atomic Lua step:
+
+```lua
+local count = redis.call('INCR', KEYS[1])
+if redis.call('TTL', KEYS[1]) < 0 then
+    redis.call('EXPIRE', KEYS[1], ARGV[1])
+end
+return count
+```
+
+The TTL check also **repairs** a key that has lost its expiry, rather than
+only setting one on the first call, so anything already poisoned in a
+running deployment heals on its next request instead of needing manual
+intervention.
+
+Deliberately not an unconditional `EXPIRE`. Refreshing the window on every
+call would repair the TTL too — and would mean a key under sustained load
+never expires, which is the same permanent denial wearing a different hat.
+There is a control test for exactly that wrong fix.
+
+### Why nothing caught it
+
+`tests/conftest.py` sets `RATE_LIMIT_ENABLED=false` for the whole suite,
+for a good reason: every test shares one client address, so a real limit
+would trip on test volume rather than on abuse. The consequence is that no
+test had ever driven the limiter through an endpoint at all. The two
+call-site tests added here turn it back on for their own duration and put
+the shared key back afterwards.
+
+### Three probes that came back clean
+
+Recorded so they are not repeated:
+
+- **Stop-versus-target ordering when one bar contains both.** All three
+  engines — backtest, paper and replay — check the stop first and the
+  target in an `elif`, so the pessimistic outcome wins consistently. A
+  strategy validated in a backtest is not flattered relative to what the
+  paper engine would do.
+- **Limiter state across processes.** It is Redis-backed, so several API
+  workers share one bucket rather than each getting its own allowance.
+- **Response fields named for one source and computed from another.** Spot
+  checks on the admin health and portfolio surfaces found none;
+  `active_broker_connections` really does count active broker accounts,
+  and `total_realized_pnl` still comes from the persisted rows.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

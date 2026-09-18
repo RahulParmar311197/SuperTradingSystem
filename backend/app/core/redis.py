@@ -283,11 +283,50 @@ async def worker_is_alive(worker_name: str) -> bool:
 
 # --- Rate limiting -------------------------------------------------------
 
+# INCR and the TTL have to land together, and the TTL has to be repairable.
+#
+# This was `incr` and then, only when the count came back 1, `expire` --
+# two round trips with an await between them. Anything that interrupted
+# that gap left the key with **no expiry at all**, and because `expire` is
+# only reached at count 1, no later call ever set one. Measured against a
+# live Redis by doing the INCR without the EXPIRE, exactly as a crash, a
+# cancellation or a dropped connection on the second call leaves things:
+#
+#     ttl after the interrupted call: -1        (no expiry)
+#     next six calls (limit 3, window 1s): True True False False False False
+#     after the window has passed:          False
+#     ttl:                                   -1
+#
+# False forever. The keys are `auth:login:<client ip>` and
+# `auth:register:<client ip>`, so that is one address permanently unable
+# to log in or sign up, with no other login path and nothing that expires
+# to recover -- only a human deleting the key by hand. Redis now has
+# persistence (see docker-compose.yml), so the poisoned key survives a
+# restart too.
+#
+# The gap is not exotic: it is one await between two round trips, and the
+# caller (app/core/rate_limit.py) already handles a Redis error there by
+# answering 503. That is exactly the interleaving that poisons the key --
+# the blip looks transient and leaves a permanent 429 behind it.
+#
+# Lua, because it must be one atomic step. The TTL check also *repairs* a
+# key that has somehow lost its expiry, rather than only setting one on
+# the first call, so any key already poisoned in a running deployment
+# heals on its next request. Deliberately not an unconditional EXPIRE:
+# refreshing the window on every call would mean a key under sustained
+# load never expires, which is the same permanent denial wearing a
+# different hat.
+_RATE_LIMIT_SCRIPT = """
+local count = redis.call('INCR', KEYS[1])
+if redis.call('TTL', KEYS[1]) < 0 then
+    redis.call('EXPIRE', KEYS[1], ARGV[1])
+end
+return count
+"""
+
+
 async def check_rate_limit(key: str, limit: int, window_seconds: int) -> bool:
     """Fixed-window limiter. Returns True if the call is allowed."""
     redis_key = f"ratelimit:{key}"
-    client = get_redis()
-    count = await client.incr(redis_key)
-    if count == 1:
-        await client.expire(redis_key, window_seconds)
-    return count <= limit
+    count = await get_redis().eval(_RATE_LIMIT_SCRIPT, 1, redis_key, window_seconds)
+    return int(count) <= limit

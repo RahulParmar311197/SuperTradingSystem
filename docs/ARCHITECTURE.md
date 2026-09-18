@@ -9311,6 +9311,73 @@ All three controls were injection-tested alongside the proofs, and both
 call-site injections were caught — the first round in four where that was
 true on the first attempt.
 
+## A 500 on `POST /auth/register` for anyone whose password is not ASCII (§68)
+
+`RegisterRequest.password` carried `Field(min_length=8, max_length=72)`.
+Pydantic's `max_length` counts **characters**. `hash_password` counts
+**bytes**, because bcrypt reads only the first 72 of them and this codebase
+refuses rather than truncates — two different long passwords must never
+hash the same way.
+
+The two units disagreed, and the gap is ordinary rather than exotic:
+
+| password | characters | bytes | schema | hash |
+|---|---|---|---|---|
+| 72 ASCII letters | 72 | 72 | pass | fine |
+| 20 emoji | 20 | 80 | pass | `PasswordTooLongError` |
+| 30 CJK characters | 30 | 90 | pass | `PasswordTooLongError` |
+| 40 accented Latin letters | 40 | 80 | pass | `PasswordTooLongError` |
+
+Nothing in `app/` caught that exception. Measured through the real route
+before the fix: **HTTP 500 with a traceback**, on an unauthenticated
+endpoint, for a perfectly reasonable password. It was found by a probe for
+custom exceptions that are raised but never caught.
+
+The fix is a `field_validator` on `RegisterRequest.password` that measures
+UTF-8 bytes, and a message that says so — "72 characters" would send the
+user round the loop with another password that also fails, so the rejection
+names the unit, how far over this one is, and that accented, CJK and emoji
+characters cost more than one byte each. The character bound stays: it is a
+necessary condition (no character encodes to less than one byte) and
+rejects obvious oversize cheaply. `POST /auth/register` also catches
+`PasswordTooLongError` and answers **422**, deliberately not the 409 a
+duplicate email gets — a conflict with existing state and a malformed
+request are different things to tell a client.
+
+`POST /auth/login` was checked and is clean: `verify_password` returns
+`False` for an over-long input rather than raising, so `LoginRequest`'s
+unbounded password is not exposed. The PR was not widened for it.
+
+### Two things injection found that review did not
+
+**The fourth vacuous test this work has caught.** The first version of the
+boundary control asserted that the schema and `hash_password` agreed, using
+`MAX_PASSWORD_BYTES` on both sides. Moving the constant to 40 moved both
+sides together and the entire suite stayed green. A control that compares a
+value to itself tests nothing.
+
+The second version was wrong in a more interesting way: it asked
+`verify_password` where bcrypt stops reading. But `verify_password` returns
+`False` above `MAX_PASSWORD_BYTES` before bcrypt ever sees the input, so it
+only ever answers where *we* stop reading. It failed immediately against
+bcrypt 4.2.0, which was measured directly and does truncate silently:
+`checkpw(b"a"*73, hashpw(b"a"*72))` is `True`, and `hashpw` on 73 bytes does
+not raise. The control now probes the bcrypt library itself — byte 72 must
+still be read, byte 73 must not — and there is deliberately no
+`assert MAX_PASSWORD_BYTES == 72`, which would pin the number without ever
+checking it was the right one.
+
+**And the wiring, again.** Removing the route's `except
+PasswordTooLongError` left the whole auth suite green, because the schema
+now rejects these passwords first and the handler's catch is never reached
+down the ordinary path. That is defence in depth by definition — and an
+untested defence is a claim, not a defence. A test now constructs the
+request with `model_construct`, which is how a bypass actually happens
+(it skips validators, as any internal caller building a `RegisterRequest`
+directly would), and asserts the route answers 422 rather than letting the
+raise become a 500. This is the fourth round in six where a call site,
+not the logic, was the uncovered half.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

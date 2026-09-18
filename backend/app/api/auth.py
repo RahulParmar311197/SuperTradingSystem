@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import service as auth_service
 from app.auth.dependencies import get_current_user
+from app.auth.security import PasswordTooLongError
 from app.auth.schemas import (
     LoginRequest,
     RefreshRequest,
@@ -66,6 +67,17 @@ async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db))
         return await auth_service.register(db, payload.email, payload.password, payload.name)
     except auth_service.AuthError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    except PasswordTooLongError as exc:
+        # Defence in depth. `RegisterRequest` already rejects this in bytes,
+        # so reaching here means a caller bypassed the schema -- but
+        # `hash_password` is documented as *the* security boundary, and an
+        # uncaught raise there is the 500 this whole change is about.
+        #
+        # 422, not the 409 `AuthError` gets: a duplicate email is a
+        # conflict with existing state, an oversized password is a
+        # malformed request, and giving them the same code tells the
+        # client to do the wrong thing about it.
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
 
 
 @router.post("/login", response_model=TokenResponse, dependencies=[Depends(_login_rate_limit)])

@@ -28,7 +28,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import select
 
@@ -45,6 +45,7 @@ from app.database.models.risk import RiskEvent
 from app.database.models.users import TradingPermission, User
 from app.database.session import async_session_factory
 from app.market.repository import get_candles
+from app.market.timeframes import timeframe_to_minutes
 from app.notifications.service import create_notification
 from app.paper.engine import PaperTradingEngine, RiskWindow
 from app.risk.limits import RiskLimits
@@ -53,6 +54,35 @@ from app.trading.persistence import load_open_positions, persist_position
 from app.trading.position_manager import PositionManager
 
 logger = logging.getLogger("workers.autotrade")
+
+# How many of its own bars old a candle may be before this loop refuses to
+# trade on it. REASONED, NOT CALIBRATED: a bar is expected within one
+# interval of its close, and this supervisor polls every
+# `interval_seconds` (60s by default), so one bar of slack covers the
+# ordinary case. At three, at least two bars are missing outright -- the
+# feed is not merely late, it has stopped.
+#
+# Deliberately NOT `RiskLimits.market_data_max_staleness_seconds` (10s).
+# That number describes a *tick*, which is what `POST /orders` measures
+# through Redis; a 15m bar is already 900 seconds old the instant it
+# closes, so applying the tick limit here would refuse every candle this
+# loop has ever seen.
+MAX_CANDLE_AGE_IN_BARS = 3
+
+
+def candle_age_seconds(candle, timeframe: str, now: datetime) -> float:
+    """How late `candle` is, measured from when its bar closed.
+
+    A bar stamped at its open is not available until `timeframe` later, so
+    the age that means anything is the excess beyond that -- not the raw
+    difference, which would call every freshly-closed 15m bar 900s stale.
+    Floored at 0: a clock skew that puts the bar slightly in the future is
+    not negative staleness.
+    """
+    elapsed = (now - candle.timestamp).total_seconds()
+    return max(0.0, elapsed - timeframe_to_minutes(timeframe) * 60)
+
+
 
 
 class AutoTradeSupervisor:
@@ -192,6 +222,43 @@ class AutoTradeSupervisor:
         if self._last_candle_seen.get(key) == latest.timestamp:
             return None
         self._last_candle_seen[key] = latest.timestamp
+
+        # This loop trades unattended, and until now it traded whatever the
+        # newest *stored* candle was, however old that was.
+        #
+        # `PaperTradingEngine` builds its `TradeRiskProposal` with
+        # `market_data_age_seconds=0.0`, so the `market_data_fresh` check
+        # could not fail here -- and the `RiskEvent` row recorded it as a
+        # check that had passed. Measured by driving the engine with a bar
+        # from January while the clock said September: proposal age 0.0,
+        # `market_data_fresh: True`. `POST /orders` computes a real age
+        # from Redis and enforces a limit; this path had the gate in name
+        # only. It is the same shape as the `strategy_allocation=0.0` that
+        # a previous round had to fix on this very proposal.
+        #
+        # The guard belongs here rather than in the engine: this is the
+        # only unattended caller, and the other one
+        # (`POST /paper/{id}/candle`) is an operator deliberately handing
+        # over a bar, where freshness is not a property of anything.
+        #
+        # Nothing about this is hypothetical. `_last_candle_seen` is
+        # in-memory, so a worker restart clears it and the very next pass
+        # acts on the newest stored bar whatever its date -- and candles
+        # only reach the store when someone runs `POST /admin/backfill`.
+        age = candle_age_seconds(latest, strategy.timeframe, datetime.now(timezone.utc))
+        max_age = timeframe_to_minutes(strategy.timeframe) * 60 * MAX_CANDLE_AGE_IN_BARS
+        if age > max_age:
+            logger.warning(
+                "Not auto-trading %s on %s: newest stored candle closed %.0fs late (limit %.0fs, "
+                "%d bars). The feed has stopped or history was never backfilled -- see "
+                "POST /admin/backfill.",
+                instrument.symbol,
+                strategy.timeframe,
+                age,
+                max_age,
+                MAX_CANDLE_AGE_IN_BARS,
+            )
+            return None
 
         # Seed a freshly-built engine with the stored history behind
         # `latest`, so its first evaluation analyses the same series every

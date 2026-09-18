@@ -397,6 +397,21 @@ class PaperTradingEngine:
             current_exposure=current_exposure,
             strategy_allocation=strategy_allocation,
             correlated_exposure=correlated_exposure,
+            # 0.0 because by the time a candle reaches this engine, whoever
+            # handed it over has already decided the bar is one to act on --
+            # and only one of the two callers can decide otherwise.
+            #
+            # `AutoTradeSupervisor` is unattended, so it checks:
+            # `candle_age_seconds` against `MAX_CANDLE_AGE_IN_BARS` before
+            # calling, and does not call at all for a bar that is too late.
+            # `POST /paper/{id}/candle` is an operator posting a bar by
+            # hand, where freshness is not a property of anything.
+            #
+            # This used to be the whole story, and it was not enough: the
+            # supervisor had no such check, so `market_data_fresh` passed on
+            # every autonomous trade and the `RiskEvent` row recorded a gate
+            # that could not fail. Measured with a bar eight months old:
+            # age 0.0, `market_data_fresh: True`.
             market_data_age_seconds=0.0,
             broker_healthy=await self.broker.is_healthy(),
             repeated_rejections=self.repeated_rejections,

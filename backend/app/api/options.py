@@ -591,6 +591,27 @@ async def execute_options_strategy(
             raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown instrument symbol: {leg.symbol}")
         if instrument.market != InstrumentMarketType.OPTIONS or instrument.option_type is None or instrument.strike is None:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"{leg.symbol} is not an options contract")
+        if instrument.lot_size < 1:
+            # POST /instruments now refuses these, but rows registered
+            # before it did are still in the table and there is no endpoint
+            # that can repair one. This is the layer that protects them,
+            # and it is not the same check: the validator guards what can
+            # be written, this guards what is read.
+            #
+            # Measured on a lot_size=0 row: this endpoint answered 201
+            # with max_profit, max_loss and net_premium all 0.0, the leg
+            # ACKNOWLEDGED, and no position opened -- a strategy reported
+            # as executed that did nothing, and a RiskEvent row recording
+            # an approval of a position that had no risk only because it
+            # had no size. A negative lot size is worse: `payoff` is
+            # `sign * (intrinsic - premium) * quantity * lot_size`, so it
+            # silently turns a long call into a short one.
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"{leg.symbol} is registered with lot_size={instrument.lot_size}, which cannot be "
+                "traded: every quantity and payoff number for this contract would be zero or "
+                "inverted. Re-register the symbol with its real lot size.",
+            )
         instruments[leg.symbol] = instrument
 
     option_legs = [

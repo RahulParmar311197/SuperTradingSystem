@@ -10243,6 +10243,52 @@ NaN is False and `inf` fails the magnitude test unaided. That half was
 removed rather than kept as belt-and-braces no test could distinguish
 from its absence.
 
+## The backtest metrics are NOT lesson 16's third home — a negative result (§44)
+
+Rounds 149 and 150 both found the same shape: a client number multiplied
+into a persisted column, where bounding the field does not bound the
+product. `app/backtest/metrics.py` was the obvious third candidate —
+`backtest_metrics.profit_factor`, `sharpe`, `sortino` and `average_r` are
+all `Numeric(10, 4)`, which holds at most 999999.9999, and nothing bounds
+their magnitude. It is not a bug, and this section records why so the
+question is not re-derived.
+
+The arithmetic really can exceed those columns. Measured by calling
+`compute_metrics` directly with hand-made trade lists:
+
+| trades | result |
+| --- | --- |
+| one +1000 win, one −0.000001 loss | `profit_factor=1e9`, `sortino=7.1e8` |
+| two wins of 100.0 and 100.000001 | `sharpe=1.4e8` |
+| a trade carrying `r_multiple=1e9` | `average_r=5e8` |
+
+What could not be found is a path to any of them through `POST /backtest`.
+These metrics are ratios, and ratios of returns are **scale-invariant**:
+the engine sizes each trade as a share of current equity, so multiplying
+the account multiplies every P&L with it and leaves `mean/std` unchanged.
+Measured on this repo's own `_UNIT x4` fixture, with `starting_capital`
+swept across the whole range its bound allows — 1e5, 1e7, 1e9, 1e10, 1e11
+and 999999999999 — Sharpe came back **39.1187 every single time**. (That
+sweep was run to confirm the opposite: the prediction was that a larger
+account would make consecutive returns converge and Sharpe diverge. The
+measurement falsified it.)
+
+The degenerate distributions above need trade *shapes* the engine does not
+produce: a loss of exactly one Numeric tick against a large win, or two
+returns agreeing to seven significant figures. `r_multiple` has the one
+remaining theoretical path — a very large `minimum_rr` whose target still
+fits `Numeric(18, 6)`, reached by a price series that actually travels
+there — but that stacks two contrived conditions and no real candle series
+supplies the second.
+
+So: a latent trap, not a defect, and deliberately left unguarded. A clamp
+here would be a bound with no measured failure behind it, which is the
+thing round 148 removed and round 150's contrast case argued against.
+Non-finite values are a different matter and are already handled —
+`profit_factor`, `sharpe` and `sortino` each return `None` rather than an
+infinity when their denominator is zero (round 128), and `win_rate` is a
+fraction in [0, 1], which `Numeric(6, 4)` holds comfortably.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

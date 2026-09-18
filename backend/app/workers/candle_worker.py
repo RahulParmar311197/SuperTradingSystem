@@ -10,7 +10,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from app.core.metrics import DERIVED_CANDLE_INCOMPLETE
+from app.core.metrics import CANDLE_DROPPED_UNKNOWN_INSTRUMENT, DERIVED_CANDLE_INCOMPLETE
 from app.core.redis import channel_name, publish
 from app.database.session import async_session_factory
 from app.market.aggregation import aggregate_candles
@@ -63,6 +63,9 @@ class CandleWorker:
         self.base_minutes = timeframe_to_minutes(base_timeframe)
         self.derived_timeframes = derived_timeframes or []
         self._forming: dict[str, _FormingCandle] = {}
+        # Symbols already reported as having no instrument id, so the
+        # warning is one line per symbol rather than one per candle.
+        self._warned_unknown_symbols: set[str] = set()
 
     async def process_tick(self, tick: StandardTick) -> Candle | None:
         """Feeds one tick in. Returns the candle that just closed, if any."""
@@ -108,6 +111,38 @@ class CandleWorker:
         if instrument_id is not None:
             async with async_session_factory() as db:
                 await upsert_candles(db, instrument_id, self.base_timeframe, [candle])
+        else:
+            # The candle is built, published below, and then thrown away,
+            # because there is no `Instrument` row to hang it on.
+            #
+            # That silence was the problem. Measured before this: a symbol
+            # absent from `WORKER_INSTRUMENT_IDS` stored nothing, logged
+            # nothing, and counted nothing -- while the worker kept
+            # building a candle a minute and streaming it, so every
+            # external sign said it was working.
+            #
+            # It is not working. `ScannerWorker`, `AutoTradeSupervisor`,
+            # the backtest engine and the replay engine all read the
+            # `candles` table; a symbol that never reaches it is invisible
+            # to every one of them, forever. The live `/ws/chart` stream
+            # is the one thing that does keep working, which is precisely
+            # what makes the failure hard to see.
+            #
+            # Once per symbol, not once per candle: at one base candle a
+            # minute this would otherwise be 1,440 identical lines a day
+            # per misconfigured symbol, which is how a real warning gets
+            # filtered out.
+            CANDLE_DROPPED_UNKNOWN_INSTRUMENT.labels(symbol).inc()
+            if symbol not in self._warned_unknown_symbols:
+                self._warned_unknown_symbols.add(symbol)
+                logger.error(
+                    "Discarding every %s candle for %s: no instrument id is configured for it, so "
+                    "nothing can be stored. It will keep streaming on /ws/chart while remaining "
+                    "invisible to the scanner, the autonomous loop and every backtest. Add it to "
+                    "WORKER_INSTRUMENT_IDS as SYMBOL=<instrument uuid>.",
+                    self.base_timeframe,
+                    symbol,
+                )
 
         await publish(
             channel_name("chart", str(instrument_id or symbol), self.base_timeframe),

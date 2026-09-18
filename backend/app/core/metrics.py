@@ -30,6 +30,22 @@ RISK_REJECTION_COUNT = Counter("risk_rejections_total", "Total orders rejected b
 # Non-zero and climbing on an instrument means its higher timeframes are
 # built from partial data: either that instrument barely trades, or ticks
 # are being lost. The two are indistinguishable from here.
+# A closed base candle thrown away because its symbol has no configured
+# `Instrument` row. Labelled by symbol because that is the thing an
+# operator has to add to `WORKER_INSTRUMENT_IDS` -- an unlabelled total
+# would say "some symbol is misconfigured" and leave them grepping.
+#
+# Non-zero at all means a misconfiguration, not a degraded condition:
+# every downstream reader (ScannerWorker, AutoTradeSupervisor, backtests)
+# works from the `candles` table, so a symbol counting here is invisible
+# to all of them no matter how long the worker runs.
+CANDLE_DROPPED_UNKNOWN_INSTRUMENT = Counter(
+    "candles_dropped_unknown_instrument_total",
+    "Closed candles discarded because the symbol has no configured instrument id",
+    ["symbol"],
+)
+
+
 DERIVED_CANDLE_INCOMPLETE = Counter(
     "derived_candles_incomplete_total",
     "Derived-timeframe candles built from a bucket missing at least one base candle",

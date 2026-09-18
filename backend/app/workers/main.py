@@ -137,6 +137,26 @@ async def main() -> None:
     if not symbols:
         logger.warning("WORKER_SYMBOLS is empty — market data / candle workers have nothing to do")
 
+    # Said at startup, because that is the moment an operator can act on
+    # it. `CandleWorker` also warns the first time it actually drops a
+    # candle for one of these, but that is minutes later and buried in a
+    # running log; this is on the first screen of output.
+    #
+    # The failure it names is a quiet one: a symbol here without an id
+    # still builds a candle a minute and still streams it on /ws/chart, so
+    # everything visible says the pipeline works. What silently does not
+    # happen is storage — and the scanner, the autonomous loop, every
+    # backtest and every replay read the `candles` table, so the symbol is
+    # invisible to all of them for as long as the deployment runs.
+    unmapped = [symbol for symbol in symbols if symbol not in instrument_ids]
+    if unmapped:
+        logger.error(
+            "No instrument id configured for %s. Their candles will be built and streamed but "
+            "never stored, leaving them invisible to the scanner, the autonomous loop and every "
+            "backtest. Set WORKER_INSTRUMENT_IDS to \"SYMBOL=<instrument uuid>,...\" for each.",
+            ", ".join(sorted(unmapped)),
+        )
+
     from app.market.feed import SimulatedFeed
 
     # `candles_by_symbol={}` -- deliberately, and this is the whole point of
@@ -207,10 +227,18 @@ async def main() -> None:
         for name, factory in supervised.items()
     ]
 
-    await stop_event.wait()
-    for task in tasks:
-        task.cancel()
-    await asyncio.gather(*tasks, return_exceptions=True)
+    try:
+        await stop_event.wait()
+    finally:
+        # In a `finally`, not just after the await: if this coroutine is
+        # cancelled rather than stopped through `stop_event` (an embedding
+        # caller, or a test driving it), the shutdown below was skipped
+        # outright and every supervised task was left running, detached,
+        # for the life of the loop -- "Task was destroyed but it is
+        # pending" is asyncio reporting exactly that.
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 if __name__ == "__main__":

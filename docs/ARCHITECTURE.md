@@ -10190,6 +10190,59 @@ reachable harm is closed at the request, and a second guard nobody could
 reach would be a bound with no measured failure behind it. Both absences
 have their own tests so they cannot be quietly filled in later.
 
+## Three client numbers reached columns that could not hold them (§57, §87)
+
+Round 149 ended on a lesson: a per-field bound does not bound a product.
+This round found the same shape in a second place, plus two plain cases
+where a field bound really is the whole fix.
+
+Measured against the live endpoints:
+
+| request | answer before |
+| --- | --- |
+| `POST /auto-trading/enable` `{"max_positions": 2147483648}` | 500 `asyncpg DataError` |
+| `POST /auto-trading/enable` `{"max_trades_per_day": 3000000000}` | 500, the same |
+| `POST /strategies` with `risk.minimum_rr: Infinity` | 500 `InvalidTextRepresentationError` |
+| `POST /strategies` with `risk.minimum_rr: 1e308` | **201, stored** — then 500 on the bar the strategy first entered on |
+
+`users.auto_trading_max_positions` and `auto_trading_max_trades_per_day`
+are `Integer`, i.e. int4; 2147483647 stores and answers 200, so the
+boundary is exactly the column's. Those two are only ever compared against
+a count, never multiplied into anything, so bounding the field is the
+whole fix and the round's contrast case.
+
+`minimum_rr` is not. `app/strategy/engine.py` computes
+`target = entry ± risk_per_unit * minimum_rr`, and that target is carried
+onto the position and written to `positions.target`, a `Numeric(18, 6)`.
+So what overflows is a **product** of a client-supplied ratio and a
+distance taken from live prices. The DSL bound stops `Infinity` and 1e308
+being stored — that is the first 500 — but it cannot stop the second:
+`minimum_rr` at the very top of what the DSL allows, against this
+codebase's own FVG-retest fixture whose stop sits an ordinary 3.3 points
+from its entry, still produces 3.3e12. The guard therefore sits where the
+product is formed, and refuses the signal rather than clamping the target
+to something the strategy did not ask for, reporting
+`target_out_of_range` the same way the existing
+`stop_on_wrong_side_of_entry` check reports itself.
+
+What the 1e308 case actually cost, measured on a paper session fed the
+fixture that is known to enter, scoped to the strategy: **zero `positions`
+rows, zero `trades` rows, zero `risk_events` rows** — the entry bar's
+request 500'd and took the whole candle's work down with it — against a
+control at `minimum_rr=2.0` on the identical candles that journalled a
+position and a +1000 trade.
+
+Two things worth recording about how this was found. The sweep that
+located these fields was wrong the first time: it tested `'lt=' in args`
+to decide whether a field had an upper bound, and `"defau**lt=**None"`
+contains that substring, so every field with a default was silently
+reported as bounded. And `_is_journallable` was first written as
+`math.isfinite(price) and abs(price) < _MAX_JOURNALLED_TARGET`; injecting
+the `isfinite` call away changed nothing, because every comparison against
+NaN is False and `inf` fails the magnitude test unaided. That half was
+removed rather than kept as belt-and-braces no test could distinguish
+from its absence.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

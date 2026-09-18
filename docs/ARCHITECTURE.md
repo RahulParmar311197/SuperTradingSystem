@@ -10083,6 +10083,62 @@ pass — one spurious notification per trade, measured, which is precisely
 how a real warning becomes noise. What makes a position managed is that a
 candle reached its engine, so that is where the marker belongs now.
 
+## The Greeks calculator 500'd on four inputs (§39)
+
+`POST /options/greeks` is pure arithmetic with no persistence behind it, so
+the harm is a 500 rather than a wrong number in a journal — but a 500 is
+still the wrong answer for a bad request, and it reaches the client as a
+traceback naming nothing useful. Measured against the live endpoint:
+
+| sent | answer |
+|---|---|
+| `rate=1e308` | **500**, "Out of range float values are not JSON compliant" (the result is `inf`) |
+| `rate=-1e308` | **500**, `OverflowError: math range error` |
+| `time_to_expiry_years=1e308` | **500**, JSON-non-compliant |
+| `iv=1e308` | **500**, `OverflowError` (34, numerical result out of range) |
+
+`_d1_d2` already refuses zero and negative `spot`/`strike`/`time`/`iv` with
+a `ValueError` the route turns into a 422, so only the upper end was open —
+plus `rate`, the one field that may legitimately be negative, which had no
+guard at either end. The ceilings added are deliberately generous: a
+hundred years of expiry against three for the longest real LEAPS, 10,000%
+implied volatility, and `[-1, 1]` on `rate`, which is a decimal fraction
+rather than a percentage.
+
+### A bound written, then removed
+
+A price ceiling on `spot` and `strike` went in with the rest, and injection
+took it straight back out: removing it left the suite green, because
+nothing it prevented had ever failed. Measured:
+
+    spot=1e308  -> 200, price 1e+308    strike=1e308  -> 200, price 0.0
+    spot=1e-308 -> 200, price 0.0       strike=1e-308 -> 200, price 25000.0
+
+Every one of those is arithmetic answering an absurd question correctly.
+The same reasoning declines a floor on `time_to_expiry_years`: an option
+expiring in a microsecond really does have enormous gamma. Both absences
+now have their own tests, so a ceiling cannot come back without a measured
+reason — an injection that *adds* one is caught.
+
+That is the rule this round is really about: **a bound is added where a
+failure was measured, and nowhere else.** An unjustified bound is not free
+— it is an endpoint refusing a calculation it can do, and nothing in the
+suite would have noticed.
+
+### Two probes that came back clean
+
+- **Strategy deletion.** Round 147 left open what happens to an open
+  position when its strategy is deleted rather than deactivated. There is
+  no `DELETE /strategies/{id}` route, so the case is unreachable through
+  the API.
+- **The autonomous loop's ever-growing analysis window.**
+  `PaperTradingEngine.candles` is appended to on every pass and never
+  trimmed, and `smc_engine.analyze(self.candles)` runs over the whole list
+  each time — so the cost grows with worker uptime. Measured, it is not
+  worth fixing: 500 bars 0.002s, 1,000 0.003s, 2,000 0.008s, 4,000 0.023s,
+  8,000 0.074s, against a 60-second loop interval. The growth is real and
+  super-linear; the magnitude is not a problem at any plausible uptime.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

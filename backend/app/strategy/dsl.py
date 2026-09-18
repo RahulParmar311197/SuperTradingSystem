@@ -406,9 +406,28 @@ class EntryConfig(BaseModel):
         return normalized
 
 
+# `strategies.definition` is a JSON column, and Postgres' JSON type has no
+# `Infinity`: `minimum_rr: Infinity` reached it as the bare token and came
+# back as `InvalidTextRepresentationError` -- a 500 on POST /strategies for
+# a value pydantic was happy to accept, since `gt=0` passes `inf`. The
+# ceiling is the one `app/api/orders.py` and `app/api/replay.py` already
+# use, for the same reason: every number this DSL produces ends up in a
+# `Numeric(18, 6)` column somewhere downstream.
+_MAX_MINIMUM_RR = 1e12
+
+
 class RiskConfig(BaseModel):
     risk_percent: float = Field(default=0.5, gt=0, le=100)
-    minimum_rr: float = Field(default=2.0, gt=0)
+    # Bounding the field is NOT the whole fix, and that is the point worth
+    # remembering here: `app/strategy/engine.py` computes
+    # `target = entry +/- risk_per_unit * minimum_rr`, so what overflows
+    # `positions.target` is a *product*. A `minimum_rr` well inside this
+    # ceiling still overflows against a large enough `risk_per_unit`, which
+    # is why the engine guards the product where it is formed. Measured
+    # before either guard: `minimum_rr=1e308` stored happily, and then the
+    # paper session 500'd with NumericValueOutOfRangeError on the bar the
+    # strategy first entered on -- with nothing journalled for that candle.
+    minimum_rr: float = Field(default=2.0, gt=0, le=_MAX_MINIMUM_RR)
     max_risk_percent: float | None = None
 
 

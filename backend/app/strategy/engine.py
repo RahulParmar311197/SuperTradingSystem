@@ -15,6 +15,33 @@ from app.strategy.scoring import compute_strategy_score
 
 _ENTRY_BUFFER_PCT = 0.05  # small buffer beyond the zone edge for stop placement
 
+# A signal's `target` is carried onto the position that opens from it and
+# written to `positions.target`, a `Numeric(18, 6)`, which holds at most
+# 999999999999.999999. `RiskConfig.minimum_rr` is bounded at the DSL, and
+# that is not sufficient on its own, because the number written here is
+# `risk_per_unit * minimum_rr` -- a product of a client-supplied ratio and
+# a distance taken from live prices. Measured before this guard, with
+# `minimum_rr=1e308`: a paper session ran normally until the bar its
+# strategy first entered on, and that request 500'd with
+# NumericValueOutOfRangeError from `persist_position`, rolling back the
+# whole candle -- no `positions` row, no `trades` row, no `risk_events`
+# row, while the engine in memory had already opened and closed the trade.
+_MAX_JOURNALLED_TARGET = 1e12
+
+
+def _is_journallable(price: float) -> bool:
+    """Whether `price` can be written to a `Numeric(18, 6)` column.
+
+    One comparison, deliberately. This was written as
+    `math.isfinite(price) and abs(price) < _MAX_JOURNALLED_TARGET`, and
+    injecting the `isfinite` call away changed nothing: every comparison
+    against `NaN` is False, and `inf` fails the magnitude test on its own,
+    so that half was unreachable belt-and-braces no test could tell apart
+    from its absence. Removed rather than kept, the same way round 145
+    removed a `None` branch a validator ordering had already made dead.
+    """
+    return abs(price) < _MAX_JOURNALLED_TARGET
+
 
 @dataclass(slots=True)
 class StrategyEvaluationResult:
@@ -79,6 +106,16 @@ class StrategyEngine:
             target = entry + risk_per_unit * minimum_rr
         else:
             target = entry - risk_per_unit * minimum_rr
+        # Refused rather than clamped, and reported the same way
+        # `stop_on_wrong_side_of_entry` above is: clamping would silently
+        # trade a different target from the one the strategy asks for,
+        # and a bare `return` would make the strategy simply never fire
+        # with nothing saying why.
+        if not _is_journallable(target):
+            return StrategyEvaluationResult(
+                matched=False, satisfied=satisfied, missing=missing + ["target_out_of_range"]
+            )
+
         risk_reward = abs(target - entry) / risk_per_unit if risk_per_unit else 0.0
 
         satisfied_types = [c.type for c in strategy.conditions if (c.name or c.type.value) in satisfied]

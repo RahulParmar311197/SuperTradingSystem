@@ -19,6 +19,8 @@ from app.database.session import get_db
 
 router = APIRouter(prefix="/auto-trading", tags=["auto-trading"])
 
+_MAX_INT4 = 2_147_483_647
+
 
 class AutoTradingStatus(BaseModel):
     enabled: bool
@@ -47,8 +49,16 @@ class EnableAutoTradingRequest(BaseModel):
     confirm: bool = Field(description="Must be true — enabling auto-trading requires explicit confirmation")
     risk_per_trade_pct: float | None = Field(default=None, gt=0, le=100)
     daily_loss_limit_pct: float | None = Field(default=None, gt=0, le=100)
-    max_trades_per_day: int | None = Field(default=None, gt=0)
-    max_positions: int | None = Field(default=None, gt=0)
+    # `users.auto_trading_max_trades_per_day` and
+    # `users.auto_trading_max_positions` are `Integer`, i.e. int4. Measured
+    # on this endpoint: 2147483647 stores and answers 200, 2147483648 and
+    # 3000000000 reach asyncpg as `DataError: invalid input for query
+    # argument` and 500 with a traceback. Unlike `minimum_rr` (see
+    # `app/strategy/dsl.py`), these two are only ever compared against a
+    # count, never multiplied into anything, so bounding the field really
+    # is the whole fix here.
+    max_trades_per_day: int | None = Field(default=None, gt=0, le=_MAX_INT4)
+    max_positions: int | None = Field(default=None, gt=0, le=_MAX_INT4)
 
 
 @router.post("/enable", response_model=AutoTradingStatus)

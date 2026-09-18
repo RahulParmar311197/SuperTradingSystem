@@ -9028,6 +9028,94 @@ codebase can assess without a live depth feed, and it is a real
 improvement on assessing nothing while claiming otherwise — not a
 substitute for the real thing.
 
+## Every options RiskEvent claimed three checks nobody performed (§40, §56)
+
+**A real bug, and one an earlier round of this same work looked straight
+at and got wrong.**
+
+An earlier round found `TradeRiskProposal.liquidity_acceptable` defaulting
+to `True` with no writer, so every equity order's audit row recorded a
+liquidity check nothing had run. Fixing it, that round wrote:
+
+> The sibling `OptionsRiskProposal.liquidity_acceptable` is genuinely
+> computed by app/api/options.py from `OptionSnapshot` data
+> (`evaluate_liquidity` in app/options/liquidity_filter.py), so it keeps
+> its `bool` type.
+
+**That was wrong.** The computation exists; its data source has no writer.
+A probe for database columns with no writer anywhere in `app/` turned up
+five, and three of them were `OptionChainSnapshot.spot_price`,
+`OptionChainSnapshot.fetched_at` and `OptionContract.chain_id` — which led
+to the real finding: **nothing in production writes `option_chains`,
+`option_contracts` or `option_snapshots` at all.** Only the test suite
+inserts them. `_latest_option_snapshot` therefore returns `None` for every
+leg of every real call, the `continue` fires, and all three quote-derived
+fields keep their defaults.
+
+Those defaults were the everything-is-fine values: `0.0` seconds stale,
+liquid, `0.00%` from the market. Measured:
+
+```
+options, no data:  liquidity_acceptable PASS  premium_matches_market PASS  market_data_fresh PASS  -> APPROVE
+equity,  no data:  liquidity_acceptable SKIPPED (absent)                   market_data_fresh FAIL
+```
+
+Same system, two order paths, opposite answers to the same question. And
+the options answer contradicts a decision recorded only a few rounds
+earlier — that `None` rejects because *"we don't know" is not "it's
+fine"*.
+
+### What changed, and what deliberately did not
+
+The three fields are now `| None`, and `evaluate_options_risk` records
+each only when it was actually evaluated. An operator reading
+`GET /admin/risk-events` can now tell a strategy whose quotes were checked
+and were fine from one where the gate was never wired up — which is the
+entire point, and was the entire point of the equity fix too.
+
+It deliberately does **not** reject on `None`, and the asymmetry with
+equities is the considered part rather than an oversight. For equities a
+feed exists, so its absence for one symbol is an anomaly worth stopping
+on. Here the absence is total and permanent until an options-chain
+ingestion path is built, so rejecting would take a working endpoint
+offline to punish a gap in this codebase rather than a fact about the
+market. Building that ingestion is the follow-on; not claiming it happened
+is this change.
+
+Worth stating plainly, because it is the uncomfortable half: **until that
+ingestion exists, `POST /options/execute` has no liquidity gate, no
+premium-deviation gate and no staleness gate.** It never did. What it had
+was three audit entries saying otherwise.
+
+### The call site, for the third round running
+
+Injection found the same class of hole in this round's own tests that the
+two preceding rounds found in theirs. Replacing the line in
+`app/api/options.py` that records the per-leg liquidity verdict with
+`pass` left the entire suite green: the pure function had proofs, the
+endpoint had none. Three endpoint-level tests now drive the real route
+against real stored quotes — illiquid, liquid, and unquoted — and assert
+on the persisted `RiskEvent.checks`.
+
+That is three rounds in a row where the uncovered half was the wiring and
+not the logic. The pattern is worth naming: a shared helper with a tidy
+unit test reads as covered, and the thing that actually decides whether a
+user is protected is the one line at the call site that nobody asserts on.
+
+Injection, after that fix:
+
+```
+the everything-is-fine defaults restored (the original state) -> 2 fail
+liquidity recorded even when unevaluated                      -> 17 fail
+0.0 staleness skipped as if it were None                      -> 1 fail  (control)
+premium check never recorded at all                           -> 4 fail  (control)
+the caller stops recording a real liquidity verdict           -> 2 fail
+the caller takes the freshest leg's age, not the stalest      -> 1 fail
+one illiquid leg no longer condemns the strategy              -> 1 fail  (control)
+```
+
+All three controls were injection-tested alongside the proofs.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

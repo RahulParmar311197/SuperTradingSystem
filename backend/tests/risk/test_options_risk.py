@@ -61,11 +61,21 @@ def test_rejects_when_broker_unhealthy():
     assert result.decision == RiskDecision.REJECT
 
 
-def test_premium_deviation_defaults_to_a_no_op():
-    # premium_deviation_pct defaults to 0.0 -- a clean strategy must still
-    # approve even though max_premium_deviation_pct exists.
+def test_an_unquoted_strategy_still_approves_but_claims_no_premium_check():
+    """The intent of this test is unchanged: a clean strategy with nothing
+    to compare a premium against must still approve, because
+    `max_premium_deviation_pct` existing must not make the endpoint
+    unusable.
+
+    What changed is the *claim*. `premium_deviation_pct` used to default to
+    0.0 -- "checked, and exactly on the market" -- so a strategy nothing
+    had quoted recorded `premium_matches_market: true` in its RiskEvent.
+    It now defaults to `None`, the check is skipped, and the audit row
+    lists only what actually governed the decision.
+    """
     result = evaluate_options_risk(_base_proposal())
-    assert any(c.name == "premium_matches_market" and c.passed for c in result.checks)
+    assert result.decision == RiskDecision.APPROVE
+    assert "premium_matches_market" not in {c.name for c in result.checks}
 
 
 def test_rejects_when_premium_deviates_from_the_real_market_quote():
@@ -165,3 +175,77 @@ def test_bounded_strategies_are_unaffected_by_the_unbounded_loss_path():
     exposure = next(c for c in result.checks if c.name == "exposure_limit")
     assert exposure.passed
     assert float(exposure.detail.split()[2].rstrip("%")) == pytest.approx(3.5, rel=1e-6)
+
+
+# --- "not assessed" is not "assessed and fine" -----------------------------
+#
+# The same defect an earlier round fixed for the equity sibling
+# (`TradeRiskProposal.liquidity_acceptable`), found still present here. That
+# round's note claimed this side was safe because it "is genuinely computed
+# by app/api/options.py from OptionSnapshot data" -- the computation exists,
+# but NO production code writes `option_snapshots`, `option_contracts` or
+# `option_chains`, so the branch performing it never runs outside the test
+# suite, and every real options RiskEvent took the everything-is-fine
+# defaults.
+
+_UNEVALUATED = ("liquidity_acceptable", "premium_matches_market", "market_data_fresh")
+
+
+def test_an_unquoted_strategy_records_none_of_the_three_quote_checks():
+    """Behavioural proof, and the measurement that opened this round.
+
+    Before: all three appeared in the audit row as passed. An operator
+    reading `GET /admin/risk-events` could not tell a strategy whose quotes
+    were checked and were fine from one where the gate was never wired up.
+    """
+    result = evaluate_options_risk(_base_proposal())
+    recorded = {c.name for c in result.checks}
+    assert not (recorded & set(_UNEVALUATED)), sorted(recorded & set(_UNEVALUATED))
+    # ... and it still approves: skipping is not rejecting.
+    assert result.decision == RiskDecision.APPROVE
+
+
+def test_a_quoted_strategy_records_all_three():
+    """Control. Skipping must happen only when there was nothing to check.
+
+    If this ever fails, the fix above has not made the checks conditional
+    on evidence -- it has switched them off.
+    """
+    result = evaluate_options_risk(
+        _base_proposal(
+            liquidity_acceptable=True,
+            premium_deviation_pct=0.5,
+            market_data_age_seconds=2.0,
+        )
+    )
+    recorded = {c.name for c in result.checks}
+    assert set(_UNEVALUATED) <= recorded, sorted(set(_UNEVALUATED) - recorded)
+    assert result.decision == RiskDecision.APPROVE
+
+
+def test_each_of_the_three_still_rejects_on_real_evidence():
+    """Control. Making the checks skippable must not make them toothless:
+    a real bad value still has to fail, one gate at a time.
+    """
+    illiquid = evaluate_options_risk(_base_proposal(liquidity_acceptable=False))
+    assert illiquid.decision == RiskDecision.REJECT
+    assert any(c.name == "liquidity_acceptable" and not c.passed for c in illiquid.checks)
+
+    off_market = evaluate_options_risk(_base_proposal(premium_deviation_pct=10.0))
+    assert off_market.decision == RiskDecision.REJECT
+    assert any(c.name == "premium_matches_market" and not c.passed for c in off_market.checks)
+
+    stale = evaluate_options_risk(_base_proposal(market_data_age_seconds=3600.0))
+    assert stale.decision == RiskDecision.REJECT
+    assert any(c.name == "market_data_fresh" and not c.passed for c in stale.checks)
+
+
+def test_zero_staleness_is_still_a_real_claim_and_is_recorded():
+    """Control on the distinction itself. `0.0` means "this quote is from
+    this instant" -- a legitimate, checkable assertion a caller may make --
+    and must be recorded as a passed check. Only `None` skips. If `0.0`
+    started skipping too, the fix would have thrown away the honest case
+    along with the fabricated one.
+    """
+    result = evaluate_options_risk(_base_proposal(market_data_age_seconds=0.0))
+    assert any(c.name == "market_data_fresh" and c.passed for c in result.checks)

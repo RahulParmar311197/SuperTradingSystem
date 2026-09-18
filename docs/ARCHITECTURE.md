@@ -9651,6 +9651,89 @@ see it. There is now one sitting where the difference decides the answer: a
 subtracting one minute instead of fifteen reads it as 58 minutes late and
 refuses a perfectly healthy feed.
 
+## A regression net for the "check that measured nothing" class (§57-58)
+
+**A negative-result round.** No bug found; what it leaves behind is a net
+for the failure this codebase has hit three times, plus a record of what is
+now known clean so it does not get re-probed.
+
+### The class
+
+A field on a `RiskProposal` left at its dataclass default, so the check
+reading it records a **pass** in the `RiskEvent` audit row while measuring
+nothing:
+
+| round | field | effect |
+|---|---|---|
+| 121 | `liquidity_acceptable` | no writer on the equity path |
+| 134 | three options quote checks | recorded without ever being evaluated |
+| 141 | `market_data_age_seconds=0.0` | `market_data_fresh` unfailable on the autonomous path |
+
+Each was found by reading code. Nothing would have caught the next one: a
+defaulted field produces a *passing* check and a green suite.
+
+`POST /options/execute` now has a per-field behavioural net. For each
+counter the engine reads, the stack is put in a state where that counter
+**alone** must reject the order, and the test asserts the rejection names
+that check. A field reading its default cannot produce that rejection.
+
+Injection confirms all five wires: removing `trades_today`, `daily_pnl`,
+`weekly_pnl`, `repeated_rejections` or `open_positions` from the proposal
+each fails the net.
+
+`open_positions` is worth naming separately. It is not a stack counter —
+it is `len(...)` over the shared `PositionManager` — so the parametrised
+poison could not reach it, and **defaulting it to 0 left the whole suite
+green**. Injection found that hole in the net itself; it now has its own
+proof that opens a real position.
+
+### What the survey checked and found clean
+
+Three probes, all negative, recorded so they are not repeated:
+
+- **Equity vs options risk checks.** The equity engine runs 15 checks, the
+  options engine 11. Three of the four differences are correct by design
+  (`valid_stop_distance` — options bound loss through the payoff engine;
+  `no_abnormal_price_jump` — `premium_matches_market` is the options
+  analogue; `strategy_allocation_limit` — that path is manual, not
+  strategy-driven). The fourth, `correlated_exposure_limit`, is a genuine
+  gap and is recorded below rather than guessed at.
+- **`current_exposure`.** Both paths compute it identically, from the same
+  shared `PositionManager`.
+- **Decimal/float across the DB boundary.** `Numeric` columns return
+  `Decimal`, and mixing that with a float raises `TypeError`. A sweep of 55
+  Numeric column names against arithmetic in `app/` produced 41 candidate
+  sites, every one of which turned out to be a *dataclass* field whose name
+  collides with a column (SMC candles, risk proposals, in-memory
+  positions). The codebase converts at the ORM boundary consistently.
+
+Two claims round 141 made without measuring were also verified rather than
+left as assertions. The paper engine's `is_reducing=False` is right —
+`risk_engine.evaluate` is called from exactly one place, the entry path,
+and `_maybe_exit` does not go through it at all. Its
+`entry_deviation_pct=0.0` is right too: that check exists to validate a
+*client-supplied* price against a broker quote, and the paper engine
+computes its own entry from the bar.
+
+### The one real gap, deliberately not built
+
+`POST /options/execute` has no correlated-exposure gate. An operator can
+hold correlated equity longs and open a large bullish options position with
+nothing netting the two, while the equity path has netted since §85-86 and
+had its direction corrected later.
+
+It is genuinely absent rather than inert — `OptionsRiskProposal` has no
+such field — and the mechanics are reusable: `compute_correlated_exposure`,
+`signed_notionals_excluding`, and `Instrument.underlying` all exist.
+
+What does not exist is an agreed way to turn a multi-leg options strategy
+into a **signed directional notional** for netting. `max_loss` (what the
+exposure gate uses) is magnitude, not direction, and a bull call spread, a
+short straddle and a long put have very different directional profiles.
+Guessing would produce a plausible-looking but wrong risk number — the
+exact failure the three rounds above spent their effort removing. The
+netting model is a decision to make explicitly, not a detail to infer.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

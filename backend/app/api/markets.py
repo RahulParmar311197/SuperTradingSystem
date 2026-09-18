@@ -56,6 +56,45 @@ _MAX_EXCHANGE = 32
 _MAX_INSTRUMENT_TYPE = 32
 _MAX_CURRENCY = 8
 
+# The same restatement for the numeric columns, which that round did not
+# cover. `instruments` is not an ordinary request body: the row is global,
+# shared by every user, written by any authenticated one, and there is no
+# endpoint that can edit or delete it (see `create_instrument`'s docstring).
+# So an out-of-range value here is not a bad request that fails and is
+# forgotten -- it is a permanent, unrepairable property of that symbol for
+# everyone.
+#
+# Measured against the live schema before these bounds existed:
+#
+#   lot_size=0       -> 201, and POST /options/execute then answered 201
+#                       with max_profit/max_loss/net_premium all 0.0, the
+#                       leg ACKNOWLEDGED and NO position opened -- a
+#                       strategy reported as executed that did nothing,
+#                       and a RiskEvent row recording an approval of a
+#                       position with no risk because it had no size.
+#   lot_size=-50     -> 201, and every payoff number inverts: `payoff` is
+#                       `sign * (intrinsic - premium) * quantity *
+#                       lot_size`, so a LONG call becomes a short call,
+#                       with the unbounded loss that implies.
+#   strike=0 / -25000-> 201; a call struck below zero is in the money at
+#                       every spot price there is.
+#   tick_size=0 / -1 -> 201.
+#   lot_size=2**31   -> 500, a raw asyncpg DataError through the catch-all
+#                       handler (the column is INTEGER).
+#   strike=1e30, inf -> 500, asyncpg NumericValueOutOfRange (NUMERIC(18,4)).
+#   tick_size=1e30   -> 500, the same (NUMERIC(18,6)).
+#
+# The upper bounds below sit inside those column widths on purpose, so the
+# answer is a 422 naming the field rather than a 500 naming nothing.
+#
+# `_MAX_LOT_SIZE` matches app/api/options.py's identical bound on the
+# strategy *builder*'s own `lot_size`. That round bounded the copy a client
+# passes in and left this one -- the authoritative value every
+# `POST /options/execute` leg is actually sized by -- unbounded.
+_MAX_LOT_SIZE = 1_000_000
+_MAX_TICK_SIZE = 1_000_000.0
+_MAX_STRIKE = 1e9
+
 
 class InstrumentCreateRequest(BaseModel):
     symbol: str = Field(min_length=1, max_length=_MAX_SYMBOL)
@@ -64,10 +103,10 @@ class InstrumentCreateRequest(BaseModel):
     instrument_type: str = Field(min_length=1, max_length=_MAX_INSTRUMENT_TYPE)
     underlying: str | None = Field(default=None, min_length=1, max_length=_MAX_SYMBOL)
     expiry: date | None = None
-    strike: float | None = None
+    strike: float | None = Field(default=None, gt=0, le=_MAX_STRIKE)
     option_type: OptionType | None = None
-    lot_size: int = 1
-    tick_size: float = 0.05
+    lot_size: int = Field(default=1, ge=1, le=_MAX_LOT_SIZE)
+    tick_size: float = Field(default=0.05, gt=0, le=_MAX_TICK_SIZE)
     currency: str = Field(default="INR", min_length=1, max_length=_MAX_CURRENCY)
 
     @model_validator(mode="after")

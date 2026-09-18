@@ -9791,6 +9791,76 @@ so cancelling `main()` itself skipped the shutdown entirely and left every
 supervised task running detached — asyncio's "Task was destroyed but it is
 pending" is exactly that. Moved into a `finally`.
 
+## The instrument master's numbers had no bounds (§9)
+
+Round 106 restated the `instruments` string column widths inside
+`InstrumentCreateRequest` after measuring four 500s, and stopped at the
+strings. The numeric columns were never done. Measured against the live
+schema:
+
+| sent | answer |
+|---|---|
+| `lot_size=0` | 201 |
+| `lot_size=-50` | 201 |
+| `lot_size=2**31` | **500**, a raw asyncpg `DataError` (the column is `INTEGER`) |
+| `tick_size=0`, `tick_size=-1` | 201 |
+| `tick_size=1e30` | **500**, `NumericValueOutOfRange` on `NUMERIC(18,6)` |
+| `strike=0`, `strike=-25000` | 201 |
+| `strike=1e30`, `strike=inf` | **500**, `NumericValueOutOfRange` on `NUMERIC(18,4)` |
+
+The 500s are the lesser half. What `instruments` is makes the accepted
+values worse than a bad request normally is: the row is **global**, shared
+by every user, writable by any authenticated one, and **there is no
+endpoint that can edit or delete it** — the same property that made a
+duplicate registration lock every holder of a symbol out of their own
+position. A bad number here is a permanent, unrepairable property of that
+symbol for everyone who trades it.
+
+`lot_size` is the one that matters, because it is the scaling factor every
+options order is sized by. Driving `POST /options/execute` against a
+`lot_size=0` contract:
+
+    execute -> 201
+    payoff:    max_profit 0.0, max_loss 0.0, net_premium 0.0
+    legs:      [('ACKNOWLEDGED', None)]
+    positions: []
+
+The caller is told a strategy executed. Nothing was opened, and the
+`RiskEvent` row records an approval of a position that had no risk only
+because it had no size — the same shape as the three rounds that removed
+checks recording a pass without measuring anything.
+
+A negative lot size is the other direction rather than a smaller version
+of the same thing. `payoff` is `sign * (intrinsic - premium) * quantity *
+lot_size`, so `lot_size=-50` silently turns a long call into a short one,
+with the unbounded loss that implies. In this environment such an order
+happened to be refused, but for the wrong reason: the exposure gate saw
+the unbounded max loss the *inverted* position implies and rejected on
+that. A smaller premium or a larger balance and it would have gone
+through.
+
+### Two layers, and they are not the same check
+
+`InstrumentCreateRequest` now bounds `lot_size` (`ge=1`, `le=1_000_000`,
+matching the identical bound `POST /options/strategy` already applies to
+the *client-supplied* copy of this value), `tick_size` (`gt=0`) and
+`strike` (`gt=0`). Every case in the table above is now a 422 naming the
+field instead of a 201 or a traceback.
+
+That decides what can be **written**. It cannot reach a row that already
+exists — and every deployed database has some. So `POST /options/execute`
+also refuses a contract whose stored `lot_size` is below 1, with a message
+saying why and what to do. The registration bound and the execution guard
+are tested separately, because a test that goes through the API passes
+with either one alone.
+
+`expiry` is deliberately still unbounded: a contract may be registered
+with a date in the past. Nothing in `app/` reads `Instrument.expiry`, so
+refusing one would be inventing a constraint nothing depends on — the same
+call round 84 made when it required `strike` and `option_type` for
+`market=OPTIONS` and left `expiry` alone. It should become a real
+constraint when something finally prices against it.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

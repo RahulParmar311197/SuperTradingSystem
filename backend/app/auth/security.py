@@ -14,7 +14,8 @@ settings = get_settings()
 # rather than truncate, so two different long passwords can never hash the
 # same way. Enforced here (not just at the request-schema layer) because
 # this function is the actual security boundary.
-_MAX_PASSWORD_BYTES = 72
+MAX_PASSWORD_BYTES = 72
+_MAX_PASSWORD_BYTES = MAX_PASSWORD_BYTES  # backwards-compatible alias
 
 
 class TokenType(StrEnum):

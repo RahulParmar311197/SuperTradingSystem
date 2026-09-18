@@ -35,27 +35,78 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logger = logging.getLogger("workers.main")
 
 
-async def _bridge_market_data_to_candles(market_worker: MarketDataWorker, candle_worker: CandleWorker) -> None:
-    """Runs the market data feed and forwards every tick into the candle
-    worker too, so one feed subscription drives both."""
-    async for tick in market_worker.feed.subscribe(market_worker.symbols):
-        try:
-            await market_worker.process_tick(tick)
-            await candle_worker.process_tick(tick)
-        except Exception:
-            logger.exception("Failed to process tick for %s", tick.symbol)
+# Matches the 60s loop cadence of every other worker, which is the number
+# `_HEARTBEAT_TTL_SECONDS` (90s) was chosen against -- see its comment in
+# app/core/redis.py, which enumerates scanner_worker, auto_trade_worker and
+# live_reconciliation and does not mention this one. That omission was the
+# bug: this worker had no loop interval to name, because it beat once per
+# *tick*.
+MARKET_DATA_HEARTBEAT_INTERVAL_SECONDS = 60.0
+
+
+async def _beat_while_subscribed(stop: asyncio.Event) -> None:
+    """Refreshes the `market_data` heartbeat on a timer until told to stop.
+
+    **A heartbeat must mean "this worker is alive and subscribed", and it
+    used to mean "a trade just happened."** `heartbeat("market_data")` sat
+    inside the tick loop below, so the key was only refreshed when a tick
+    arrived. With a 90s TTL against an NSE session that runs 03:45-10:00
+    UTC, a perfectly healthy subscribed worker went stale 90 seconds into
+    every overnight, every weekend, and any quiet stretch in a thin
+    instrument mid-session -- reported UP for at best 18.6% of the week.
+
+    `GET /health` is the endpoint an operator consults *during* an
+    incident, and it was calling this worker dead more often than alive.
+    Either they wire it to alerting and get paged every evening, or they
+    learn to ignore market_data and miss the outage it exists to show.
+
+    Tied to the subscription's lifetime rather than the process's, on
+    purpose: the caller cancels this the moment the bridge returns or
+    raises, so a genuinely dead feed still goes stale within one TTL. A
+    heartbeat that outlived the thing it describes would be the same
+    fabricated claim this codebase has now removed from two risk paths.
+    """
+    while not stop.is_set():
         # Guarded for the same reason as ScannerWorker.run's: `heartbeat`
         # is a bare `redis.set`, and one transient Redis error outside a
-        # guard ended this generator loop outright.
+        # guard ended the loop it lived in outright.
         try:
             await heartbeat("market_data")
         except Exception:
             logger.exception("Market-data heartbeat failed (Redis unreachable?) — the loop continues")
-    logger.warning(
-        "Market data feed for symbols=%s produced no more ticks; the bridge is returning. "
-        "`supervise` will restart it after a backoff.",
-        market_worker.symbols,
-    )
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=MARKET_DATA_HEARTBEAT_INTERVAL_SECONDS)
+        except asyncio.TimeoutError:
+            pass
+
+
+async def _bridge_market_data_to_candles(market_worker: MarketDataWorker, candle_worker: CandleWorker) -> None:
+    """Runs the market data feed and forwards every tick into the candle
+    worker too, so one feed subscription drives both."""
+    stop = asyncio.Event()
+    beater = asyncio.create_task(_beat_while_subscribed(stop), name="market_data_heartbeat")
+    try:
+        async for tick in market_worker.feed.subscribe(market_worker.symbols):
+            try:
+                await market_worker.process_tick(tick)
+                await candle_worker.process_tick(tick)
+            except Exception:
+                logger.exception("Failed to process tick for %s", tick.symbol)
+        logger.warning(
+            "Market data feed for symbols=%s produced no more ticks; the bridge is returning. "
+            "`supervise` will restart it after a backoff.",
+            market_worker.symbols,
+        )
+    finally:
+        # Stops the heartbeat whether the feed ended cleanly or raised, so
+        # the key expires within one TTL and `GET /health` reports what is
+        # actually true.
+        stop.set()
+        beater.cancel()
+        try:
+            await beater
+        except asyncio.CancelledError:
+            pass
 
 
 async def main() -> None:

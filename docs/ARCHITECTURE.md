@@ -9116,6 +9116,106 @@ one illiquid leg no longer condemns the strategy              -> 1 fail  (contro
 
 All three controls were injection-tested alongside the proofs.
 
+## A quiet market read as a dead worker (§117)
+
+**A real bug in the health signal, and the codebase's own comment is what
+gave it away.**
+
+`_HEARTBEAT_TTL_SECONDS` (90s) carries a careful note explaining how it
+was chosen:
+
+> scanner_worker.py, auto_trade_worker.py, and live_reconciliation.py all
+> call `heartbeat()` once per 60-second loop […] The TTL must be
+> comfortably longer than that.
+
+It names three workers. There are four. `market_data` is missing from that
+list because it had no loop interval to name: `heartbeat("market_data")`
+sat **inside the tick loop** of `_bridge_market_data_to_candles`, so the
+key was refreshed only when a trade happened.
+
+### What that costs, measured against a real session
+
+NSE trades 03:45–10:00 UTC. A subscribed, perfectly healthy worker goes
+stale 90 seconds into every silent stretch:
+
+```
+every weeknight    1065 silent minutes
+every weekend      3945 silent minutes
+reported UP at best   1875 / 10080 min = 18.6% of the week
+```
+
+So `GET /health` — the endpoint an earlier round specifically hardened for
+use *during* an incident — called the market-data worker dead for roughly
+four fifths of every week. An operator wiring that to alerting gets paged
+every evening; one who learns to ignore `market_data` misses the outage it
+exists to show. That is the alert-fatigue failure, and it is a defect in
+the signal rather than in the worker.
+
+It is also the mirror image of a bug an earlier round already fixed — a
+30-second TTL against a 60-second loop, which made `worker_is_alive()`
+flap for the back half of every cycle. Same flap, opposite cause, still
+present in the one worker that comment did not enumerate.
+
+### The fix, and the constraint on it
+
+The heartbeat now runs on a 60-second timer, matching every sibling and
+the cadence the TTL was chosen against.
+
+The constraint worth stating: **it is tied to the subscription's lifetime,
+not the process's.** The beater starts when the bridge subscribes and is
+cancelled in a `finally` when the bridge returns or raises, so a genuinely
+dead feed still goes stale within one TTL. A heartbeat that outlived the
+thing it describes would be the same fabricated claim the two preceding
+rounds removed from the equity and options risk paths — a green light
+nobody earned.
+
+### A control that hung instead of failing
+
+Injection caught this round's own test file twice before it was right.
+Removing the beater's cancellation leaves the bridge awaiting a task
+nothing stops, so the test **hung** rather than failing — first on an
+unbounded `await`, then again on an unbounded `asyncio.gather` after the
+first bound was placed on the wrong call. A control that hangs is killed
+by a CI timeout and read as a flake, which is worse than no control at
+all.
+
+Every task shutdown in the file is now bounded by
+`asyncio.wait([task], timeout=…)` with an assertion naming the cause, so
+the same injection now fails in eight seconds. An earlier round recorded
+exactly this lesson; it did not transfer on the first try, which is worth
+writing down rather than quietly fixing.
+
+Injection, after that:
+
+```
+back to beating once per tick (the original state)       -> 2 fail
+the beater is never stopped when the feed dies           -> 2 fail  (control)
+heartbeat unguarded again, one Redis error ends it       -> 1 fail  (control)
+interval raised past the TTL, reintroducing the flap     -> 1 fail  (control)
+ticks no longer reach the candle worker                  -> 1 fail  (control)
+```
+
+All four controls were injection-tested alongside the proof.
+
+### Found on the way, and not fixed here
+
+The probe that surfaced this — public functions with no caller anywhere in
+`app/` — turned up something larger that deserves its own round rather
+than being folded into this one:
+
+`app/workers/main.py` constructs `SimulatedFeed(candles_by_symbol={})`, an
+**empty** dict, so `subscribe()` yields nothing and the bridge returns
+immediately, busy-restarting under `supervise` forever. Separately,
+`backfill_candles` — the only path from `UpstoxMarketData` into the candle
+store — has no caller in `app/` at all. Every layer of ingestion exists
+(provider client, instrument-key resolution, normalization, backfill,
+aggregation) and nothing wires any of it.
+
+That is a missing feature, not a correctness bug, and it is the honest
+counterweight to this round: fixing the heartbeat makes the health signal
+tell the truth, and the truth it will tell in the current deployment is
+that there is no market data.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

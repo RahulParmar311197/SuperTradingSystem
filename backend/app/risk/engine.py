@@ -89,10 +89,15 @@ class TradeRiskProposal:
     # A caller that *does* assess liquidity passes a real bool and gets a
     # real gate: `False` rejects.
     #
-    # The sibling `OptionsRiskProposal.liquidity_acceptable` is genuinely
-    # computed by app/api/options.py from `OptionSnapshot` data
-    # (`evaluate_liquidity` in app/options/liquidity_filter.py), so it
-    # keeps its `bool` type. There is no equivalent source for equities
+    # CORRECTION, from a later round: this note used to claim the sibling
+    # `OptionsRiskProposal.liquidity_acceptable` was "genuinely computed by
+    # app/api/options.py from OptionSnapshot data, so it keeps its `bool`
+    # type". The computation is there, but its data source has no writer --
+    # nothing in production inserts `option_snapshots`, `option_contracts`
+    # or `option_chains` -- so the branch performing it never ran outside
+    # the test suite, and the sibling had exactly this bug too. It is now
+    # `bool | None` for the same reason this one is. There is no equivalent
+    # source for equities
     # here: `evaluate_liquidity`'s thresholds are open-interest and
     # option-spread shaped, and what a minimum traded volume should be for
     # an NSE equity is a number to be chosen deliberately, not invented in

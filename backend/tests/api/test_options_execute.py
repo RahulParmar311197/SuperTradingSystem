@@ -1154,3 +1154,148 @@ async def test_an_ordinary_two_leg_spread_still_executes(require_infra):
             await resume_account(str(user_id))
             orders_module._STACKS.pop(user_id, None)
             await _cleanup(user_id, [long_leg.id, short_leg.id])
+
+
+async def _quote_one_leg(leg, *, volume: float, open_interest: float) -> tuple[uuid.UUID, uuid.UUID]:
+    """Give `leg` a real OptionSnapshot. Returns (contract_id, chain_id)."""
+    from datetime import datetime, timezone
+
+    async with async_session_factory() as db:
+        chain = OptionChainSnapshot(
+            underlying="NIFTY", expiry=leg.expiry, spot_price=25000.0, fetched_at=datetime.now(timezone.utc)
+        )
+        db.add(chain)
+        await db.flush()
+        contract = OptionContract(instrument_id=leg.id, chain_id=chain.id, strike=25000.0, option_type="CALL")
+        db.add(contract)
+        await db.flush()
+        db.add(
+            OptionSnapshot(
+                option_contract_id=contract.id,
+                bid=100.0,
+                ask=102.0,
+                ltp=101.0,
+                volume=volume,
+                open_interest=open_interest,
+                snapshot_at=datetime.now(timezone.utc),
+            )
+        )
+        await db.commit()
+        return contract.id, chain.id
+
+
+async def _drop_quote(contract_id: uuid.UUID, chain_id: uuid.UUID) -> None:
+    async with async_session_factory() as db:
+        await db.execute(delete(OptionSnapshot).where(OptionSnapshot.option_contract_id == contract_id))
+        await db.execute(delete(OptionContract).where(OptionContract.id == contract_id))
+        await db.execute(delete(OptionChainSnapshot).where(OptionChainSnapshot.id == chain_id))
+        await db.commit()
+
+
+async def test_a_quoted_illiquid_leg_is_rejected_and_says_so_in_the_audit_row(require_infra):
+    """Behavioural proof for the liquidity verdict's *wiring*, not its math.
+
+    Measured before adding this: replacing the line in
+    `app/api/options.py` that records the per-leg verdict with `pass` left
+    the entire suite green. The pure function had proofs; the endpoint had
+    none, so an illiquid quoted contract would have slipped through with
+    the check merely absent from the audit row. That is the third round in
+    a row where the call site, not the function, was the uncovered half.
+    """
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+        long_leg, short_leg = await _make_two_leg_instruments(f"ILLQ{uuid.uuid4().hex[:5].upper()}")
+        # Default LiquidityFilterConfig wants volume >= 100 and OI >= 500.
+        contract_id, chain_id = await _quote_one_leg(long_leg, volume=1.0, open_interest=1.0)
+
+        try:
+            r = client.post(
+                "/options/execute",
+                json={
+                    "strategy_name": "long_call",
+                    "legs": [{"symbol": long_leg.symbol, "direction": "LONG", "quantity": 1, "premium": 101.0}],
+                },
+                headers=headers,
+            )
+            assert r.status_code == 403, r.text
+
+            async with async_session_factory() as db:
+                events = (await db.execute(select(RiskEvent).where(RiskEvent.user_id == user_id))).scalars().all()
+                assert len(events) == 1
+                assert events[0].checks.get("liquidity_acceptable") is False, events[0].checks
+                orders = (await db.execute(select(Order).where(Order.user_id == user_id))).scalars().all()
+                assert orders == []
+        finally:
+            await _drop_quote(contract_id, chain_id)
+            await _cleanup(user_id, [long_leg.id, short_leg.id])
+
+
+async def test_a_quoted_liquid_leg_records_the_check_as_passed(require_infra):
+    """Control. Identical call, identical premium -- only the quoted volume
+    and open interest differ. Without this, the test above would pass just
+    as happily if the endpoint rejected every quoted leg, and the audit row
+    would still be the only thing distinguishing "checked and fine" from
+    "never checked" -- which is the whole point of the round.
+    """
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+        long_leg, short_leg = await _make_two_leg_instruments(f"LIQO{uuid.uuid4().hex[:5].upper()}")
+        contract_id, chain_id = await _quote_one_leg(long_leg, volume=1000.0, open_interest=1000.0)
+
+        try:
+            r = client.post(
+                "/options/execute",
+                json={
+                    "strategy_name": "long_call",
+                    "legs": [{"symbol": long_leg.symbol, "direction": "LONG", "quantity": 1, "premium": 101.0}],
+                },
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+
+            async with async_session_factory() as db:
+                events = (await db.execute(select(RiskEvent).where(RiskEvent.user_id == user_id))).scalars().all()
+                assert len(events) == 1
+                assert events[0].checks.get("liquidity_acceptable") is True, events[0].checks
+        finally:
+            await _drop_quote(contract_id, chain_id)
+            await _cleanup(user_id, [long_leg.id, short_leg.id])
+
+
+async def test_an_unquoted_strategy_records_none_of_the_three_quote_checks(require_infra):
+    """Behavioural proof through the endpoint, and the round's headline.
+
+    No production code writes `option_chains`, `option_contracts` or
+    `option_snapshots` -- only tests do -- so this, with no quote inserted,
+    is what every real options execution looked like. All three checks used
+    to appear in the persisted audit row as passed.
+    """
+    with TestClient(app) as client:
+        token, user_id = await _register_and_grant_live_trade(client)
+        headers = {"Authorization": f"Bearer {token}"}
+        long_leg, short_leg = await _make_two_leg_instruments(f"NOQT{uuid.uuid4().hex[:5].upper()}")
+
+        try:
+            r = client.post(
+                "/options/execute",
+                json={
+                    "strategy_name": "long_call",
+                    "legs": [{"symbol": long_leg.symbol, "direction": "LONG", "quantity": 1, "premium": 101.0}],
+                },
+                headers=headers,
+            )
+            assert r.status_code == 201, r.text
+
+            async with async_session_factory() as db:
+                events = (await db.execute(select(RiskEvent).where(RiskEvent.user_id == user_id))).scalars().all()
+                assert len(events) == 1
+                recorded = set(events[0].checks)
+                assert not (recorded & {"liquidity_acceptable", "premium_matches_market", "market_data_fresh"}), (
+                    f"claimed checks nothing performed: {sorted(recorded)}"
+                )
+                # ... and the checks that DID govern the decision are still there.
+                assert "kill_switch" in recorded and "exposure_limit" in recorded, sorted(recorded)
+        finally:
+            await _cleanup(user_id, [long_leg.id, short_leg.id])

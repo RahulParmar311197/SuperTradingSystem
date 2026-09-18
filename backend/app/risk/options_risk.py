@@ -42,15 +42,49 @@ class OptionsRiskProposal:
     daily_pnl: float = 0.0  # negative = loss
     weekly_pnl: float = 0.0
     repeated_rejections: int = 0
-    market_data_age_seconds: float = 0.0
-    liquidity_acceptable: bool = True
+    # The next three are `| None` for one reason, and it is the same reason
+    # in all three cases: **"we could not check" is not "we checked and it
+    # is fine"**, and recording the second when only the first happened
+    # puts a claim in the `RiskEvent` audit row that nobody made.
+    #
+    # They used to be plain `float`/`bool` with the everything-is-fine
+    # value as their default -- 0.0 seconds old, liquid, 0.00% from the
+    # market. `app/api/options.py` passes those defaults whenever a leg has
+    # no `OptionSnapshot` row, and **no production code writes
+    # `option_snapshots`, `option_contracts` or `option_chains` at all**;
+    # only tests insert them. So in production every leg took the defaults,
+    # every options `RiskEvent` recorded `liquidity_acceptable: true`,
+    # `premium_matches_market: true` and `market_data_fresh: true`, and an
+    # operator reading `GET /admin/risk-events` could not tell a strategy
+    # whose quotes were checked and were fine from one where the gate was
+    # never wired up.
+    #
+    # This is the identical defect an earlier round fixed for
+    # `TradeRiskProposal.liquidity_acceptable`, and that round's own note
+    # claimed this sibling was safe because it "is genuinely computed by
+    # app/api/options.py from OptionSnapshot data". That claim was wrong:
+    # the computation exists, but its data source has no writer, so the
+    # branch that performs it never runs outside the test suite.
+    #
+    # `None` now SKIPS the check rather than passing it -- exactly what
+    # `is_reducing` already does for the entry-only limits below, so the
+    # audit row lists only the checks that actually governed the decision.
+    # It deliberately does NOT reject. For equities `None` does reject,
+    # because there a feed exists and its absence for one symbol is an
+    # anomaly; here the absence is total and permanent until an
+    # options-chain ingestion path is built, and rejecting would take a
+    # working endpoint offline to punish a gap in this codebase rather than
+    # a fact about the market. Wiring that ingestion is the follow-on;
+    # not claiming it happened is this change.
+    market_data_age_seconds: float | None = None
+    liquidity_acceptable: bool | None = None
     # Worst (max) percent gap, across every leg with a real OptionSnapshot
     # quote available, between that leg's client-claimed `premium` and the
-    # snapshot's own bid/ask mid -- 0.0 when no leg has snapshot data yet.
-    # See RiskLimits.max_premium_deviation_pct for why this exists: premium
-    # is otherwise trusted input that sizes this strategy's own payoff/risk
-    # math (compute_payoff_summary), unchecked against anything real.
-    premium_deviation_pct: float = 0.0
+    # snapshot's own bid/ask mid. See RiskLimits.max_premium_deviation_pct
+    # for why this exists: premium is otherwise trusted input that sizes
+    # this strategy's own payoff/risk math (compute_payoff_summary),
+    # unchecked against anything real.
+    premium_deviation_pct: float | None = None
     # True when every leg of this order opposes an open position in that
     # leg's own instrument, and each leg is clamped to at most the open
     # quantity -- i.e. the order can only reduce or flatten what the
@@ -157,21 +191,28 @@ def evaluate_options_risk(
             proposal.repeated_rejections < limits.max_repeated_rejections,
         )
     )
-    checks.append(RiskCheck("liquidity_acceptable", proposal.liquidity_acceptable))
-    checks.append(
-        RiskCheck(
-            "premium_matches_market",
-            proposal.premium_deviation_pct <= limits.max_premium_deviation_pct,
-            f"Premium deviates {proposal.premium_deviation_pct:.2f}% from the real quote vs limit {limits.max_premium_deviation_pct}%",
+    # Each of these three is recorded only when it was actually evaluated.
+    # `None` means no leg had a real quote to check against, so the check
+    # is absent from the audit row rather than present and claiming to have
+    # passed -- see the fields' own note on OptionsRiskProposal.
+    if proposal.liquidity_acceptable is not None:
+        checks.append(RiskCheck("liquidity_acceptable", proposal.liquidity_acceptable))
+    if proposal.premium_deviation_pct is not None:
+        checks.append(
+            RiskCheck(
+                "premium_matches_market",
+                proposal.premium_deviation_pct <= limits.max_premium_deviation_pct,
+                f"Premium deviates {proposal.premium_deviation_pct:.2f}% from the real quote vs limit {limits.max_premium_deviation_pct}%",
+            )
         )
-    )
-    checks.append(
-        RiskCheck(
-            "market_data_fresh",
-            proposal.market_data_age_seconds <= limits.market_data_max_staleness_seconds,
-            f"Data age {proposal.market_data_age_seconds}s vs max {limits.market_data_max_staleness_seconds}s",
+    if proposal.market_data_age_seconds is not None:
+        checks.append(
+            RiskCheck(
+                "market_data_fresh",
+                proposal.market_data_age_seconds <= limits.market_data_max_staleness_seconds,
+                f"Data age {proposal.market_data_age_seconds}s vs max {limits.market_data_max_staleness_seconds}s",
+            )
         )
-    )
     checks.append(RiskCheck("broker_healthy", proposal.broker_healthy))
 
     failed = [c for c in checks if not c.passed]

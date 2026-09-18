@@ -570,17 +570,23 @@ async def execute_options_strategy(
     # "never populated" the same as "actually illiquid" would make this
     # endpoint permanently unusable rather than honestly degraded.
     liquidity_warnings: list[str] = []
-    liquidity_acceptable = True
+    # `None` until some leg actually has a quote to judge. Nothing in
+    # production writes `option_snapshots`, so today that is every call --
+    # and recording "liquid" for a strategy nobody looked at is the audit
+    # row lying, not the endpoint degrading gracefully. See
+    # OptionsRiskProposal for the whole note.
+    liquidity_acceptable: bool | None = None
     # Worst-case deviation across legs, not summed -- one leg's claimed
     # premium being wildly off from the real market is already enough
     # reason to reject the whole strategy (blueprint §56/§57's
     # "entry_matches_market" precedent, extended here to options premiums:
     # see RiskLimits.max_premium_deviation_pct).
-    premium_deviation_pct = 0.0
-    # Worst (max) staleness across every leg with a real OptionSnapshot --
-    # 0.0 when no leg has snapshot data yet, matching premium_deviation_pct's
-    # same "nothing to check yet" default just above.
-    market_data_age_seconds = 0.0
+    premium_deviation_pct: float | None = None
+    # Worst (max) staleness across every leg with a real OptionSnapshot.
+    # `None` -- not 0.0 -- when no leg has one: 0.0 asserts the quotes are
+    # this instant's, which is the strongest possible claim to make about
+    # data that does not exist.
+    market_data_age_seconds: float | None = None
     for leg in payload.legs:
         snapshot = await _latest_option_snapshot(db, instruments[leg.symbol].id)
         if snapshot is None:
@@ -594,16 +600,18 @@ async def execute_options_strategy(
             quote_timestamp=snapshot.snapshot_at,
         )
         liquidity_warnings.extend(f"{leg.symbol}: {w}" for w in assessment.warnings)
+        # A leg was assessed, so the verdict is a real bool from here on --
+        # and one unacceptable leg condemns the strategy.
+        liquidity_acceptable = bool(liquidity_acceptable is not False and assessment.acceptable)
         if not assessment.acceptable:
-            liquidity_acceptable = False
             liquidity_warnings.extend(f"{leg.symbol}: {r}" for r in assessment.rejections)
         if snapshot.bid is not None and snapshot.ask is not None:
             mid = (float(snapshot.bid) + float(snapshot.ask)) / 2
             if mid:
                 deviation = abs(leg.premium - mid) / mid * 100
-                premium_deviation_pct = max(premium_deviation_pct, deviation)
+                premium_deviation_pct = max(premium_deviation_pct or 0.0, deviation)
         age = (datetime.now(timezone.utc) - snapshot.snapshot_at).total_seconds()
-        market_data_age_seconds = max(market_data_age_seconds, age)
+        market_data_age_seconds = max(market_data_age_seconds or 0.0, age)
 
     stack = await _stack_for(user, db)
 

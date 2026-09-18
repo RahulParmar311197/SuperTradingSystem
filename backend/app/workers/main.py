@@ -109,6 +109,22 @@ async def _bridge_market_data_to_candles(market_worker: MarketDataWorker, candle
             pass
 
 
+def _feed_can_emit(feed, symbols: list[str]) -> bool:
+    """Whether this feed could ever yield a tick for these symbols.
+
+    Only `SimulatedFeed` can be answered statically -- it replays a dict it
+    was handed, so an empty one is a provable dead end. Anything else is
+    assumed live, because a real feed's silence is a fact about the market
+    rather than about the object, and refusing to start it would be this
+    guard causing the outage it exists to report.
+    """
+    from app.market.feed import SimulatedFeed
+
+    if not isinstance(feed, SimulatedFeed):
+        return True
+    return any(feed.candles_by_symbol.get(symbol) for symbol in symbols)
+
+
 async def main() -> None:
     symbols = [s.strip() for s in os.environ.get("WORKER_SYMBOLS", "").split(",") if s.strip()]
     instrument_ids_env = os.environ.get("WORKER_INSTRUMENT_IDS", "")  # "SYMBOL=uuid,SYMBOL2=uuid2"
@@ -123,6 +139,13 @@ async def main() -> None:
 
     from app.market.feed import SimulatedFeed
 
+    # `candles_by_symbol={}` -- deliberately, and this is the whole point of
+    # the guard below rather than an oversight to fix by inventing data.
+    # `SimulatedFeed.subscribe` iterates `candles_by_symbol.get(symbol, [])`,
+    # so an empty dict yields nothing and returns immediately. There is no
+    # streaming provider to put here instead: `UpstoxMarketData` is REST
+    # only (historical candles and LTP, no WebSocket), so a live feed would
+    # have to be a polling client that does not exist yet.
     feed = SimulatedFeed(candles_by_symbol={}, exchange="NSE", market="EQUITY")
     market_worker = MarketDataWorker(feed, symbols)
     candle_worker = CandleWorker(instrument_ids, base_timeframe="1m", derived_timeframes=["5m", "15m"])
@@ -149,10 +172,36 @@ async def main() -> None:
     # coroutine object can only be awaited once, so restarting needs a
     # fresh one each time.
     supervised = {
-        "market_data+candles": lambda: _bridge_market_data_to_candles(market_worker, candle_worker),
         "scanner": scanner_worker.run,
         "autotrade": auto_trade_supervisor.run,
     }
+    # Only supervise the bridge if it can actually produce something.
+    #
+    # It could not. The feed above holds no candles, so `subscribe()`
+    # returned on its first step, `supervise` logged "returned
+    # unexpectedly; restarting in 5s", and the process spent its whole
+    # life restarting a generator that was structurally incapable of
+    # yielding -- backing off to one attempt a minute, forever, while an
+    # operator reading the log saw a worker that looked busy.
+    #
+    # Refusing to start it is the honest state, and it is not the same as
+    # doing nothing: `scanner` and `autotrade` still run against whatever
+    # candles the store holds (see `POST /admin/backfill`, which is how
+    # real history gets in), and `market_data` correctly reads DOWN on
+    # `GET /health` because nothing is beating for it.
+    if _feed_can_emit(feed, symbols):
+        supervised["market_data+candles"] = lambda: _bridge_market_data_to_candles(
+            market_worker, candle_worker
+        )
+    else:
+        logger.error(
+            "No live market-data feed: the simulated feed holds no candles for %s, so the "
+            "market_data bridge is NOT being started (it would restart forever without ever "
+            "producing a tick). Historical candles can still be loaded through "
+            "POST /admin/backfill; a streaming feed is not implemented -- UpstoxMarketData is "
+            "REST only.",
+            symbols or "any symbol",
+        )
     tasks = [
         asyncio.create_task(supervise(name, factory, stop_event), name=name)
         for name, factory in supervised.items()

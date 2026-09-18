@@ -163,6 +163,61 @@ class Condition(BaseModel):
         return self
 
     @model_validator(mode="after")
+    def _reject_a_lookback_that_can_never_match(self) -> "Condition":
+        """Rejects `lookback` below 1, which makes the condition false on
+        every candle forever.
+
+        `evaluate_condition` asks `context.current_index - event.index <
+        condition.lookback` for `bos`, `mss`, `choch` and
+        `liquidity_sweep`. On the very bar the event happened that
+        difference is 0, so `lookback=1` is the smallest value that can
+        ever be true, and it means "only on the event bar". At 0 and
+        below nothing satisfies it -- not even the bar the structure
+        break printed on.
+
+        Measured through `StrategyEngine.evaluate` with a real BOS at
+        index 7, evaluated one bar later:
+
+            lookback=2   -> satisfied=['bos']
+            lookback=1   -> missing=['bos']     (correct: the event is a bar old)
+            lookback=0   -> missing=['bos']
+            lookback=-5  -> missing=['bos']
+
+        and `POST /strategies` answered 201 for the `lookback=0` version.
+
+        Accepted silently, that is the same trap as the two validators
+        around it. Conditions AND implicitly (`evaluate_conditions`), so
+        one of them zeroes the whole strategy: it stores, lists,
+        backtests and auto-trades like any other and simply never
+        produces a signal, and a validation backtest reporting zero
+        trades is indistinguishable from "this history had no setups".
+
+        No upper bound. A very large `lookback` means "this event never
+        expires", which is a defensible authoring choice -- it is what
+        every structure condition did before the expiry window existed --
+        and `lookback` lives inside a JSON column, so there is no width
+        to overflow. Only the end that cannot match is refused.
+
+        Compares the value directly rather than guarding for `None`:
+        `_default_lookback_per_condition_type` is declared above this and
+        pydantic runs `mode="after"` validators in declaration order, so
+        the field always holds an int by the time this runs. A `None`
+        guard here would be unreachable -- injecting one changed nothing
+        and the suite stayed green, which is how it was found. If that
+        fill-in is ever removed, this raises a `TypeError` naming the
+        line instead of quietly admitting `None`, and
+        `test_an_omitted_lookback_still_gets_its_per_type_default` fails.
+        """
+        if self.lookback < 1:
+            raise ValueError(
+                f"lookback={self.lookback} can never match: an event on the current candle is "
+                "0 bars old, so the smallest useful value is 1 (meaning 'only on the bar the "
+                "event printed'). Because conditions AND together, this would stop the whole "
+                "strategy from ever firing."
+            )
+        return self
+
+    @model_validator(mode="after")
     def _reject_premium_discount_without_a_zone(self) -> "Condition":
         """Rejects `premium_discount` with no `zone`, which can never match.
 

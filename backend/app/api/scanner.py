@@ -15,7 +15,7 @@ from app.ict.engine import ICTConfig, ICTEngine
 from app.market.repository import get_candles
 from app.smc.engine import SMCConfig, SMCEngine
 from app.strategy.context import EvaluationContext
-from app.strategy.dsl import StrategyDefinition
+from app.api.stored_strategies import parse_stored_definition
 from app.strategy.engine import StrategyEngine
 
 router = APIRouter(tags=["scanner"])
@@ -45,7 +45,7 @@ async def run_scanner(
     strategy_row = await db.get(StrategyRow, payload.strategy_id)
     if strategy_row is None or strategy_row.user_id != user.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Strategy not found")
-    strategy = StrategyDefinition.model_validate(strategy_row.definition)
+    strategy = parse_stored_definition(strategy_row)
 
     smc_engine = SMCEngine(SMCConfig())
     ict_engine = ICTEngine(ICTConfig())

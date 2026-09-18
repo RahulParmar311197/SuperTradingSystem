@@ -9452,6 +9452,65 @@ market, and it is **not** a live quote stream: the freshness a strategy is
 judged against is the freshness of the last fetch. As with equities, the
 system can now be fed; it cannot yet feed itself.
 
+## The backtest cost model was a bare `dict` (§47, §77-78)
+
+`cost_model` on `POST /backtest` and `POST /backtest/validate` was typed
+`dict`, with nothing between the request body and
+`CostModel(**payload.cost_model)`. Two separate failures, both measured
+through the real routes on one strategy over one set of candles.
+
+**Four shapes returned HTTP 500 with a traceback.** `CostModel` is a slots
+dataclass, so an unknown key raises `TypeError` at construction, and a
+string or an explicit null raises `TypeError` later in the arithmetic.
+`POST /backtest` did not guard the call at all; `POST /backtest/validate`
+guarded it with `except ValueError`, which a `TypeError` walks straight
+past.
+
+| `cost_model` | before | after |
+|---|---|---|
+| `{"bogus": 1}` | 500 | 422 |
+| `{"slippage_pct": "abc"}` | 500 | 422 |
+| `{"slippage_pct": null}` | 500 | 422 |
+| `{"brokerage_pct": [1, 2]}` | 500 | 422 |
+
+**And the values that constructed fine were unbounded, which is the worse
+half.** Every cost here exists to make a backtest *more* pessimistic. A
+negative one is a subsidy paid on every fill:
+
+```
+slippage_pct   0.05  ->  net_profit      8,106.55
+slippage_pct -50.0   ->  net_profit    224,464.33
+```
+
+Same strategy, same candles: a 27x edge that exists only in the cost
+model, reported with exactly the same authority as a real result. A
+backtest is the artifact someone decides to risk money on, and the cost
+model is the one knob whose entire job is to stop it flattering the
+strategy. `brokerage_pct: 500` was likewise accepted (-320,121) — absurd,
+though at least in the safe direction.
+
+`cost_model` is now a `CostModelRequest` with `extra="forbid"` and `ge=0`
+on all six fields, plus an upper bound of 100% on the percentage ones
+(above that a single round trip costs more than the position is worth,
+which is a typo rather than a cost model). The bounds are **REASONED, NOT
+CALIBRATED**. `ge=0` and not `gt=0` on purpose: a zero-cost run is the
+documented default and a legitimate first look at a strategy, so what is
+rejected is negative costs specifically, not small ones.
+
+A control pins `CostModelRequest`'s field names against `CostModel`'s, so
+a field added to one and not the other cannot silently fall back to its
+default — a caller setting a cost and being ignored is worse than a 422.
+
+### A negative result worth recording
+
+`train_pct` and `validation_pct` are **fractions** (0–1) named `_pct` in a
+codebase where every other `_pct` is 0–100, and they are request fields
+with no `Field()` bounds. That looked like the same bug. It is not:
+`split_periods` raises `ValueError` for anything outside (0, 1), and the
+validate endpoint's `except ValueError` does catch that one. Measured:
+`train_pct: 60` returns a clean **422** naming the constraint. The naming
+is still inconsistent, and it is not worth an API break to fix.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

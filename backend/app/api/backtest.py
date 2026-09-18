@@ -29,6 +29,42 @@ router = APIRouter(prefix="/backtest", tags=["backtest"])
 _MAX_MONEY = 1e12
 
 
+# Each cost is a percentage of notional, and every one of them must make a
+# backtest *more* pessimistic, never less. Bounds are REASONED, NOT
+# CALIBRATED: above 100% a single round trip costs more than the position
+# is worth, which is a typo rather than a cost model, and the flat charges
+# are bounded by the same money ceiling every other amount here uses.
+#
+# `ge=0` is the load-bearing half. `cost_model` used to be a bare `dict`,
+# so `{"slippage_pct": -50}` was accepted and meant every fill came in 50%
+# better than the market. Measured on one strategy over one set of
+# candles: reported net profit went from 8,106 to 224,464 -- a 27x edge
+# that exists only in the cost model. A backtest is the artifact someone
+# decides to risk money on, and the cost model is the one knob whose whole
+# job is to stop it flattering the strategy.
+#
+# `extra="forbid"` because the dict reached `CostModel(**...)`, a slots
+# dataclass, so a typo raised `TypeError` -- which the validate endpoint's
+# `except ValueError` does not catch and the run endpoint does not guard at
+# all. Measured through both real routes: an unknown key, a string, an
+# explicit null and a list each returned **HTTP 500 with a traceback**.
+_MAX_COST_PCT = 100.0
+
+
+class CostModelRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    brokerage_flat: float = Field(default=0.0, ge=0, lt=_MAX_MONEY)
+    brokerage_pct: float = Field(default=0.0, ge=0, le=_MAX_COST_PCT)
+    slippage_pct: float = Field(default=0.0, ge=0, le=_MAX_COST_PCT)
+    spread_pct: float = Field(default=0.0, ge=0, le=_MAX_COST_PCT)
+    taxes_pct: float = Field(default=0.0, ge=0, le=_MAX_COST_PCT)
+    contract_charges_flat: float = Field(default=0.0, ge=0, lt=_MAX_MONEY)
+
+    def to_cost_model(self) -> CostModel:
+        return CostModel(**self.model_dump())
+
+
 class RunBacktestRequest(BaseModel):
     strategy_id: uuid.UUID
     instrument_id: uuid.UUID
@@ -36,7 +72,7 @@ class RunBacktestRequest(BaseModel):
     start_date: datetime
     end_date: datetime
     starting_capital: float = Field(default=100_000.0, gt=0, lt=_MAX_MONEY)
-    cost_model: dict = {}
+    cost_model: CostModelRequest = CostModelRequest()
 
 
 class OpenPositionResponse(BaseModel):
@@ -99,7 +135,7 @@ async def run_backtest(
     if len(candles) < 10:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Not enough historical candles for a meaningful backtest")
 
-    engine = BacktestEngine(strategy, starting_capital=payload.starting_capital, cost_model=CostModel(**payload.cost_model))
+    engine = BacktestEngine(strategy, starting_capital=payload.starting_capital, cost_model=payload.cost_model.to_cost_model())
     trades = engine.run(candles, symbol=str(payload.instrument_id))
     metrics = compute_metrics(trades, payload.starting_capital)
     open_position = (
@@ -114,7 +150,7 @@ async def run_backtest(
         start_date=payload.start_date,
         end_date=payload.end_date,
         starting_capital=payload.starting_capital,
-        cost_model=payload.cost_model,
+        cost_model=payload.cost_model.model_dump(),
         status=BacktestStatus.COMPLETED,
         open_position=(open_position.model_dump(mode="json") if open_position is not None else None),
     )
@@ -175,7 +211,7 @@ class ValidateBacktestRequest(BaseModel):
     start_date: datetime
     end_date: datetime
     starting_capital: float = Field(default=100_000.0, gt=0, lt=_MAX_MONEY)
-    cost_model: dict = {}
+    cost_model: CostModelRequest = CostModelRequest()
     train_pct: float = 0.6
     validation_pct: float = 0.2
 
@@ -240,7 +276,7 @@ async def validate_backtest(
             candles,
             symbol=str(payload.instrument_id),
             starting_capital=payload.starting_capital,
-            cost_model=CostModel(**payload.cost_model),
+            cost_model=payload.cost_model.to_cost_model(),
             train_pct=payload.train_pct,
             validation_pct=payload.validation_pct,
         )

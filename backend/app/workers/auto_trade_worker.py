@@ -38,6 +38,7 @@ from app.database.models.instruments import Instrument
 from app.database.models.strategy import Direction
 from app.database.models.strategy import Strategy as StrategyRow
 from app.database.models.trading import ExecutionMode
+from app.database.models.trading import Position as PositionRow
 from app.database.models.trading import Trade as TradeRow
 from app.database.models.notifications import NotificationType
 from app.database.models.risk import RiskDecision as RiskEventDecision
@@ -54,6 +55,11 @@ from app.trading.persistence import load_open_positions, persist_position
 from app.trading.position_manager import PositionManager
 
 logger = logging.getLogger("workers.autotrade")
+
+# The `positions.source_key` every position this loop opens is written
+# under. Named so the unmanaged-position sweep below and the writers that
+# stamp it cannot drift apart.
+AUTO_SOURCE_KEY = "auto"
 
 # How many of its own bars old a candle may be before this loop refuses to
 # trade on it. REASONED, NOT CALIBRATED: a bar is expected within one
@@ -111,6 +117,9 @@ class AutoTradeSupervisor:
         # the cap they configured -- and the daily-loss halt only fired
         # once a *single* pair had lost the whole limit by itself.
         self._risk_windows: dict[str, RiskWindow] = {}
+        # Positions already reported as unmanaged, so the error below is one
+        # line per position rather than one per 60-second pass.
+        self._reported_unmanaged: set[str] = set()
 
     async def run_once(self) -> list[dict]:
         results: list[dict] = []
@@ -119,11 +128,43 @@ class AutoTradeSupervisor:
                 await db.execute(select(User).where(User.auto_trading_enabled.is_(True)))
             ).scalars().all()
 
+            # Every (user, instrument) whose open position this pass actually
+            # fed a candle to. What is left over is reported below: an open
+            # position nothing is managing is the one state this loop must
+            # never reach silently.
+            managed: set[tuple[str, str]] = set()
+
             for user in eligible_users:
                 if TradingPermission.AUTO_TRADE.value not in user.trading_permissions:
                     continue
-                if await account_halt_reason(str(user.id)) is not None:
-                    continue
+
+                # **A halt stops new entries. It must not stop exits.**
+                #
+                # This used to `continue`, which skipped the user entirely --
+                # and the stop on any position already open then stopped
+                # being evaluated, because that stop exists nowhere else.
+                # `ensure_protective_stop` is called only from POST /orders,
+                # so there is no broker-side order behind an auto-traded
+                # position: `PaperTradingEngine._maybe_exit`, run on the
+                # candles this loop feeds it, IS the stop.
+                #
+                # Measured on the stop-loss fixture in
+                # tests/workers/test_auto_trade_worker.py, halting the
+                # account after the entry filled and before the bar that
+                # breaks the stop:
+                #
+                #     not halted -> 1 trade, no open position
+                #     halted     -> 0 trades, position still open,
+                #                   stop 99.70, on a bar whose low was 90
+                #
+                # The ruling this now follows is already made twice in this
+                # codebase, in these words: reconciliation halts an account
+                # precisely when its positions look wrong, which is "the
+                # worst moment to forbid closing them". `POST /orders` and
+                # `POST /options/execute` both exempt a reducing order from
+                # the halt for exactly that reason; this path had the
+                # exemption missing rather than declined.
+                entries_allowed = await account_halt_reason(str(user.id)) is None
 
                 strategy_rows = (
                     await db.execute(
@@ -147,13 +188,94 @@ class AutoTradeSupervisor:
                         continue
 
                     for instrument in instruments:
-                        outcome = await self._process(db, user, strategy_row, strategy, instrument)
+                        outcome = await self._process(
+                            db, user, strategy_row, strategy, instrument,
+                            entries_allowed=entries_allowed, managed=managed,
+                        )
                         if outcome is not None:
                             results.append(outcome)
 
+            await self._report_unmanaged_positions(db, managed)
+
         return results
 
-    async def _process(self, db, user: User, strategy_row: StrategyRow, strategy: StrategyDefinition, instrument: Instrument) -> dict | None:
+    async def _report_unmanaged_positions(self, db, managed: set[tuple[str, str]]) -> None:
+        """Says so when an open auto-traded position is no longer being
+        managed by anything.
+
+        The gates above are about taking risk ON, and the halt one now
+        exempts exits for that reason. Three others do not, and each of
+        them leaves a live position whose stop has quietly stopped being
+        enforced:
+
+          - `auto_trading_enabled` turned off
+          - the AUTO_TRADE permission revoked
+          - the strategy that opened it deactivated or made ineligible
+
+        Whether the loop should keep honouring a stop it placed after the
+        operator has switched the robot off is a real question with two
+        defensible answers -- `POST /orders` requires the LIVE_TRADE
+        permission for every order including a reducing one, which argues
+        for stopping; a stop that silently stops existing argues for
+        continuing -- and guessing it is not this round's to do. What is
+        not in question is that it must not be **silent**.
+
+        Once per position, not once per pass: this runs every 60 seconds,
+        and an operator who has to filter the warning will not read it.
+        """
+        open_auto = (
+            await db.execute(
+                select(PositionRow).where(
+                    PositionRow.is_open.is_(True),
+                    PositionRow.source_key == AUTO_SOURCE_KEY,
+                )
+            )
+        ).scalars().all()
+        for position in open_auto:
+            key = (str(position.user_id), str(position.instrument_id))
+            if key in managed or str(position.id) in self._reported_unmanaged:
+                continue
+            self._reported_unmanaged.add(str(position.id))
+            logger.error(
+                "Open auto-traded position %s (user %s, instrument %s, stop %s) is no longer "
+                "being managed by this loop: nothing is evaluating its stop or target, and "
+                "there is no broker-side protective order behind it. Auto-trading may have "
+                "been disabled, the AUTO_TRADE permission revoked, the strategy that opened "
+                "it deactivated, or its candle feed gone stale. Close it through POST /orders, "
+                "or restore whichever of those stopped.",
+                position.id, position.user_id, position.instrument_id, position.stop,
+            )
+            try:
+                await create_notification(
+                    db,
+                    user_id=position.user_id,
+                    notification_type=NotificationType.RECONCILIATION_REQUIRED,
+                    title="An open position is no longer being managed",
+                    body=(
+                        "The autonomous loop is no longer evaluating the stop or target on an "
+                        "open position. Nothing else is: there is no broker-side protective "
+                        "order behind an auto-traded position. Close it manually or re-enable "
+                        "auto-trading."
+                    ),
+                    data={"position_id": str(position.id), "instrument_id": str(position.instrument_id)},
+                )
+                await db.commit()
+            except Exception:
+                # Never let reporting take the loop down -- the same
+                # reasoning as the heartbeat guards in this module.
+                logger.exception("Could not notify about unmanaged position %s", position.id)
+
+    async def _process(
+        self,
+        db,
+        user: User,
+        strategy_row: StrategyRow,
+        strategy: StrategyDefinition,
+        instrument: Instrument,
+        *,
+        entries_allowed: bool = True,
+        managed: set[tuple[str, str]] | None = None,
+    ) -> dict | None:
         key = (str(user.id), str(strategy_row.id), str(instrument.id))
         engine = self._engines.get(key)
         if engine is None:
@@ -169,7 +291,7 @@ class AutoTradeSupervisor:
                 position_manager = PositionManager()
                 position_manager.restore(
                     await load_open_positions(
-                        db, user.id, ExecutionMode.PAPER, source_key="auto"
+                        db, user.id, ExecutionMode.PAPER, source_key=AUTO_SOURCE_KEY
                     )
                 )
                 self._position_managers[str(user.id)] = position_manager
@@ -331,6 +453,24 @@ class AutoTradeSupervisor:
                 "target": position_before.target,
             }
 
+        if not entries_allowed and not (position_before is not None and position_before.is_open):
+            # Halted, and nothing open on this instrument. `on_candle`
+            # evaluates an entry whenever no position is open, so feeding
+            # it here would open one straight through the halt. With a
+            # position open it cannot: `on_candle` returns immediately
+            # after `_maybe_exit`, which is exactly the exit-only pass the
+            # halt must not block.
+            return None
+
+        # Marked here, not where the open position is read above: the pass
+        # that *opens* a position sees no position beforehand, so recording
+        # it there reported every fresh entry as unmanaged on its very own
+        # pass -- measured, one spurious notification per trade, which is
+        # how a real warning becomes noise. What makes a position managed is
+        # that a candle reached its engine, which is exactly here.
+        if managed is not None:
+            managed.add((str(user.id), str(instrument.id)))
+
         outcome = await engine.on_candle(latest, db)
 
         # Blueprint §9/§86: mirrors app/api/paper.py's feed_candle fix --
@@ -346,7 +486,7 @@ class AutoTradeSupervisor:
         position_after = engine.position_manager.get(engine.account_id, engine.symbol)
         if position_after is not None:
             await persist_position(
-                db, user.id, instrument.id, position_after, execution_mode=ExecutionMode.PAPER, source_key="auto"
+                db, user.id, instrument.id, position_after, execution_mode=ExecutionMode.PAPER, source_key=AUTO_SOURCE_KEY
             )
 
         if outcome.risk_checks is not None:

@@ -9577,6 +9577,80 @@ which still holds `strategy_kwargs` separately. `RESERVED_ARGUMENTS` is
 exported for it, and `build_strategy` carries a comment saying why the
 check is not there.
 
+## The autonomous loop had no freshness gate (§54, §58)
+
+`AutoTradeSupervisor` reads the newest stored candle for an instrument and
+trades on it. Until now it did that **however old that candle was**.
+
+`PaperTradingEngine` builds its `TradeRiskProposal` with
+`market_data_age_seconds=0.0`, so the `market_data_fresh` check could not
+fail on this path — and the `RiskEvent` row recorded it as a check that had
+passed. Measured by driving the engine with a bar from January while the
+clock read September:
+
+```
+proposal market_data_age_seconds=0.0   market_data_fresh=True
+```
+
+`POST /orders` computes a real age from Redis and enforces a limit. The
+autonomous path — the one that trades unattended — had the gate in name
+only. It is the same shape as the `strategy_allocation=0.0` an earlier
+round had to fix on this very proposal, and `tests/paper/test_engine.py`
+still carries that regression test.
+
+Nothing about the stale case is exotic. `_last_candle_seen` is in-memory,
+so a worker restart clears it and the very next pass acts on the newest
+stored bar whatever its date — and candles only reach the store when an
+operator runs `POST /admin/backfill`.
+
+### Where the guard goes, and what it measures
+
+At the supervisor, not in the engine. The supervisor is the only unattended
+caller; the other one, `POST /paper/{id}/candle`, is an operator
+deliberately handing over a bar, where freshness is not a property of
+anything. The engine's `0.0` is now true by construction, and says so.
+
+Lateness is measured **beyond the bar**, not from its stamp. A 15m bar
+stamped at its open is not available until 15 minutes later, so the raw
+difference would call every freshly closed bar 900s stale and refuse the
+whole loop. The limit is `MAX_CANDLE_AGE_IN_BARS` (3) of the instrument's
+own timeframe — **REASONED, NOT CALIBRATED**: a bar is expected within one
+interval of its close and this loop polls every 60s, so one bar of slack
+covers the ordinary case; at three, at least two bars are missing outright
+and the feed has stopped rather than slipped.
+
+Deliberately not `RiskLimits.market_data_max_staleness_seconds`. That is 10
+seconds and describes a *tick*, which is what `POST /orders` measures; a
+15m bar is 900 seconds old the instant it closes, so applying the tick
+limit to bars would refuse every candle this loop has ever seen. A control
+pins that relationship rather than the numbers.
+
+### The fixtures were unrealistic in a new dimension
+
+Turning the gate on failed 15 existing tests, all of which anchored their
+candles at a fixed `datetime(2026, 1, 5)` — 256 days stale against the
+clock they actually run under. The same call as the `volume=100.0` fixtures
+when the liquidity gate went in: the gate is right and the anchor was
+arbitrary. The series are now anchored to finish at roughly now.
+
+One of those fixtures needed more than a re-anchor. `_seed(bar_count=N)`
+took the *first* N bars, which is fine for `N=74` of 75 (the prefix still
+ends a bar ago) and wrong for `N=2` (the two bars furthest in the past).
+An instrument with almost no history is one that only just started being
+tracked, so it now takes the newest N — which is both the passing fixture
+and the more faithful one.
+
+### What injection caught that the tests did not
+
+Hard-coding the bar duration to `"1m"` in the supervisor's own call —
+ignoring `strategy.timeframe` — left the whole suite green. A bar 15
+minutes old and a bar a day old land on the same side of the limit
+whichever duration is subtracted, so neither existing call-site test could
+see it. There is now one sitting where the difference decides the answer: a
+15m bar stamped 59 minutes ago is 44 minutes late and must trade, while
+subtracting one minute instead of fifteen reads it as 58 minutes late and
+refuses a perfectly healthy feed.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

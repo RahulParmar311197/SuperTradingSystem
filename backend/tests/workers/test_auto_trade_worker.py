@@ -60,6 +60,24 @@ STRATEGY_DEFINITION = {
 LIQUID_BAR_VOLUME = 50_000.0
 
 
+def _recent_start() -> datetime:
+    """Anchor a candle series so its newest bar is recent.
+
+    These fixtures were anchored at a fixed `datetime(2026, 1, 5)`, which
+    stops being a detail the moment the supervisor gained a freshness gate:
+    it now refuses a bar more than `MAX_CANDLE_AGE_IN_BARS` of its own
+    timeframe late, and against a September clock that anchor was 256 days
+    stale -- so every one of these tests stopped trading, correctly.
+
+    The gate is right and the anchor was arbitrary, which is the same call
+    an earlier round made about `volume=100.0` fixtures when the liquidity
+    gate went in. Thirty minutes back covers every series in this file (all
+    are 1 minute apart and well under 30 bars) while leaving the newest bar
+    comfortably inside the 45-minute budget a 15m timeframe allows.
+    """
+    return datetime.now(timezone.utc).replace(second=0, microsecond=0) - timedelta(minutes=30)
+
+
 async def _cleanup(user_id: uuid.UUID) -> None:
     async with async_session_factory() as db:
         await db.execute(delete(Position).where(Position.user_id == user_id))
@@ -125,7 +143,7 @@ async def test_supervisor_skips_strategy_not_marked_eligible(db_instrument):
 
 
 async def test_supervisor_opens_and_journals_a_trade_end_to_end(db_instrument):
-    start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
+    start = _recent_start()
     candles = [Candle(start + timedelta(minutes=i), o, h, l, c, LIQUID_BAR_VOLUME) for i, (o, h, l, c) in enumerate(SETUP)]
 
     async with async_session_factory() as db:
@@ -199,7 +217,7 @@ async def test_supervisor_persists_the_open_position_to_the_database(db_instrume
     # persist_position at all. Every position it ever opened was invisible
     # to every one of those for its entire open lifetime, only appearing
     # once it closed and a Trade row appeared.
-    start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
+    start = _recent_start()
     candles = [Candle(start + timedelta(minutes=i), o, h, l, c, LIQUID_BAR_VOLUME) for i, (o, h, l, c) in enumerate(SETUP)]
 
     async with async_session_factory() as db:
@@ -266,7 +284,7 @@ async def test_supervisor_caps_open_positions_account_wide_across_instruments(db
     # could open two simultaneous positions instead of one. Mirrors
     # `_UserTradingStack` (app/api/orders.py), which shares one
     # `PositionManager` per user for exactly this reason.
-    start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
+    start = _recent_start()
     candles = [Candle(start + timedelta(minutes=i), o, h, l, c, LIQUID_BAR_VOLUME) for i, (o, h, l, c) in enumerate(SETUP)]
 
     async with async_session_factory() as db:
@@ -349,7 +367,7 @@ async def test_supervisor_caps_trades_per_day_account_wide_across_instruments(db
     #
     # `max_open_positions` is deliberately set high here so it cannot be
     # the binding constraint; the only cap under test is trades-per-day.
-    start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
+    start = _recent_start()
     candles = [Candle(start + timedelta(minutes=i), o, h, l, c, LIQUID_BAR_VOLUME) for i, (o, h, l, c) in enumerate(SETUP)]
 
     async with async_session_factory() as db:
@@ -453,7 +471,7 @@ async def test_supervisor_journals_a_close_against_the_strategy_that_opened_it(d
     # key had no coverage at all, even though `run_once` iterates every
     # eligible strategy against every active instrument, making multiple
     # strategies per instrument the normal configuration.
-    start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
+    start = _recent_start()
     candles = [Candle(start + timedelta(minutes=i), o, h, l, c, LIQUID_BAR_VOLUME) for i, (o, h, l, c) in enumerate(SETUP)]
 
     async with async_session_factory() as db:
@@ -525,7 +543,7 @@ async def test_supervisor_writes_risk_event_audit_row_for_the_opened_trade(db_in
     # rejected. This path runs unattended with no synchronous caller to see
     # the decision at all, so `GET /admin/risk-events` was blind to every
     # autonomous trade ever placed.
-    start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
+    start = _recent_start()
     candles = [Candle(start + timedelta(minutes=i), o, h, l, c, LIQUID_BAR_VOLUME) for i, (o, h, l, c) in enumerate(SETUP)]
 
     async with async_session_factory() as db:
@@ -588,7 +606,7 @@ async def test_supervisor_notifies_sl_hit_on_stop_loss_exit(db_instrument):
         (109, 109, 103, 104),  # retraces into the FVG -> entry
         (104, 105, 90, 92),  # reverses hard through the stop
     ]
-    start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
+    start = _recent_start()
     candles = [Candle(start + timedelta(minutes=i), o, h, l, c, LIQUID_BAR_VOLUME) for i, (o, h, l, c) in enumerate(stop_loss_setup)]
 
     async with async_session_factory() as db:
@@ -655,7 +673,7 @@ async def test_supervisor_records_the_real_stop_price_not_the_candles_close(db_i
         (109, 109, 103, 104),  # retraces into the FVG -> entry
         (104, 105, 90, 92),  # reverses hard through the stop
     ]
-    start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
+    start = _recent_start()
     candles = [Candle(start + timedelta(minutes=i), o, h, l, c, LIQUID_BAR_VOLUME) for i, (o, h, l, c) in enumerate(stop_loss_setup)]
 
     async with async_session_factory() as db:
@@ -712,7 +730,7 @@ async def test_supervisor_picks_up_strategy_edited_after_engine_cached(db_instru
     # definition and bump its version -- the rest of the same dataset
     # should still open and close a trade, which is only possible if the
     # cached engine actually picked up the edit.
-    start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
+    start = _recent_start()
     candles = [Candle(start + timedelta(minutes=i), o, h, l, c, LIQUID_BAR_VOLUME) for i, (o, h, l, c) in enumerate(SETUP)]
 
     unmatchable_definition = {
@@ -796,7 +814,7 @@ async def test_supervisor_notifies_on_risk_rejected_entry(db_instrument, monkeyp
         RiskEngine, "evaluate", lambda self, proposal: RiskDecisionResult(RiskDecision.REJECT, [], "forced rejection for test")
     )
 
-    start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
+    start = _recent_start()
     candles = [Candle(start + timedelta(minutes=i), o, h, l, c, LIQUID_BAR_VOLUME) for i, (o, h, l, c) in enumerate(SETUP)]
 
     async with async_session_factory() as db:
@@ -867,7 +885,7 @@ async def test_supervisor_notifies_daily_loss_limit_distinctly(db_instrument, mo
         ),
     )
 
-    start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
+    start = _recent_start()
     candles = [Candle(start + timedelta(minutes=i), o, h, l, c, LIQUID_BAR_VOLUME) for i, (o, h, l, c) in enumerate(SETUP)]
 
     async with async_session_factory() as db:

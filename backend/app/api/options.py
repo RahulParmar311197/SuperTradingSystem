@@ -40,12 +40,57 @@ from app.trading.persistence import persist_order, persist_position, record_trad
 router = APIRouter(prefix="/options", tags=["options"])
 
 
+# Black-Scholes is pure arithmetic with no persistence behind it, so an
+# out-of-range input here costs a 500 rather than a wrong number in a
+# journal -- but a 500 is still the wrong answer for a bad request, and it
+# reaches the client as a traceback that names nothing useful. Measured
+# against the live endpoint before these bounds:
+#
+#   rate=1e308                  -> 500  "Out of range float values are not
+#                                        JSON compliant" (the result is inf)
+#   rate=-1e308                 -> 500  OverflowError: math range error
+#   time_to_expiry_years=1e308  -> 500  JSON-non-compliant
+#   iv=1e308                    -> 500  OverflowError (34, numerical result
+#                                        out of range)
+#
+# `_d1_d2` already refuses zero and negative spot/strike/time/iv with a
+# ValueError the route turns into a 422, so only the upper end was open --
+# plus `rate`, which is the one field that may legitimately be negative and
+# had no guard at either end.
+#
+# The ceilings are deliberately generous rather than opinionated: a hundred
+# years of expiry against three for the longest real LEAPS, and 10,000%
+# implied volatility. `rate` is a decimal fraction, not a percentage (the
+# default 0.06 is 6%, and `math.exp(-rate * t)` reads it that way), so
+# [-1, 1] spans -100% to +100%.
+#
+# **A ceiling is added only where one was measured to be needed.** `spot`
+# and `strike` keep the positivity `_d1_d2` already demands and nothing
+# more, because every extreme they accept answers correctly:
+#
+#   spot=1e308  -> 200, price 1e+308    strike=1e308  -> 200, price 0.0
+#   spot=1e-308 -> 200, price 0.0       strike=1e-308 -> 200, price 25000.0
+#
+# A price ceiling here was written first and then removed: injection showed
+# the suite stayed green without it, because nothing it prevented had ever
+# failed. The same reasoning declines a floor on `time_to_expiry_years` --
+# an option expiring in a microsecond really does have enormous gamma, so
+# the huge number 1e-300 returns is arithmetic answering an absurd question
+# correctly. Inventing either bound would be this endpoint refusing a
+# calculation it can do.
+_MAX_TIME_TO_EXPIRY_YEARS = 100.0
+_MAX_IV = 100.0
+_MAX_ABS_RATE = 1.0
+
+
 class GreeksRequest(BaseModel):
-    spot: float
-    strike: float
-    time_to_expiry_years: float
-    rate: float = 0.06
-    iv: float
+    # `gt=0` here rather than leaving it to `_d1_d2`: both answer 422, but
+    # this one names the field that was wrong.
+    spot: float = Field(gt=0)
+    strike: float = Field(gt=0)
+    time_to_expiry_years: float = Field(gt=0, le=_MAX_TIME_TO_EXPIRY_YEARS)
+    rate: float = Field(default=0.06, ge=-_MAX_ABS_RATE, le=_MAX_ABS_RATE)
+    iv: float = Field(gt=0, le=_MAX_IV)
     option_type: OptionType
 
 

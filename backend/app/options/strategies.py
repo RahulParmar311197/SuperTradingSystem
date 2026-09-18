@@ -7,6 +7,8 @@ correctly once a strategy has been chosen.
 
 from __future__ import annotations
 
+import inspect
+
 from app.database.models.strategy import Direction
 from app.options.greeks import OptionType
 from app.options.payoff import OptionLeg
@@ -139,8 +141,64 @@ BIAS_STRATEGIES = {
 }
 
 
+def required_arguments(name: str) -> list[str]:
+    """The strike arguments `name`'s builder cannot be called without.
+
+    Every one of the ten builders takes at least one -- `long_call` needs a
+    `strike`, `iron_condor` needs four -- and nothing told a caller which.
+    `POST /options/strategy` spreads a caller-supplied `strategy_kwargs`
+    into the builder, and that field's **default is an empty dict**, so the
+    documented default request could not succeed for any strategy: it
+    raised `TypeError` (missing positional arguments), which the route did
+    not catch, and came back as HTTP 500 with a traceback.
+
+    Read from the signature rather than hard-coded, so a builder that gains
+    or loses an argument cannot drift away from what the API reports.
+    """
+    builder = _STRATEGY_BUILDERS.get(name)
+    if builder is None:
+        raise ValueError(f"Unknown options strategy: {name}")
+    return [
+        parameter.name
+        for parameter in inspect.signature(builder).parameters.values()
+        if parameter.default is inspect.Parameter.empty and parameter.name != "chain"
+    ]
+
+
+# Supplied by `build_strategy`'s own caller, so passing any of them again
+# through a request's `strategy_kwargs` is "multiple values for argument"
+# -- another `TypeError`, and another 500. Enforced at the API layer, which
+# is the only place that can still tell the request's copy from the
+# route's; see the note in `build_strategy`.
+RESERVED_ARGUMENTS = frozenset({"chain", "quantity", "lot_size"})
+
+
 def build_strategy(name: str, chain: OptionChain, **kwargs) -> list[OptionLeg]:
     builder = _STRATEGY_BUILDERS.get(name)
     if builder is None:
         raise ValueError(f"Unknown options strategy: {name}")
+
+    # Turn every way of calling this wrongly into a `ValueError` naming
+    # what the strategy actually wants. The builders raise `KeyError` for a
+    # strike that is not in the chain and `ValueError` for a bad one, both
+    # of which callers already handle; a `TypeError` out of `**kwargs` was
+    # the one that escaped as a 500.
+    required = required_arguments(name)
+    accepted = {p.name for p in inspect.signature(builder).parameters.values()}
+    missing = [argument for argument in required if argument not in kwargs]
+    if missing:
+        raise ValueError(
+            f"Options strategy {name!r} requires {required}; missing {missing}. "
+            "Pass them in `strategy_kwargs`."
+        )
+    # NOT the place to reject `quantity`/`lot_size`: this function's own
+    # caller passes them as keyword arguments, so by the time they land in
+    # `**kwargs` they are indistinguishable from ones a request smuggled in
+    # -- rejecting them here refused every correct call. The API layer can
+    # tell the two apart, because it holds `strategy_kwargs` separately,
+    # and `RESERVED_ARGUMENTS` is exported for it to use.
+    unknown = sorted(set(kwargs) - accepted)
+    if unknown:
+        raise ValueError(f"Options strategy {name!r} does not accept {unknown}; it accepts {required}.")
+
     return builder(chain, **kwargs)

@@ -9511,6 +9511,72 @@ validate endpoint's `except ValueError` does catch that one. Measured:
 `train_pct: 60` returns a clean **422** naming the constraint. The naming
 is still inconsistent, and it is not worth an API break to fix.
 
+## `POST /options/strategy` 500'd on its own default request (§37)
+
+`BuildStrategyRequest.strategy_kwargs` is a `dict` that gets spread into
+`build_strategy(...)`, and its default is `{}`. **Every one of the ten
+builders requires at least one strike argument** — `long_call` needs a
+`strike`, `iron_condor` needs four — so that default could not succeed for
+any strategy. It raised `TypeError` (missing positional arguments), the
+route caught only `(ValueError, KeyError)`, and the caller got HTTP 500
+with a traceback.
+
+Nothing anywhere told a caller what to send instead. `GET
+/options/strategies` listed the ten names and no arguments, so the only
+way to discover that `bull_call_spread` wants `long_strike` and
+`short_strike` was to keep guessing against a 500.
+
+Three more shapes did the same thing, all `TypeError` out of the `**kwargs`
+spread: an unknown argument, and `quantity` or `chain` passed a second time
+through `strategy_kwargs` ("multiple values for argument").
+
+`build_strategy` now rejects all of them with a `ValueError` naming what
+the strategy actually wants, read from the builder's own signature via
+`required_arguments`, and `GET /options/strategies` reports the same thing
+under `requires` so a caller can know before asking.
+
+### And the sizes were unbounded
+
+`quantity` and `lot_size` had no bounds. This endpoint answers a question
+rather than placing a trade, so what that produced was a wrong number
+rather than a bad fill — which is worse to leave than it sounds, because a
+payoff summary is exactly what someone reads *before* choosing a strategy.
+Measured on a 25000/25200 bull call spread:
+
+| request | before | after |
+|---|---|---|
+| `quantity: -5` | 200, `net_premium: -17500` (a debit spread as a credit) | 422 |
+| `lot_size: 0` | 200, every number `0.0` | 422 |
+| `lot_size: -50` | 200, every number inverted | 422 |
+
+### Two layers that masked each other
+
+Worth recording because injection is the only reason it was found. The fix
+has two: `build_strategy` rejecting bad arguments with a `ValueError`, and
+the route catching any `TypeError` that still escapes. Every test went
+through the endpoint — where **either layer alone produces a 422**.
+Measured: removing `build_strategy`'s checks left the whole suite green,
+because the route's guard caught the `TypeError`; removing the route's
+guard left it green too, because the checks ran first.
+
+Two layers that can stand in for each other are two layers nothing is
+testing. There are now unit tests on `build_strategy` asserting it raises
+`ValueError` rather than `TypeError` for every strategy, and an endpoint
+test that monkeypatches a drifted builder so the route's guard is the only
+thing that can answer. This is the same lesson as the password round's
+`model_construct` test, in a new shape.
+
+### One correction from this round's own work
+
+The first attempt put the reserved-argument check (`quantity`, `lot_size`,
+`chain` may not be passed twice) inside `build_strategy` — where it
+**refused every correct call**, because that function's own caller passes
+`quantity` and `lot_size` through the same `**kwargs` and by then they are
+indistinguishable from smuggled ones. The check belongs at the API layer,
+which still holds `strategy_kwargs` separately. `RESERVED_ARGUMENTS` is
+exported for it, and `build_strategy` carries a comment saying why the
+check is not there.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

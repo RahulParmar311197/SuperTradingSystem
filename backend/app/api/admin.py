@@ -40,6 +40,7 @@ from app.database.session import get_db
 from app.market.backfill import backfill_candles
 from app.market.providers.factory import market_data_provider_or_reason
 from app.market.providers.instrument_master import InstrumentKeyUnknown
+from app.options.ingestion import ChainSpotPriceUnavailable, ingest_option_chain
 from app.monitoring.health import ComponentStatus, check_database, check_redis, check_workers
 from app.trading.portfolio_snapshots import snapshot_all_stacks
 
@@ -457,4 +458,94 @@ async def backfill_instrument_candles(
         candles_written=result.candles_written,
         first_timestamp=result.first_timestamp,
         last_timestamp=result.last_timestamp,
+    )
+
+
+class OptionChainRequest(BaseModel):
+    # The *underlying's* symbol (an index or a stock), not a contract's.
+    underlying: str = Field(min_length=1, max_length=64)
+    expiry: date
+
+
+class OptionChainResponse(BaseModel):
+    underlying: str
+    expiry: date
+    fetched_at: datetime
+    spot_price: float
+    quotes_returned: int
+    snapshots_written: int
+    unregistered_count: int
+    unregistered_sample: list[str]
+
+
+@router.post("/option-chain", response_model=OptionChainResponse)
+async def ingest_underlying_option_chain(
+    payload: OptionChainRequest,
+    user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> OptionChainResponse:
+    """Load one underlying's option chain for one expiry.
+
+    **This is the first writer `option_snapshots` has ever had**, and with
+    it the three options-specific gates on `POST /options/execute` become
+    real: liquidity (volume, open interest, spread), premium deviation
+    against the actual bid/ask mid, and quote staleness. Until now each
+    recorded `None` -- correctly, since nothing had looked -- so an
+    operator could execute a multi-leg strategy against a contract nobody
+    had ever quoted. `app/trading/portfolio_snapshots.py` also stops
+    contributing 0 for every option position's Greeks.
+
+    Admin-gated and on demand, like `POST /admin/backfill`: which expiry
+    to fetch is a judgement call and provider chains are rate-limited.
+
+    Not idempotent, deliberately. Each run appends a new chain with fresh
+    snapshots, because a snapshot is a timestamped quote -- and the
+    staleness gate downstream only means something if the store keeps
+    *when* each quote was taken.
+    """
+    market_data, reason = market_data_provider_or_reason()
+    if market_data is None:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, reason)
+
+    instrument = (
+        await db.execute(select(Instrument).where(Instrument.symbol == payload.underlying))
+    ).scalar_one_or_none()
+    if instrument is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, f"No instrument registered for {payload.underlying!r}"
+        )
+
+    try:
+        result = await ingest_option_chain(db, market_data, instrument, payload.expiry)
+    except InstrumentKeyUnknown as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    except ChainSpotPriceUnavailable as exc:
+        # 502: the request was well formed and the provider answered, but
+        # with something this system will not store. Distinct from the 400
+        # above, which is this deployment's own misconfiguration.
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
+
+    await record_audit(
+        db,
+        actor="user",
+        action="admin.option_chain_ingested",
+        user_id=user.id,
+        details={
+            "underlying": result.underlying,
+            "expiry": result.expiry.isoformat(),
+            "snapshots_written": result.snapshots_written,
+            "quotes_returned": result.quotes_returned,
+            "unregistered_count": result.unregistered_count,
+        },
+    )
+    await db.commit()
+    return OptionChainResponse(
+        underlying=result.underlying,
+        expiry=result.expiry,
+        fetched_at=result.fetched_at,
+        spot_price=result.spot_price,
+        quotes_returned=result.quotes_returned,
+        snapshots_written=result.snapshots_written,
+        unregistered_count=result.unregistered_count,
+        unregistered_sample=result.unregistered_sample,
     )

@@ -26,7 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.orders import _execution_mode_for, _UserTradingStack, all_stacks
 from app.database.models.instruments import Instrument
-from app.database.models.options import OptionContract, OptionSnapshot
+from app.options.snapshots import latest_option_snapshot
 from app.database.models.trading import PortfolioSnapshot
 from app.database.session import async_session_factory
 from app.risk.portfolio import compute_portfolio_exposure
@@ -38,9 +38,9 @@ async def _net_greeks(db: AsyncSession, positions) -> tuple[float, float, float,
     """Best-effort net delta/gamma/theta/vega across a user's open
     positions. Only contributes for a position whose instrument is an
     option (`Instrument.option_type` is set) AND already has a real
-    `OptionSnapshot` -- there is no options-chain ingestion pipeline in
-    this environment (see docs/ARCHITECTURE.md), so most positions will
-    simply contribute 0 rather than a fabricated Greek."""
+    `OptionSnapshot`. Chains reach the store only when an operator runs
+    `POST /admin/option-chain`, so a position whose chain has never been
+    fetched contributes 0 rather than a fabricated Greek."""
     net_delta = net_gamma = net_theta = net_vega = 0.0
     for position in positions:
         instrument = (
@@ -49,20 +49,7 @@ async def _net_greeks(db: AsyncSession, positions) -> tuple[float, float, float,
         if instrument is None or instrument.option_type is None:
             continue
 
-        contract = (
-            await db.execute(select(OptionContract).where(OptionContract.instrument_id == instrument.id))
-        ).scalar_one_or_none()
-        if contract is None:
-            continue
-
-        snapshot = (
-            await db.execute(
-                select(OptionSnapshot)
-                .where(OptionSnapshot.option_contract_id == contract.id)
-                .order_by(OptionSnapshot.snapshot_at.desc())
-                .limit(1)
-            )
-        ).scalar_one_or_none()
+        snapshot = await latest_option_snapshot(db, instrument.id)
         if snapshot is None:
             continue
 

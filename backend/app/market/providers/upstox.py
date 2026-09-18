@@ -32,6 +32,7 @@ for.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 
 import httpx
@@ -73,6 +74,115 @@ def parse_ltp(payload: dict, instrument_key: str) -> float | None:
         return None
     ltp = entry.get("last_price", entry.get("ltp"))
     return float(ltp) if ltp is not None else None
+
+
+@dataclass(frozen=True, slots=True)
+class OptionQuote:
+    """One side (call or put) of one strike, as the chain reports it.
+
+    Every price field is optional because Upstox omits rather than zeroes
+    what it has no value for, and a contract that has not traded today
+    genuinely has no LTP. `volume` and `open_interest` default to 0.0
+    instead: those are counts over the session, and "no trades" really is
+    zero — which is exactly the reading
+    `app.options.liquidity_filter.evaluate_liquidity` needs to reject a
+    dead strike rather than skip it.
+    """
+
+    instrument_key: str
+    strike: float
+    option_type: str  # "CE" or "PE"
+    ltp: float | None = None
+    bid: float | None = None
+    ask: float | None = None
+    volume: float = 0.0
+    open_interest: float = 0.0
+    iv: float | None = None
+    delta: float | None = None
+    gamma: float | None = None
+    theta: float | None = None
+    vega: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class OptionChain:
+    underlying_spot_price: float | None
+    quotes: list[OptionQuote]
+
+
+def _opt_float(value) -> float | None:
+    """A float, or None for anything that is not a usable number.
+
+    Upstox sends `null`, `""` and occasionally `"NA"` in price fields.
+    `float("")` raises, and a raised ValueError several layers into an
+    ingestion loop would discard a whole chain over one bad strike.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_one_side(entry: dict, strike: float, option_type: str) -> OptionQuote | None:
+    instrument_key = (entry.get("instrument_key") or "").strip()
+    if not instrument_key:
+        return None
+    market = entry.get("market_data") or {}
+    greeks = entry.get("option_greeks") or {}
+    return OptionQuote(
+        instrument_key=instrument_key,
+        strike=strike,
+        option_type=option_type,
+        ltp=_opt_float(market.get("ltp")),
+        bid=_opt_float(market.get("bid_price")),
+        ask=_opt_float(market.get("ask_price")),
+        # `or 0.0` and not `_opt_float(...)`: see OptionQuote's docstring.
+        volume=_opt_float(market.get("volume")) or 0.0,
+        open_interest=_opt_float(market.get("oi")) or 0.0,
+        iv=_opt_float(greeks.get("iv")),
+        delta=_opt_float(greeks.get("delta")),
+        gamma=_opt_float(greeks.get("gamma")),
+        theta=_opt_float(greeks.get("theta")),
+        vega=_opt_float(greeks.get("vega")),
+    )
+
+
+def parse_option_chain(payload: dict) -> OptionChain:
+    """Upstox `/option/chain`, flattened to one quote per tradable side.
+
+    The documented shape is a list of per-strike rows, each carrying a
+    `strike_price`, an `underlying_spot_price` and up to two nested sides
+    (`call_options`, `put_options`). A row missing its strike is skipped
+    rather than stored at 0.0, which would be a real strike at the money
+    for a low-priced underlying.
+
+    Isolated as a pure function for the same reason `parse_candles` is:
+    this environment cannot reach Upstox's servers, so the shape is
+    fixture-tested here and correctable from one real call later
+    (blueprint §120).
+    """
+    rows = payload.get("data") or []
+    spot: float | None = None
+    quotes: list[OptionQuote] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if spot is None:
+            spot = _opt_float(row.get("underlying_spot_price"))
+        strike = _opt_float(row.get("strike_price"))
+        if strike is None:
+            logger.warning("Skipping an option-chain row with no strike_price: %s", sorted(row))
+            continue
+        for key, option_type in (("call_options", "CE"), ("put_options", "PE")):
+            side = row.get(key)
+            if not isinstance(side, dict):
+                continue
+            quote = _parse_one_side(side, strike, option_type)
+            if quote is not None:
+                quotes.append(quote)
+    return OptionChain(underlying_spot_price=spot, quotes=quotes)
 
 
 def parse_candles(payload: dict) -> list[Candle]:
@@ -184,6 +294,19 @@ class UpstoxMarketData:
             raise ValueError(f"interval {interval!r} is not one of {sorted(INTRADAY_INTERVALS)}")
         payload = await self._get(f"/historical-candle/intraday/{instrument_key}/{interval}")
         return parse_candles(payload)
+
+    async def get_option_chain(self, instrument_key: str, expiry: date) -> OptionChain:
+        """The full chain for one underlying and one expiry.
+
+        `instrument_key` names the *underlying* here (e.g. the Nifty 50
+        index), not a contract — the response is what enumerates the
+        contracts.
+        """
+        payload = await self._get(
+            "/option/chain",
+            params={"instrument_key": instrument_key, "expiry_date": expiry.isoformat()},
+        )
+        return parse_option_chain(payload)
 
     async def aclose(self) -> None:
         await self._http.aclose()

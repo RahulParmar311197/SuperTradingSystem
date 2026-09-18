@@ -9216,6 +9216,101 @@ counterweight to this round: fixing the heartbeat makes the health signal
 tell the truth, and the truth it will tell in the current deployment is
 that there is no market data.
 
+## Real market data can now reach the candle store (§14)
+
+**A missing feature, and the biggest one left.** Nothing here was
+computing a wrong answer; there was simply no path from a market-data
+provider into the store every strategy reads, and two previous rounds
+named it rather than fixing it.
+
+A probe for public functions with no caller anywhere in `app/` found it.
+Most hits were FastAPI route handlers — framework-called, a false-positive
+class — but two were not, and one of them mattered: **`backfill_candles`
+had no caller at all.** The function existed, the read-only
+`UpstoxMarketData` client existed, `resolve_instrument_key` existed. Every
+layer of ingestion was present except the one that would have used them,
+so the only candles a deployment could ever hold were whatever a test had
+inserted.
+
+### What it does now
+
+`POST /admin/backfill` — admin-gated, on-demand, idempotent. It is
+deliberately modelled on `POST /admin/portfolio-snapshot` rather than made
+a background loop: the range to fetch is a judgement call, provider
+history is rate-limited, and a real deployment should drive it from its
+own scheduler. `upsert_candles` is a real upsert, so re-running an
+overlapping range corrects bars rather than duplicating them.
+
+Provider construction is now one place, `app/market/providers/factory.py`,
+which also owns the sentence explaining what to configure. Splitting
+`market_data_provider_or_reason` out of `market_data_provider` is not
+decoration: an earlier round had to collapse a duplicated helper after
+breaking *both* copies at once went unnoticed by the whole suite, and one
+message written once cannot drift.
+
+The credential stays process-level (`UPSTOX_DATA_ACCESS_TOKEN`) with **no
+`BrokerAccount` row**, and that is load-bearing rather than tidy.
+`resolve_broker` picks the most recent ACTIVE `BrokerAccount` for every
+order a user places, and `_execution_mode_for` stamps anything that is not
+a `MockBroker` as LIVE — so a row here would route that user's real orders
+to Upstox as a side effect of wanting price history. A test asserts the
+returned client has no `place_order`, `modify_order` or `cancel_order`
+surface at all.
+
+### The worker stops pretending
+
+`app/workers/main.py` built `SimulatedFeed(candles_by_symbol={})` — an
+empty dict — so `subscribe()` returned on its first step, `supervise`
+logged "returned unexpectedly; restarting in 5s", and the process spent
+its whole life restarting a generator structurally incapable of yielding.
+Backing off to one attempt a minute, forever, while the log looked busy.
+
+The bridge is now supervised only when the feed could actually produce
+something. `_feed_can_emit` answers that statically for `SimulatedFeed`
+alone — it replays a dict it was handed, so an empty one is a provable
+dead end — and assumes anything else is live, because **a real feed's
+silence is a fact about the market, not about the object**, and refusing
+to start it would make the guard the cause of the outage it exists to
+report.
+
+Refusing is not the same as doing nothing: `scanner` and `autotrade` still
+run against whatever the store holds, `market_data` correctly reads DOWN
+on `GET /health` because nothing beats for it, and one `ERROR` line names
+the gap and points at the backfill route.
+
+### What is still missing, precisely
+
+**There is no live streaming feed, and this round did not build one.**
+`UpstoxMarketData` is REST only — historical candles and last-traded price,
+no WebSocket — so a live feed would have to be a polling client that does
+not exist. What this round delivers is *historical* ingestion: enough for
+the scanner, the autonomous loop, backtests and out-of-sample validation
+to run against real prices instead of nothing, and not enough to trade
+intraday on live ticks.
+
+Said plainly so the improvement is not mistaken for more than it is: the
+system can now be fed, on demand, by an operator. It cannot yet feed
+itself.
+
+### Injection
+
+The wiring — not the logic — was the uncovered half in three consecutive
+earlier rounds, so both call sites were injected deliberately this time:
+
+```
+blank token no longer stripped                        -> 1 fail  (control)
+the missing-provider reason stops naming the remedy   -> 2 fail
+endpoint no longer guards a missing provider          -> 1 fail  (call site)
+backfill endpoint drops its admin gate                -> 1 fail  (control)
+endpoint stops calling backfill_candles at all        -> 1 fail  (call site)
+the guard always says the feed can emit (original)    -> 3 fail
+a real feed refused as if it were dead                -> 1 fail  (control)
+```
+
+All three controls were injection-tested alongside the proofs, and both
+call-site injections were caught — the first round in four where that was
+true on the first attempt.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

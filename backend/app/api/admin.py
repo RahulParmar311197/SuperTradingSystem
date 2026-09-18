@@ -8,7 +8,7 @@ broker secrets."
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
@@ -32,10 +32,14 @@ from app.core.redis import (
     set_strategy_kill,
 )
 from app.database.models.ai import AIDecision, AIDecisionType
+from app.database.models.instruments import Instrument
 from app.database.models.risk import RiskDecision, RiskEvent
 from app.database.models.trading import Order, OrderStatus
 from app.database.models.users import BrokerAccount, BrokerAccountStatus, BrokerName, User, UserRole, UserStatus
 from app.database.session import get_db
+from app.market.backfill import backfill_candles
+from app.market.providers.factory import market_data_provider_or_reason
+from app.market.providers.instrument_master import InstrumentKeyUnknown
 from app.monitoring.health import ComponentStatus, check_database, check_redis, check_workers
 from app.trading.portfolio_snapshots import snapshot_all_stacks
 
@@ -363,3 +367,94 @@ async def clear_strategy_kill_switch(
         db, actor="user", action="admin.kill_switch_strategy_cleared", user_id=user.id, details={"strategy_id": strategy_id}
     )
     return await _kill_switch_state()
+
+
+class BackfillRequest(BaseModel):
+    symbol: str = Field(..., min_length=1, max_length=64)
+    timeframe: str = Field(..., min_length=1, max_length=8)
+    from_date: date
+    to_date: date
+
+
+class BackfillResponse(BaseModel):
+    symbol: str
+    timeframe: str
+    candles_written: int
+    first_timestamp: datetime | None = None
+    last_timestamp: datetime | None = None
+
+
+@router.post("/backfill", response_model=BackfillResponse)
+async def backfill_instrument_candles(
+    payload: BackfillRequest,
+    user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> BackfillResponse:
+    """Load an instrument's real price history from the market-data provider.
+
+    **This is the first caller `backfill_candles` has ever had.** The
+    function, the read-only `UpstoxMarketData` client and the
+    instrument-key resolution it depends on all existed; nothing in `app/`
+    invoked any of them, so the only candles a deployment could hold were
+    whatever a test had inserted. Everything downstream -- `ScannerWorker`,
+    `AutoTradeSupervisor`, the backtest engine, the paper engine's own feed
+    -- reads `candles` from Postgres and does not care where a bar came
+    from, which is exactly why one missing caller emptied all of them.
+
+    On-demand and admin-gated rather than a background loop, for the same
+    reason `POST /admin/portfolio-snapshot` is: the range to fetch is a
+    judgement call, provider history is rate-limited, and a real deployment
+    should drive this from its own scheduler. Idempotent, because
+    `upsert_candles` is a real upsert -- re-running an overlapping range
+    corrects bars rather than duplicating them.
+    """
+    if payload.from_date > payload.to_date:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "from_date must not be after to_date")
+
+    market_data, reason = market_data_provider_or_reason()
+    if market_data is None:
+        # 503, not 500: the deployment is misconfigured, not broken, and
+        # the message names the remedy rather than leaving an operator to
+        # read the traceback.
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, reason)
+
+    instrument = (
+        await db.execute(select(Instrument).where(Instrument.symbol == payload.symbol))
+    ).scalar_one_or_none()
+    if instrument is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"No instrument registered for {payload.symbol!r}")
+
+    try:
+        result = await backfill_candles(
+            db, market_data, instrument, payload.timeframe, payload.from_date, payload.to_date
+        )
+    except InstrumentKeyUnknown as exc:
+        # The instrument exists but carries no provider key: a 400 naming
+        # the instrument, not a 500 several layers from the cause.
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    except ValueError as exc:
+        # `upstox_interval_for` rejects a timeframe the provider does not
+        # serve, and says which ones it does.
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+
+    await record_audit(
+        db,
+        actor="user",
+        action="admin.candles_backfilled",
+        user_id=user.id,
+        details={
+            "symbol": result.symbol,
+            "timeframe": result.timeframe,
+            "candles_written": result.candles_written,
+            "from_date": payload.from_date.isoformat(),
+            "to_date": payload.to_date.isoformat(),
+        },
+    )
+    await db.commit()
+    return BackfillResponse(
+        symbol=result.symbol,
+        timeframe=result.timeframe,
+        candles_written=result.candles_written,
+        first_timestamp=result.first_timestamp,
+        last_timestamp=result.last_timestamp,
+    )

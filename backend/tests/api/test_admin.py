@@ -212,3 +212,142 @@ async def test_admin_can_view_and_trigger_the_three_level_kill_switch(require_in
             await clear_account_kill(account_id)
             await clear_strategy_kill(strategy_id)
             await _cleanup(admin_id)
+
+
+# --- POST /admin/backfill: the first caller backfill_candles ever had ------
+
+
+async def _make_admin(client: TestClient, label: str) -> tuple[dict, uuid.UUID]:
+    token, user_id = await _register(client, label)
+    async with async_session_factory() as db:
+        admin_user = await db.get(User, user_id)
+        admin_user.role = UserRole.ADMIN
+        await db.commit()
+    return {"Authorization": f"Bearer {token}"}, user_id
+
+
+class _StubMarketData:
+    """Stands in for `UpstoxMarketData`. Records the call and returns bars.
+
+    Deliberately not a mock of the HTTP layer: what this round wires is the
+    *call*, and the provider's own parsing is covered by its own tests.
+    """
+
+    def __init__(self, candles):
+        self.candles = candles
+        self.calls = []
+
+    async def get_historical_candles(self, key, interval, from_date, to_date):
+        self.calls.append((key, interval, from_date, to_date))
+        return self.candles
+
+
+async def test_backfill_writes_real_candles_through_the_endpoint(require_infra, monkeypatch):
+    """Behavioural proof, and the round's whole point.
+
+    `backfill_candles` had **no caller anywhere in app/** -- the function,
+    the read-only client and the instrument-key resolution all existed and
+    nothing invoked any of them, so the only candles a deployment could
+    hold were whatever a test had inserted. This drives the real route and
+    asserts the rows land in the store the scanner and the autonomous loop
+    actually read.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    import app.api.admin as admin_module
+    from app.database.models.instruments import Instrument, MarketType
+    from app.database.models.market import Candle as CandleRow
+    from app.market.repository import get_candles
+    from app.smc.types import Candle as SMCCandle
+
+    start = datetime(2026, 1, 5, 3, 45, tzinfo=timezone.utc)
+    bars = [SMCCandle(start + timedelta(minutes=i), 100.0, 101.0, 99.0, 100.5, 5000.0) for i in range(4)]
+    stub = _StubMarketData(bars)
+    monkeypatch.setattr(admin_module, "market_data_provider_or_reason", lambda: (stub, ""))
+
+    with TestClient(app) as client:
+        headers, admin_id = await _make_admin(client, "backfilladmin")
+        async with async_session_factory() as db:
+            instrument = Instrument(
+                symbol=f"BF{uuid.uuid4().hex[:6].upper()}",
+                exchange="NSE",
+                market=MarketType.EQUITY,
+                instrument_type="EQ",
+                broker_instrument_key="NSE_EQ|INE000A01001",
+            )
+            db.add(instrument)
+            await db.commit()
+            await db.refresh(instrument)
+            instrument_id, symbol = instrument.id, instrument.symbol
+
+        try:
+            r = client.post(
+                "/admin/backfill",
+                json={"symbol": symbol, "timeframe": "1m", "from_date": "2026-01-05", "to_date": "2026-01-06"},
+                headers=headers,
+            )
+            assert r.status_code == 200, r.text
+            assert r.json()["candles_written"] == 4
+
+            # The bars are in the store every downstream reader uses.
+            async with async_session_factory() as db:
+                stored = await get_candles(db, instrument_id, "1m")
+            assert len(stored) == 4
+
+            # ... and the provider was asked for the instrument's own key
+            # and the provider's own interval name, not this codebase's.
+            assert stub.calls == [("NSE_EQ|INE000A01001", "1minute", *stub.calls[0][2:])]
+        finally:
+            async with async_session_factory() as db:
+                await db.execute(delete(CandleRow).where(CandleRow.instrument_id == instrument_id))
+                await db.execute(delete(Instrument).where(Instrument.id == instrument_id))
+                await db.commit()
+            await _cleanup(admin_id)
+
+
+async def test_backfill_without_a_provider_says_what_to_configure(require_infra, monkeypatch):
+    """Control. A deployment with no token is misconfigured, not broken:
+    503 naming the remedy, never a 500 with a traceback."""
+    import app.api.admin as admin_module
+    import app.market.providers.factory as factory
+
+    # Drive the real factory with no token rather than hand-writing the
+    # reason string here: the point is that the message an operator sees
+    # is the one the factory actually produces.
+    class _NoToken:
+        upstox_data_access_token = None
+
+    monkeypatch.setattr(factory, "get_settings", lambda: _NoToken())
+    monkeypatch.setattr(
+        admin_module, "market_data_provider_or_reason", factory.market_data_provider_or_reason
+    )
+
+    with TestClient(app) as client:
+        headers, admin_id = await _make_admin(client, "noprovider")
+        try:
+            r = client.post(
+                "/admin/backfill",
+                json={"symbol": "ANY", "timeframe": "1m", "from_date": "2026-01-05", "to_date": "2026-01-06"},
+                headers=headers,
+            )
+            assert r.status_code == 503, r.text
+            assert "UPSTOX_DATA_ACCESS_TOKEN" in r.text
+        finally:
+            await _cleanup(admin_id)
+
+
+async def test_backfill_is_admin_only(require_infra):
+    """Control. This endpoint spends provider quota and writes to the
+    candle store every strategy reads; it must sit behind the same gate as
+    the rest of /admin."""
+    with TestClient(app) as client:
+        token, user_id = await _register(client, "notadminbf")
+        try:
+            r = client.post(
+                "/admin/backfill",
+                json={"symbol": "ANY", "timeframe": "1m", "from_date": "2026-01-05", "to_date": "2026-01-06"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert r.status_code == 403, r.text
+        finally:
+            await _cleanup(user_id)

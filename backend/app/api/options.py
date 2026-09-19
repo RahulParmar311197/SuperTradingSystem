@@ -35,7 +35,12 @@ from app.options.strategies import (
 from app.risk.kill_switch import load_kill_switch_state
 from app.risk.options_risk import OptionsRiskProposal, evaluate_options_risk
 from app.trading.order_manager import OrderRecord
-from app.trading.persistence import persist_order, persist_position, record_trade
+from app.trading.persistence import (
+    load_open_position_notionals_elsewhere,
+    persist_order,
+    persist_position,
+    record_trade,
+)
 
 router = APIRouter(prefix="/options", tags=["options"])
 
@@ -763,7 +768,18 @@ async def execute_options_strategy(
     # already prevents for POST /orders.
     stack._roll_risk_window(datetime.now(timezone.utc))
     open_positions = stack.position_manager.open_positions(str(user.id))
-    current_exposure = sum(abs(p.quantity) * p.average_price for p in open_positions)
+    # The third site that measures the account's exposure, and the one the
+    # round-158 change first missed: it wired `POST /orders` and
+    # `PaperTradingEngine` and left this one reading `stack.position_manager`
+    # alone, so an account auto-trading at its exposure limit could still
+    # put on options here. Same argument as the other two -- `positions.
+    # source_key` partitions the book while `max_exposure_pct` stays a
+    # percentage of the one account balance (blueprint §86, "Total
+    # exposure") -- and the same helper, so the three cannot drift.
+    elsewhere = await load_open_position_notionals_elsewhere(db, user.id, excluding_source_key="manual")
+    current_exposure = sum(abs(p.quantity) * p.average_price for p in open_positions) + sum(
+        abs(notional) for notional in elsewhere.values()
+    )
 
     risk_proposal = OptionsRiskProposal(
         account_id=str(user.id),

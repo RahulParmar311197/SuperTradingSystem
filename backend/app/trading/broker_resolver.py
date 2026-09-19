@@ -35,6 +35,26 @@ from app.core.encryption import decrypt_credentials
 from app.database.models.users import BrokerAccount, BrokerAccountStatus, BrokerName, User
 
 
+async def active_broker_account_id(db: AsyncSession, user_id: uuid.UUID) -> uuid.UUID | None:
+    """Which account `resolve_broker` would pick for this user right now,
+    or `None` if it would fall back to `MockBroker`.
+
+    Split out of `resolve_broker` so a caller holding a stack built earlier
+    can ask whether that stack is still the right one without decrypting
+    credentials or constructing an adapter. The ordering is `resolve_broker`'s
+    own, deliberately: two rules for "which account is live" would drift,
+    and the drift would be silent.
+    """
+    return (
+        await db.execute(
+            select(BrokerAccount.id)
+            .where(BrokerAccount.user_id == user_id, BrokerAccount.status == BrokerAccountStatus.ACTIVE)
+            .order_by(BrokerAccount.created_at.desc())
+            .limit(1)
+        )
+    ).scalars().first()
+
+
 async def resolve_broker(db: AsyncSession, user: User) -> tuple[Broker, uuid.UUID | None]:
     """Returns the resolved adapter alongside the `BrokerAccount.id` it was
     built from (`None` for `MockBroker`, since there's no connected account

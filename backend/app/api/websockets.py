@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
@@ -36,11 +37,13 @@ router = APIRouter(tags=["websocket"])
 SESSION_RECHECK_SECONDS = 30.0
 
 
-async def _authenticate(websocket: WebSocket) -> tuple[User, uuid.UUID] | None:
-    """The authenticated user and the session its token was issued from.
+async def _authenticate(websocket: WebSocket) -> tuple[User, uuid.UUID, datetime] | None:
+    """The authenticated user, the session its token was issued from, and
+    the moment that token expires.
 
-    The session id comes back with the user because authenticating once at
-    the handshake is not enough: see `_watch_for_revocation`.
+    Both come back with the user because authenticating once at the
+    handshake is not enough: see `_watch_for_revocation` and
+    `_watch_for_token_expiry`.
     """
     token = websocket.query_params.get("token")
     if not token:
@@ -59,13 +62,22 @@ async def _authenticate(websocket: WebSocket) -> tuple[User, uuid.UUID] | None:
     if not session_id:
         return None
 
+    # A token with no `exp` would open a stream with no deadline at all.
+    # `_create_token` always sets one, so this is unreachable through any
+    # token this codebase mints -- which is the reason to refuse rather
+    # than default it to something: a token that got here without one did
+    # not come from here.
+    exp = payload.get("exp")
+    if exp is None:
+        return None
+
     async with async_session_factory() as db:
         if await auth_service.get_active_session(db, uuid.UUID(session_id)) is None:
             return None
         user = await get_user_by_id(db, uuid.UUID(payload["sub"]))
     if user is None or user.status != UserStatus.ACTIVE:
         return None
-    return user, uuid.UUID(session_id)
+    return user, uuid.UUID(session_id), datetime.fromtimestamp(exp, tz=timezone.utc)
 
 
 async def _watch_for_revocation(session_id: uuid.UUID) -> None:
@@ -89,6 +101,32 @@ async def _watch_for_revocation(session_id: uuid.UUID) -> None:
         async with async_session_factory() as db:
             if await auth_service.get_active_session(db, session_id) is None:
                 return
+
+
+async def _watch_for_token_expiry(expires_at: datetime) -> None:
+    """Returns once the access token that opened this socket has expired.
+
+    The handshake verifies `exp` and nothing checked it again, so a stream
+    outlived the credential that opened it by as long as the client cared
+    to stay connected. Measured against the real endpoint with a
+    three-second token: after it expired, `GET /auth/sessions` with that
+    same token answered 401 and the socket went on delivering that user's
+    order events.
+
+    That matters more here than the usual "authenticate at the handshake"
+    shortcut suggests, because the token arrives as a `?token=` query
+    parameter (see this module's docstring) -- the one place credentials
+    routinely end up in proxy and server logs. A thirty-minute expiry is
+    the bound on what a leaked one is worth, and an unbounded stream of a
+    user's live orders and positions removes it.
+
+    A deadline rather than a poll: unlike revocation, which can happen at
+    any moment and has to be noticed, this instant is known at the
+    handshake.
+    """
+    remaining = (expires_at - datetime.now(timezone.utc)).total_seconds()
+    if remaining > 0:
+        await asyncio.sleep(remaining)
 
 
 async def _forward(websocket: WebSocket, channel: str) -> None:
@@ -117,15 +155,23 @@ async def _watch_for_disconnect(websocket: WebSocket) -> None:
             return
 
 
-async def _relay(websocket: WebSocket, channel: str, session_id: uuid.UUID | None = None) -> None:
+async def _relay(
+    websocket: WebSocket,
+    channel: str,
+    session_id: uuid.UUID | None = None,
+    token_expires_at: datetime | None = None,
+) -> None:
     await websocket.accept()
     tasks = {
         asyncio.ensure_future(_forward(websocket, channel)),
         asyncio.ensure_future(_watch_for_disconnect(websocket)),
     }
+    if token_expires_at is not None:
+        tasks.add(asyncio.ensure_future(_watch_for_token_expiry(token_expires_at)))
     if session_id is not None:
         # Whichever finishes first ends the connection: the client goes
-        # away, the channel errors, or the session is revoked under it.
+        # away, the channel errors, the session is revoked under it, or the
+        # token it was opened with expires.
         tasks.add(asyncio.ensure_future(_watch_for_revocation(session_id)))
     try:
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -152,8 +198,8 @@ async def _authenticated_relay(websocket: WebSocket, channel: str) -> None:
     if authenticated is None:
         await websocket.close(code=4401, reason="Unauthorized")
         return
-    _user, session_id = authenticated
-    await _relay(websocket, channel, session_id)
+    _user, session_id, expires_at = authenticated
+    await _relay(websocket, channel, session_id, expires_at)
 
 
 @router.websocket("/ws/market")
@@ -183,8 +229,8 @@ async def ws_orders(websocket: WebSocket) -> None:
     if authenticated is None:
         await websocket.close(code=4401, reason="Unauthorized")
         return
-    user, session_id = authenticated
-    await _relay(websocket, channel_name("orders", str(user.id)), session_id)
+    user, session_id, expires_at = authenticated
+    await _relay(websocket, channel_name("orders", str(user.id)), session_id, expires_at)
 
 
 @router.websocket("/ws/positions")
@@ -193,8 +239,8 @@ async def ws_positions(websocket: WebSocket) -> None:
     if authenticated is None:
         await websocket.close(code=4401, reason="Unauthorized")
         return
-    user, session_id = authenticated
-    await _relay(websocket, channel_name("positions", str(user.id)), session_id)
+    user, session_id, expires_at = authenticated
+    await _relay(websocket, channel_name("positions", str(user.id)), session_id, expires_at)
 
 
 @router.websocket("/ws/replay")
@@ -203,7 +249,7 @@ async def ws_replay(websocket: WebSocket, session_id: str) -> None:
     if authenticated is None:
         await websocket.close(code=4401, reason="Unauthorized")
         return
-    user, auth_session_id = authenticated
+    user, auth_session_id, expires_at = authenticated
     try:
         session_uuid = uuid.UUID(session_id)
     except ValueError:
@@ -219,4 +265,4 @@ async def ws_replay(websocket: WebSocket, session_id: str) -> None:
     if owned is None:
         await websocket.close(code=4404, reason="Replay session not found")
         return
-    await _relay(websocket, channel_name("replay", session_id), auth_session_id)
+    await _relay(websocket, channel_name("replay", session_id), auth_session_id, expires_at)

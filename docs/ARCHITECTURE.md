@@ -10613,6 +10613,69 @@ subscription lands reaches only the first socket. A separate probe
 confirmed two sockets on one channel do both receive once both are
 subscribed; the test now settles before publishing, and says why.
 
+## Disconnecting a broker did not stop orders going through it (round 157)
+
+`DELETE /brokers/{id}` marks the account DISCONNECTED and scrubs its stored
+credentials — in its own words, because "a disconnect prompted by a leaked
+or compromised token should not leave that token sitting in the row". But
+`_stack_for` resolved the broker once, at that user's first order, and the
+adapter built from that account lives in process memory already holding
+the token. The scrub protected the row; nothing touched the live adapter.
+
+Measured end to end on a PAPER connection, which stamps its account id on
+an order exactly as a real one does:
+
+```
+order 1 while connected  -> 201, broker_account_id = X
+DELETE /brokers/X        -> 204, row DISCONNECTED, credentials gone
+order 2 after that       -> 201, broker_account_id = X, still X
+only after a restart     -> broker_account_id = None
+```
+
+So the single action a user has for "stop trading through this broker" did
+not stop it, and with a real Upstox account those would be real orders
+through a token the user believes they have cut off. Both `_stack_for` and
+`disconnect_broker` carried a comment acknowledging the staleness as a
+documented limitation "the same as for connects" — which is true, and
+weighs connect and disconnect the same when only one of them is a safety
+control.
+
+This is the shape rounds 92 and 110 each fixed once: a revocation written
+to a column no live reader re-reads. The remedy is theirs — check at use,
+not only at build. `_stack_for` now asks which account the user trades
+through *now* (one indexed query, `active_broker_account_id`, split out of
+`resolve_broker` so the two cannot hold different rules about which
+account is live) and rebuilds the stack when it differs from the one the
+cached stack was built from.
+
+Comparing account ids rather than watching for a disconnect covers connect
+and reconnect with the same query, which matters more than it sounds:
+reconnecting after a token expires creates a *new* row rather than
+reviving the old one, so the fix for "my broker connection broke" also
+needed a restart before this.
+
+Rebuilding mid-session is only safe because the build path rehydrates
+everything the discarded stack knew — the position book (round 78), the
+order idempotency index (round 206) and the day's risk counters (rounds
+154–155). A test asserts exactly that, because if any of those stopped
+being rebuilt, this change would quietly hand an account a fresh day's
+allowance every time it disconnected a broker. A second test pins the
+other side on object identity: an unchanged connection keeps the *same*
+stack, so this is a targeted rebuild and not a rebuild on every request.
+
+The round began as an authorization sweep, which came back **clean** and
+is worth recording as a negative result: every `/admin/*` route is gated on
+`require_admin`; every route taking a resource id scopes it to the caller
+(the two that do not, `GET /charts/{instrument_id}/smc` and `/ict`, take an
+*instrument* id, which is shared market data and owned by nobody); the
+`/ws/*` channels authenticate through `_authenticate`; and the Upstox
+OAuth callback validates a single-use `state` popped from Redis rather
+than trusting the redirect. The first version of that sweep reported
+sixteen unauthenticated routes, all false positives — it matched
+`Depends(get_current_user)` but not the factory form
+`Depends(require_permission(...))`. Worth writing down: a sweep's dirty
+result needs verifying as much as a clean one.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

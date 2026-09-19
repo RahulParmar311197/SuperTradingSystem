@@ -144,12 +144,28 @@ async def test_a_live_entry_with_a_stop_does_not_halt_its_own_account(require_in
                 db.add(Instrument(symbol=symbol, exchange="NSE", market=MarketType.EQUITY, instrument_type="EQ"))
                 await db.commit()
 
-            assert client.get("/orders", headers=headers).status_code == 200
+            # Connect BEFORE the stack is built, and use a PAPER
+            # connection. Both matter, and both used to be the other way
+            # round: this connected UPSTOX *after* a `GET /orders` had
+            # already built the stack against `MockBroker`, and relied on
+            # the stack never noticing -- so it claimed to test an Upstox
+            # account while actually exercising `MockBroker`, and would
+            # reach for the network the moment the stack stopped being
+            # stale. `_stack_for` now re-resolves, so the stack must be
+            # built from the account this test means to use.
+            #
+            # PAPER keeps `set_quote` available (it resolves to
+            # `MockBroker`, with its account id attached) and changes
+            # nothing about what is under test:
+            # `reconcile_all_connected_accounts` selects every ACTIVE
+            # `BrokerAccount` whatever its broker name, and reconciles it
+            # against `stack.broker`.
             assert client.post(
                 "/brokers/connect",
-                json={"broker": "UPSTOX", "credentials": {"access_token": "irrelevant-for-this-test"}},
+                json={"broker": "PAPER", "credentials": {}},
                 headers=headers,
             ).status_code == 201
+            assert client.get("/orders", headers=headers).status_code == 200
 
             stack = all_stacks()[user_id]
             stack.broker.set_quote(symbol, ltp=100.0)

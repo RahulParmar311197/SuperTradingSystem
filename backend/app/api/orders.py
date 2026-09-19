@@ -28,7 +28,7 @@ from app.trading.protective_stops import ensure_protective_stop
 from app.risk.limits import RiskLimits
 from app.risk.liquidity import assess_equity_liquidity
 from app.risk.portfolio import compute_correlated_exposure, signed_notionals_excluding
-from app.trading.broker_resolver import resolve_broker
+from app.trading.broker_resolver import active_broker_account_id, resolve_broker
 from app.trading.execution import ExecutionEngine
 from app.trading.order_manager import OrderManager
 from app.trading.persistence import (
@@ -186,6 +186,37 @@ async def _stack_for(user: User, db: AsyncSession) -> _UserTradingStack:
     manager, not Postgres). A per-user lock serializes stack creation;
     `dict.setdefault` for the lock itself is safe since plain dict access
     between two `await` points can't interleave on one event loop."""
+    # Has the account this stack was built from stopped being the one the
+    # user trades through? `DELETE /brokers/{id}` marks a row DISCONNECTED
+    # and scrubs its stored credentials -- explicitly because "a disconnect
+    # prompted by a leaked or compromised token should not leave that token
+    # sitting in the row" -- but the adapter built from it lives here, in
+    # memory, already holding that token. Measured end to end on a PAPER
+    # connection, which stamps its account id the same way a real one does:
+    #
+    #   order 1 while connected  -> 201, broker_account_id = X
+    #   DELETE /brokers/X        -> 204, row DISCONNECTED, credentials gone
+    #   order 2 after that       -> 201, broker_account_id = X, still X
+    #   only after a restart     -> broker_account_id = None
+    #
+    # So the one action a user has for "stop trading through this broker"
+    # did not stop it, and with a real Upstox account those orders are real.
+    # This is the shape rounds 92 and 110 already fixed twice -- a
+    # revocation written to a column that the live reader never re-reads --
+    # and the remedy is theirs: check at use, not only at build.
+    #
+    # Comparing account ids rather than watching for a disconnect covers
+    # connect and reconnect with the same query: whatever changed, the
+    # stack is rebuilt from what the database says now. Rebuilding is safe
+    # to do mid-session precisely because the build path rehydrates the
+    # position book, the order idempotency index and the day's risk
+    # counters from Postgres -- a rebuilt stack knows everything the
+    # discarded one did.
+    current_account_id = await active_broker_account_id(db, user.id)
+    cached = _STACKS.get(user.id)
+    if cached is not None and cached.broker_account_id != current_account_id:
+        _STACKS.pop(user.id, None)
+
     if user.id not in _STACKS:
         lock = _STACK_LOCKS.setdefault(user.id, asyncio.Lock())
         async with lock:

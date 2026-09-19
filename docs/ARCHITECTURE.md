@@ -10423,6 +10423,79 @@ and zero audit rows on both of two attempts. A test pins it, because the
 same injection that commits the claim early turns it into a real false
 alarm.
 
+## A restart cleared the day's risk counters, lifting the daily gates (round 154)
+
+`_stack_for` (`app/api/orders.py`) already rebuilt two things from
+Postgres when a process came up: the open position book, and the order
+manager's idempotency index. Both were added for one reason — a restart
+must not lift a limit. The counters that *are* the daily limits were left
+behind. `trades_today`, `daily_pnl` and `weekly_pnl` started at `0.0` on
+every stack build, and nothing ever read them back from the journal.
+
+Measured through the real endpoint on the default limits:
+
+```
+10 orders placed -> #11 is 403 "10 trades today vs limit 10"
+restart          -> #12 fills 201, trades_today reads 1, 11 orders journalled
+
+realized -2500 (2.50% vs the 2.0% daily limit)
+                 -> 403 "Daily loss 2.50% vs limit 2.0%"
+restart          -> the same order fills 201, daily_pnl reads 0.00, against
+                    a -2500 row in the trades journal
+```
+
+The second one is the daily circuit breaker — the gate whose whole job is
+to stop an account bleeding out on a bad day — being cleared by a deploy,
+an OOM kill or a crash loop. A crash loop clears it again on every pass.
+
+Round 72 fixed the *opposite* direction of the same limit: counters that
+never reset, so "daily" really meant "since the last deploy". Its own
+write-up noted in passing that "in practice these counters only ever
+cleared on a restart" and treated that as the status quo rather than as
+the other half of the defect. This is that other half.
+
+The fix rebuilds all three at stack build from the journal that already
+holds them, over exactly the windows `_roll_risk_window` measures:
+`trades_today` is a row count over `orders` since the UTC day boundary,
+and the two P&L figures sum `trades.pnl` since the day and ISO-week
+boundaries. Neither is an approximation of the in-memory counter — they
+are the same numbers by construction. `place_order` increments
+`trades_today` once per order it actually creates, and `persist_order`
+writes exactly one row per such order (it is idempotent on
+`idempotency_key`, so a deduped resubmit updates the row and increments
+nothing either); and `stack.daily_pnl += realized_delta` passes that same
+`realized_delta` to `record_trade` as `pnl`.
+
+Three details are load-bearing, and each has a test because an injection
+proved it so:
+
+- **The window keys are set at build too.** `_roll_risk_window` only
+  resets when the day key *changes*, so leaving `_risk_day` at `None`
+  would have the next day's first order adopt that day's key without
+  resetting — carrying a spent allowance into a day it does not belong
+  to. Round 72's fix and this one have to hold simultaneously.
+- **The P&L query filters on `journal.source = 'manual_order'`.**
+  `execution_mode` cannot separate these: a manual stack with no
+  connected broker trades against `MockBroker` and persists as PAPER, the
+  same mode `/paper/*` and the auto-trade worker use. Without the filter a
+  restart would *add* losses the running counter never had — a different
+  wrong answer, not a smaller one. (Whether an account's paper and
+  auto-trading losses *should* gate its manual orders is a real question,
+  and a separate one; it is the same shape as the open question about
+  `POST /orders` using `RiskLimits()` defaults rather than the user's
+  configured limits.)
+- **Day and week are different windows.** Measuring both from the day
+  boundary would leave `max_weekly_loss_pct` seeing only today.
+
+Two of the ten injections escaped the first time round, and both were
+gaps in the tests rather than in the fix. Measuring the weekly counter
+from the day boundary changed nothing, because no test read
+`stack.weekly_pnl` at all — only the loader beneath it. And removing the
+`execution_mode` filter changed nothing, because every account in the
+suite trades against `MockBroker` and is therefore PAPER, so there was no
+LIVE row anywhere for the filter to exclude. Both now have tests that
+fail under those injections.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

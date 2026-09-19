@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.orders import _execution_mode_for, _stack_for
+from app.api.orders import _execution_mode_for, _stack_for, serialize_user_trading
 from app.auth.dependencies import get_current_user, require_permission
 from app.brokers.mock import MockBroker
 from app.core.audit import record_audit
@@ -605,6 +605,10 @@ async def execute_options_strategy(
     payload: ExecuteOptionsStrategyRequest,
     user: User = Depends(require_permission(TradingPermission.LIVE_TRADE)),
     db: AsyncSession = Depends(get_db),
+    # Shares `POST /orders`' per-user stack, so it shares its lock too --
+    # see `serialize_user_trading`. Without it, concurrent calls read the
+    # same pre-fill exposure and every one of them passes the same gate.
+    _serialized: None = Depends(serialize_user_trading),
 ) -> ExecuteOptionsStrategyResponse:
     """Submits every leg of a multi-leg options strategy (blueprint §37,
     §120) as real orders through the same broker/risk/persistence

@@ -83,11 +83,60 @@ async def refresh(db: AsyncSession, refresh_token: str) -> tuple[str, str]:
     if not session_id or not user_id:
         raise AuthError("Invalid refresh token")
 
+    # Claim the rotation ATOMICALLY rather than read-check-write.
+    #
+    # This used to be: SELECT the session, check `revoked`, and much later
+    # (after `get_user_by_id` and `_issue_tokens`) set `session.revoked =
+    # True`. Two concurrent refreshes presenting the same token both read
+    # `revoked=False`, both passed, and both issued a fresh pair -- and
+    # neither tripped the reuse detection below, because neither ever saw
+    # a revoked session. Measured on the real ASGI app, two concurrent
+    # POSTs with one token (it is a race, so it does not reproduce every
+    # run):
+    #
+    #     sequential:  200, 401 -> 2 sessions, 0 live, 1 reuse audit row
+    #     concurrent:  200, 200 -> 3 sessions, 2 LIVE, 0 reuse audit rows
+    #
+    # That is precisely the case this detection exists for. Blueprint §69
+    # and round 84's reasoning both start from "a legitimate client and a
+    # thief racing to use the same token" -- and racing was the one thing
+    # that slipped through.
+    #
+    # A single conditional UPDATE decides the winner in the database, so
+    # the guarantee does not depend on both requests landing in one
+    # process: Postgres serializes two writers on the same row, and the
+    # loser matches zero rows. That matters here more than for the
+    # in-process lock round 152 added to `POST /orders` -- auth has to
+    # hold across every replica.
+    #
+    # The hash is part of the WHERE clause rather than checked afterwards
+    # so the claim is correct on its own terms: a request naming a real
+    # session id with the wrong token matches zero rows and cannot touch
+    # that session. Removing it changes no observable behaviour today --
+    # measured, identical results either way -- because every path that
+    # refuses raises, and that rolls the claim back. But that safety is a
+    # property of code some distance from here. Injecting the predicate
+    # away together with a commit of the claim before those refusal checks
+    # does break the forged-token tests, where either injection alone does
+    # not; see test_a_forged_token_racing_the_real_one_cannot_lock_the_
+    # victim_out.
+    claimed = await db.execute(
+        update(UserSession)
+        .where(
+            UserSession.id == uuid.UUID(session_id),
+            UserSession.revoked.is_(False),
+            UserSession.refresh_token_hash == hash_token(refresh_token),
+        )
+        .values(revoked=True)
+        .returning(UserSession.id)
+    )
+    won_the_rotation = claimed.scalar_one_or_none() is not None
+
     result = await db.execute(select(UserSession).where(UserSession.id == uuid.UUID(session_id)))
     session = result.scalar_one_or_none()
     token_matches = session is not None and session.refresh_token_hash == hash_token(refresh_token)
 
-    if token_matches and session.revoked:
+    if token_matches and not won_the_rotation:
         # Reuse of a refresh token that already rotated (or was logged
         # out) is the textbook signal that it was stolen: a legitimate
         # client and a thief racing to use the same token, or a thief
@@ -117,15 +166,19 @@ async def refresh(db: AsyncSession, refresh_token: str) -> tuple[str, str]:
         await db.commit()
         raise AuthError("Refresh token is no longer valid")
 
-    if session is None or session.revoked or not token_matches or session.expires_at < datetime.now(timezone.utc):
+    if session is None or not token_matches or session.expires_at < datetime.now(timezone.utc):
+        # `session.revoked` is deliberately NOT tested here any more: the
+        # UPDATE above set it, so this request's own claim would fail its
+        # own check. Losing the claim is the `not won_the_rotation` branch
+        # above, and every other reason to refuse is covered by these three.
         raise AuthError("Refresh token is no longer valid")
 
     user = await get_user_by_id(db, uuid.UUID(user_id))
     if user is None:
         raise AuthError("User not found")
 
-    # Rotate: revoke the used refresh token and issue a new pair.
-    session.revoked = True
+    # Already revoked by the claiming UPDATE above -- issuing the new pair
+    # is all that is left.
     return await _issue_tokens(db, user, device_info=session.device_info)
 
 

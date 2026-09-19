@@ -10343,6 +10343,86 @@ race end to end needs registered contracts and fresh `option_snapshots`
 rows, so what is asserted there is that it is wired to the same mechanism,
 with the mechanism itself proven behaviourally on `/orders`.
 
+## Concurrent refresh defeated the refresh-token reuse detection (round 153)
+
+Round 84 added refresh-token reuse detection: presenting a refresh token
+that has already rotated revokes every session the user has and writes an
+`auth.refresh_token_reuse_detected` audit row, because a token used twice
+is the textbook signal that it was stolen. The reasoning behind it starts
+from one scenario — a legitimate client and a thief racing to use the same
+token — and racing was the one case it did not cover.
+
+`refresh` was read-check-write: SELECT the session, check `revoked`, and
+much later (after `get_user_by_id` and `_issue_tokens`) set
+`session.revoked = True`. Two concurrent requests carrying the same token
+both read `revoked=False`, both passed, and both issued a fresh pair.
+Neither tripped the detection, because neither ever saw a revoked session.
+Measured on the real ASGI app:
+
+    sequential:  200, 401 -> 2 sessions, 0 live, 1 reuse audit row
+    concurrent:  200, 200 -> 3 sessions, 2 LIVE, 0 reuse audit rows
+
+Repeated 20 times, the concurrent case violated the invariant in 19 runs
+before the fix and 0 after. In plain terms: a stolen refresh token used at
+the same moment as the legitimate one handed the thief a live session and
+raised no alarm at all — the detection was reliable against a slow replay
+and absent against the fast one.
+
+The fix claims the rotation atomically, with one conditional UPDATE:
+
+    UPDATE user_sessions SET revoked = true
+     WHERE id = :sid AND revoked IS false AND refresh_token_hash = :hash
+     RETURNING id
+
+The loser matches zero rows, and `token_matches and not won_the_rotation`
+is now what the reuse branch tests. Unlike round 152's per-user
+`asyncio.Lock` on `POST /orders`, which makes one process correct, this
+one is decided in Postgres: authentication has to hold across every
+replica, so the claim belongs in the row, not in the process. Two
+consequences follow in the code and are commented there: `session.revoked`
+is no longer part of the final guard (this request's own claim would fail
+it), and the trailing assignment is gone.
+
+Three things the injections established, including one that contradicted
+what was being claimed:
+
+The headline test was **vacuous when first written**. Reverting `refresh`
+to the original read-check-write left all nine tests green, even though
+the bug reproduces 19 times in 20 outside pytest. The cause is specific to
+the suite: `tests/conftest.py` disposes the engine after every test — it
+has to, or the run exhausts Postgres connections — so each test begins
+with an empty pool. The first of two concurrent requests gets a connection
+that is already open; the second must establish one, TCP and auth
+handshake included, which costs more than the first request's entire
+transaction. They never overlap. Measured on the original code, varying
+only pool warmth: cold gave `[200, 401]` once then `[200, 200]` five
+times — the single serialized result being the very first iteration — and
+warm gave `[200, 200]` six times. The tests now open four pooled
+connections before racing anything, which is what a running server looks
+like. Injecting the original code back then fails four tests.
+
+The hash predicate in the claim's WHERE clause is **not load-bearing
+today**, and the test written to prove it was is a corrected claim rather
+than a confirmed one. Removing it yields identical measured results
+(`forged=401 real=200, sessions=2, live=1, reuse_audits=0`, four runs
+each way), because Postgres row-locks the two claims: the forged request
+holds the row, every refusal path raises, that rolls its claim back, and
+the real refresh's UPDATE then re-evaluates against an unrevoked row and
+wins. It is kept anyway for a reason the injections do show: removing it
+*together with* committing the claim before the refusal checks fails all
+four forged-token assertions, where either injection alone leaves them
+green. Claiming on the session id alone is safe only while nothing between
+the claim and the refusal ever commits — an invisible property of code
+some distance away; claiming on the hash is safe on its own terms.
+
+An expired token does **not** false-alarm as theft, which was predicted to
+regress and measured not to. The claim runs before the expiry check, so it
+momentarily marks the row revoked, but that write rides the request's
+transaction and is discarded when the expiry check raises: `revoked=False`
+and zero audit rows on both of two attempts. A test pins it, because the
+same injection that commits the claim early turns it into a real false
+alarm.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

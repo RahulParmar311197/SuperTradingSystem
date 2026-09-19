@@ -10703,10 +10703,23 @@ again as the limit allows, and the gate recorded a pass. After the fix the
 same order is refused: `Projected exposure 114.42% vs limit 100.0%`.
 
 `load_open_position_notionals_elsewhere` (app/trading/persistence.py)
-returns `{symbol: signed notional}` for the account's other engines, and
-both `POST /orders` and `PaperTradingEngine` add it to `current_exposure`.
+returns `{symbol: signed notional}` for the account's other engines.
 Blueprint §86 is titled *Portfolio* Risk and asks for *Total* exposure, so
 this is the blueprint's own reading rather than a new policy.
+
+**Three** sites build a risk proposal carrying `current_exposure`, and all
+three take the union: `POST /orders`, `PaperTradingEngine._maybe_enter`
+and `POST /options/execute`. That count is the point. The change that
+introduced the union wired the first two and shipped, leaving the options
+path measuring one partition for a release — an account auto-trading at
+its exposure limit could still put on options. `tests/api/
+test_cross_engine_exposure.py` now asserts the set of sites structurally
+(labelled as such, since exercising `POST /options/execute` end to end
+needs registered `option_contracts` and fresh `option_snapshots` rows),
+so a fourth site cannot appear without the union. The first version of
+that structural check was itself vacuous — it looked for the helper's
+name, which the leftover `import` line satisfied even with the call
+deleted — so it now asserts the call and the union expression.
 
 Two scoping decisions are deliberate, and each has a test so it reads as a
 decision rather than an omission:

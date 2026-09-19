@@ -447,6 +447,55 @@ async def test_a_closed_position_is_not_exposure(require_infra):
             await _cleanup([user_id], [instrument.id])
 
 
+def test_every_site_that_measures_account_exposure_takes_the_union():
+    """STRUCTURAL, and labelled as such.
+
+    There are three places that build a risk proposal carrying
+    `current_exposure`: `POST /orders`, `PaperTradingEngine._maybe_enter`
+    and `POST /options/execute`. The first two are proven behaviourally
+    above. The third is asserted structurally for the same reason round 152
+    gave when it covered this endpoint the same way: exercising
+    `POST /options/execute` end to end needs registered `option_contracts`
+    and fresh `option_snapshots` rows, and the mechanism it would be
+    proving is already proven behaviourally on the other two.
+
+    This test exists because the change that introduced the union wired two
+    of the three and shipped: the options path kept measuring one partition
+    for a whole release. A count is what catches a fourth site appearing
+    without the union, which is exactly how the third was missed."""
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[2] / "app"
+    sites = {
+        "api/orders.py": root / "api/orders.py",
+        "paper/engine.py": root / "paper/engine.py",
+        "api/options.py": root / "api/options.py",
+    }
+    # The CALL and the union expression, not merely the name: checking for
+    # the bare name passes on the leftover `from ... import` line alone,
+    # which is exactly how the first version of this test let a revert of
+    # the options path through with every test still green.
+    missing = [
+        name
+        for name, path in sites.items()
+        if "load_open_position_notionals_elsewhere(" not in path.read_text()
+        or "abs(notional) for notional in elsewhere.values()" not in path.read_text()
+    ]
+    assert not missing, (
+        f"these sites measure account exposure without unioning the other engines' "
+        f"positions: {missing}"
+    )
+
+    # Nothing else may compute `current_exposure` off a bare position
+    # manager -- a fourth site would be the same bug again.
+    computing = sorted(
+        path.relative_to(root).as_posix()
+        for path in root.rglob("*.py")
+        if "current_exposure = sum(" in path.read_text()
+    )
+    assert computing == ["api/options.py", "api/orders.py", "paper/engine.py"], computing
+
+
 def test_the_account_backed_partitions_are_named_not_inferred():
     """A new engine that mirrors into `positions` joins the account's
     exposure only by being named here -- deliberately, so adding one is a

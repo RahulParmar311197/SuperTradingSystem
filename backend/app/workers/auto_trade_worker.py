@@ -366,6 +366,7 @@ class AutoTradeSupervisor:
                 position_manager=position_manager,
                 strategy_id=str(strategy_row.id),
                 risk_window=risk_window,
+                source_key=AUTO_SOURCE_KEY,
             )
             self._engines[key] = engine
             self._engine_strategy_versions[key] = strategy_row.version

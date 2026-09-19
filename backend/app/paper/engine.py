@@ -7,6 +7,7 @@ rejections are simulated by the underlying `MockBroker`).
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Literal
@@ -28,6 +29,7 @@ from app.strategy.context import EvaluationContext
 from app.strategy.dsl import StrategyDefinition
 from app.strategy.engine import StrategyEngine, StrategyEvaluationResult
 from app.trading.execution import ExecutionEngine
+from app.trading.persistence import load_open_position_notionals_elsewhere
 from app.trading.order_manager import OrderManager
 from app.trading.position_manager import PositionManager
 
@@ -163,7 +165,15 @@ class PaperTradingEngine:
         position_manager: PositionManager | None = None,
         strategy_id: str | None = None,
         risk_window: RiskWindow | None = None,
+        source_key: str | None = None,
     ) -> None:
+        # Which `positions.source_key` partition this engine owns, when it
+        # has one. Used only to measure the account's exposure held by the
+        # OTHER engines (see `_maybe_enter`), so `None` -- a bare engine
+        # with no database row behind it, as every unit test here builds --
+        # simply means "no other book to union in", never a fabricated
+        # zero standing in for a real one.
+        self.source_key = source_key
         self.strategy = strategy
         # The `strategies.id` UUID this engine is running, as a string --
         # the identity the rest of the platform uses for a strategy
@@ -312,7 +322,22 @@ class PaperTradingEngine:
         # defeating RiskLimits.max_open_positions/max_exposure_pct as
         # account-wide caps on unattended autonomous trading.
         open_positions = self.position_manager.open_positions(self.account_id)
-        current_exposure = sum(abs(p.quantity) * p.average_price for p in open_positions)
+        # The account's exposure is every engine's positions, not this
+        # one's -- the same union `app/api/orders.py` takes, and for the
+        # same reason: `positions.source_key` partitions the book while
+        # `max_exposure_pct` stays a percentage of the one account balance
+        # (blueprint §86, "Total exposure"). Without it a user auto-trading
+        # at their exposure limit could place manual orders up to the limit
+        # again; measured at 145.6% of a 100,000 account against a 100%
+        # limit, with the gate recording a pass.
+        elsewhere: dict[str, float] = (
+            await load_open_position_notionals_elsewhere(db, uuid.UUID(self.account_id), excluding_source_key=self.source_key)
+            if db is not None and self.source_key is not None
+            else {}
+        )
+        current_exposure = sum(abs(p.quantity) * p.average_price for p in open_positions) + sum(
+            abs(notional) for notional in elsewhere.values()
+        )
         # Notional this specific strategy already has open, across every
         # symbol it trades -- not just `self.symbol` (this method already
         # returned early above if that one has an open position). Only
@@ -335,6 +360,23 @@ class PaperTradingEngine:
         # the two cannot drift. Signed -- negative for a short -- because
         # `correlated_exposure` nets; the gross limit is separate.
         other_position_notionals = signed_notionals_excluding(open_positions, self.symbol)
+        # Signed, and merged by addition, for the reasons given at the
+        # matching lines in app/api/orders.py.
+    # NOT load-bearing today, and that is measured rather than assumed:
+    # removing this merge leaves every test in
+    # tests/api/test_cross_engine_exposure.py green. `correlated_exposure`
+    # is a netted subset of the gross notional, so it can never exceed
+    # `current_exposure`, and `max_correlated_exposure_pct` and
+    # `max_exposure_pct` both default to 100 -- the gross gate above always
+    # decides first. It is kept because it is the same account-level
+    # argument (blueprint §85/§86) and becomes load-bearing the moment
+    # those two limits can differ, which is exactly what making the manual
+    # path's `RiskLimits` user-configurable would do.
+        for other_symbol, notional in elsewhere.items():
+            if other_symbol != self.symbol:
+                other_position_notionals[other_symbol] = (
+                    other_position_notionals.get(other_symbol, 0.0) + notional
+                )
         correlated_exposure = (
             await compute_correlated_exposure(
                 db,

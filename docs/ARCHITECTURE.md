@@ -10559,6 +10559,60 @@ without ever rolling it, which is why the same injection bites there. The
 marks are kept anyway: a window whose counters cover today should say so
 on its own terms rather than depend on a call made somewhere else.
 
+## An open WebSocket outlived the access token that opened it (round 156)
+
+Round 110 made session *revocation* reach open streams: the handshake
+check alone left revocation applying to REST and not to sockets. The
+token's own expiry was left in exactly that state. `_authenticate`
+verifies `exp` once, and nothing checked it again, so a stream ran for as
+long as the client cared to stay connected on a thirty-minute credential.
+
+Measured against the real endpoint with a three-second token:
+
+```
+while valid:  socket received the published order event
+after expiry: GET /auth/sessions with the same token -> 401
+after expiry: the SOCKET still delivered that user's order event
+```
+
+That matters more than the usual "authenticate at the handshake" shortcut
+suggests, because the token arrives as a `?token=` query parameter — the
+one place credentials routinely end up in proxy and server logs. The
+thirty-minute expiry is the bound on what a leaked token is worth, and an
+unbounded stream of a user's live orders and positions removes it.
+
+The fix is a deadline task in `_relay`, beside the revocation watcher. The
+two are deliberately different shapes: revocation can happen at any moment
+and has to be noticed, so it polls; expiry is an instant already known at
+the handshake, so it sleeps to it. All seven channels go through one
+`_authenticate`/`_relay` pair, so one change covers `/ws/orders`,
+`/ws/positions`, `/ws/replay` and the four that reach `_relay` via
+`_authenticated_relay`. A token carrying no `exp` at all is now refused at
+the handshake rather than defaulted: `_create_token` always sets one, so
+such a token did not come from here, and defaulting would hand it a stream
+with no deadline.
+
+**The tests could hang, and did.** The first injection run of this file
+was killed after twenty minutes having reported nothing.
+`WebSocketTestSession.receive` blocks on an unbounded `queue.get()`, so
+every injection that left a socket *open* turned
+`pytest.raises(WebSocketDisconnect)` into an indefinite wait. This is
+round 152's lesson arriving by a different door — a control that hangs
+proves nothing — and the remedy is the same: every read in that file now
+goes through a bounded helper mirroring starlette's own `receive_json`
+(`_send_queue` → `_raise_on_close` → `json.loads`) with a deadline on the
+one call that lacks it. The same six injections then ran to completion in
+about two and a half minutes, and all six fail.
+
+One test needed correcting along the way, and it was the test's fault
+rather than the fix's: two sockets opened back to back on one channel,
+with a publish immediately after, left the second one missing the
+message. A relay subscribes to Redis after its handshake returns and
+pub/sub has no history, so a message published before the second
+subscription lands reaches only the first socket. A separate probe
+confirmed two sockets on one channel do both receive once both are
+subscribed; the test now settles before publishing, and says why.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

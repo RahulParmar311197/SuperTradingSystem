@@ -290,6 +290,83 @@ async def record_trade(
     return row
 
 
+# The `positions.source_key` partitions that are the ACCOUNT's own book,
+# and so share its balance: the manual/live stack in `app/api/orders.py`
+# and the autonomous loop in `app/workers/auto_trade_worker.py`.
+#
+# `paper:<session_id>` is deliberately absent. A `POST /paper` session is a
+# sandbox the user spins up with its OWN `starting_balance`; its positions
+# consume none of the account's capital, so counting them toward the
+# account's exposure would refuse real trades over simulated ones, and
+# feeding the account's real positions into the sandbox would make the
+# simulation answer a question nobody asked.
+ACCOUNT_BACKED_SOURCE_KEYS: tuple[str, ...] = ("manual", "auto")
+
+
+async def load_open_position_notionals_elsewhere(
+    db: AsyncSession,
+    user_id: uuid.UUID,
+    *,
+    excluding_source_key: str,
+) -> dict[str, float]:
+    """`{symbol: signed notional}` for this user's open positions held by
+    the other ACCOUNT-BACKED engines -- `ACCOUNT_BACKED_SOURCE_KEYS` minus
+    `excluding_source_key`.
+
+    Blueprint §86 calls exposure a **portfolio** quantity -- "Total
+    exposure" -- and `max_exposure_pct` is a percentage of the account
+    balance. The account has one balance, so the denominator is shared
+    even though the book is not.
+
+    It was not shared in practice. `positions.source_key` partitions the
+    table so three independent `PositionManager`s stop overwriting each
+    other's rows (see `persist_position`), and each engine then rebuilt
+    only its own partition and measured exposure against that. Measured
+    through the real endpoints and the real `AutoTradeSupervisor`, one
+    account on a 100,000 balance with `max_exposure_pct=100`:
+
+        auto positions open   : 3     gross  93,636.36
+        manual POST /orders   : 201   exposure_limit recorded True
+        manual stack sees     : 1 position, exposure 52,000.00
+        TOTAL gross notional  : 145,636.36   = 145.6% of the account
+
+    Each path was under its own limit and the account was half as levered
+    again as the limit allows, with the gate recording a pass.
+
+    Signed -- negative for a short -- to match
+    `app.risk.portfolio.signed_notionals_excluding`, whose output this is
+    merged with: `correlated_exposure` nets, so an `abs()` here would turn
+    a hedge held by the other engine into double concentration. Callers
+    take `abs()` themselves for the gross figure.
+
+    Deliberately NOT filtered by `execution_mode`: all three writers
+    persist as `ExecutionMode.PAPER` when no broker is connected, which is
+    every account's default, so filtering on it would drop exactly the
+    rows this exists to find. The `float()` casts are for the same reason
+    `load_open_positions` needs them -- `Numeric(18, 6)` comes back as
+    `Decimal`.
+    """
+    rows = (
+        await db.execute(
+            select(PositionRow.quantity, PositionRow.average_price, InstrumentRow.symbol)
+            .join(InstrumentRow, InstrumentRow.id == PositionRow.instrument_id)
+            .where(
+                PositionRow.user_id == user_id,
+                PositionRow.source_key.in_(ACCOUNT_BACKED_SOURCE_KEYS),
+                PositionRow.source_key != excluding_source_key,
+                PositionRow.is_open.is_(True),
+            )
+        )
+    ).all()
+
+    # Summed rather than assigned: two engines can each hold a position in
+    # the same symbol, and they net for the same reason a hedge does.
+    notionals: dict[str, float] = {}
+    for quantity, average_price, symbol in rows:
+        notionals[symbol] = notionals.get(symbol, 0.0) + float(quantity) * float(average_price)
+    return notionals
+
+
 async def load_open_positions(
     db: AsyncSession,
     user_id: uuid.UUID,

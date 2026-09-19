@@ -32,6 +32,7 @@ from app.trading.broker_resolver import active_broker_account_id, resolve_broker
 from app.trading.execution import ExecutionEngine
 from app.trading.order_manager import OrderManager
 from app.trading.persistence import (
+    load_open_position_notionals_elsewhere,
     ORDER_REHYDRATION_WINDOW,
     load_open_positions,
     load_orders_placed_since,
@@ -542,13 +543,53 @@ async def place_order(
 
     account = await stack.broker.get_account()
     open_positions = stack.position_manager.open_positions(str(user.id))
-    current_exposure = sum(abs(p.quantity) * p.average_price for p in open_positions)
+    # The account's exposure is every engine's positions, not this one's.
+    #
+    # `positions.source_key` partitions the table so the manual stack, each
+    # `PaperTradingEngine` and `AutoTradeSupervisor` stop overwriting each
+    # other's rows -- and each then rebuilt only its own partition, so
+    # `current_exposure` here counted manual positions alone. Blueprint §86
+    # calls exposure a *portfolio* quantity, and `max_exposure_pct` is a
+    # percentage of the account balance, which is shared even though the
+    # book is not. Measured before this line existed, 100,000 balance,
+    # `max_exposure_pct=100`, three auto positions already open:
+    #
+    #     auto gross      93,636.36
+    #     this order      52,000.00 -> 201, exposure_limit recorded True
+    #     account total  145,636.36 = 145.6%
+    #
+    # The COUNT limits are deliberately left per-path: `max_open_positions`
+    # here and `user.auto_trading_max_positions` on the worker are two
+    # separately configured budgets, and no unambiguous failure of them was
+    # measured. See `test_cross_engine_exposure.py` for that as a pinned
+    # decision rather than an omission.
+    elsewhere = await load_open_position_notionals_elsewhere(db, user.id, excluding_source_key="manual")
+    current_exposure = sum(abs(p.quantity) * p.average_price for p in open_positions) + sum(
+        abs(notional) for notional in elsewhere.values()
+    )
     # Signed deliberately -- negative for a short -- and shared with the
     # paper path rather than spelled out twice. `correlated_exposure` nets
     # these against the proposed trade's own direction, so an `abs()` here
     # would turn a hedge into double concentration. `current_exposure`
     # above stays unsigned: that is the *gross* limit, and it should be.
     other_position_notionals = signed_notionals_excluding(open_positions, payload.symbol)
+    # Same union, and signed for the same reason: a short held by the
+    # auto-trade worker hedges a long taken here, and `compute_correlated_
+    # exposure` nets. Merged by addition so one symbol held by both engines
+    # is one netted number, never one silently replacing the other.
+    # NOT load-bearing today, and that is measured rather than assumed:
+    # removing this merge leaves every test in
+    # tests/api/test_cross_engine_exposure.py green. `correlated_exposure`
+    # is a netted subset of the gross notional, so it can never exceed
+    # `current_exposure`, and `max_correlated_exposure_pct` and
+    # `max_exposure_pct` both default to 100 -- the gross gate above always
+    # decides first. It is kept because it is the same account-level
+    # argument (blueprint §85/§86) and becomes load-bearing the moment
+    # those two limits can differ, which is exactly what making the manual
+    # path's `RiskLimits` user-configurable would do.
+    for symbol, notional in elsewhere.items():
+        if symbol != payload.symbol:
+            other_position_notionals[symbol] = other_position_notionals.get(symbol, 0.0) + notional
     correlated_exposure = await compute_correlated_exposure(
         db,
         target_symbol=payload.symbol,

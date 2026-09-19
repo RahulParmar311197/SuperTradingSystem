@@ -10676,6 +10676,70 @@ sixteen unauthenticated routes, all false positives — it matched
 `Depends(require_permission(...))`. Worth writing down: a sweep's dirty
 result needs verifying as much as a clean one.
 
+## Account exposure spans every engine (§57, §85-86)
+
+`positions.source_key` partitions the table so the manual/live stack
+(`app/api/orders.py`), each `POST /paper` session and `AutoTradeSupervisor`
+stop overwriting each other's rows — three `PositionManager`s, all
+persisting as `ExecutionMode.PAPER` when no broker is connected, which is
+every account's default.
+
+Each engine then rebuilt only its own partition and measured
+`current_exposure` against that. `max_exposure_pct` is a percentage of the
+account **balance**, and the account has one balance, so the denominator
+was shared while the numerator was not. Measured through the real endpoints
+and the real `AutoTradeSupervisor`, one account on 100,000 with
+`max_exposure_pct = 100`:
+
+```
+auto positions open   : 3      gross  93,636.36
+manual POST /orders   : 201    exposure_limit recorded True
+manual stack sees     : 1 position, exposure 52,000.00
+TOTAL gross notional  : 145,636.36   = 145.6% of the account
+```
+
+Each path sat inside its own limit while the account was half as levered
+again as the limit allows, and the gate recorded a pass. After the fix the
+same order is refused: `Projected exposure 114.42% vs limit 100.0%`.
+
+`load_open_position_notionals_elsewhere` (app/trading/persistence.py)
+returns `{symbol: signed notional}` for the account's other engines, and
+both `POST /orders` and `PaperTradingEngine` add it to `current_exposure`.
+Blueprint §86 is titled *Portfolio* Risk and asks for *Total* exposure, so
+this is the blueprint's own reading rather than a new policy.
+
+Two scoping decisions are deliberate, and each has a test so it reads as a
+decision rather than an omission:
+
+- **`paper:<session_id>` is not in the union.** `ACCOUNT_BACKED_SOURCE_KEYS`
+  is `("manual", "auto")`. A `POST /paper` session is a sandbox with its own
+  `starting_balance` and consumes none of the account's capital; counting it
+  would refuse real trades over simulated ones, and feeding the account's
+  real book into the sandbox would make the simulation answer a question
+  nobody asked.
+- **The count limits stay per-path.** `RiskLimits.max_open_positions` and
+  `user.auto_trading_max_positions` are two separately configured budgets,
+  and no unambiguous failure of them was measured — unlike exposure, which
+  is a share of one shared balance. A bound goes where a failure was
+  measured and nowhere else.
+
+One part of the change is **not load-bearing today, and that is measured
+rather than assumed**: merging the other engines' notionals into
+`other_position_notionals` (the `correlated_exposure` input) changes no
+verdict, because `correlated_exposure` is a netted subset of the gross
+notional and `max_correlated_exposure_pct` and `max_exposure_pct` both
+default to 100 — the gross gate always decides first. Removing that merge
+leaves every test in `tests/api/test_cross_engine_exposure.py` green. It is
+kept because it is the same account-level argument and becomes load-bearing
+the moment those two limits can differ.
+
+**Open question for the operator.** The manual path builds its stack with a
+bare `RiskLimits()`, so the four user-configured limits apply to
+auto-trading only. If those become user-configurable on the manual path
+too, the count-limit decision above should be revisited at the same time:
+the blueprint's §57 list has a single "Maximum open positions", not one per
+engine.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

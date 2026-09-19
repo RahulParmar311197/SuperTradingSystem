@@ -20,7 +20,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.text import clip
@@ -504,6 +504,91 @@ async def load_realized_pnl_since(
                 TradeRow.user_id == user_id,
                 TradeRow.execution_mode == execution_mode,
                 TradeRow.journal["source"].as_string() == MANUAL_TRADE_SOURCE,
+                TradeRow.closed_at >= since,
+            )
+        )
+    ).scalar_one()
+    return float(total)
+
+
+# The auto-trade worker's own `journal.source`, the third value alongside
+# `manual_order` and `/paper/*`'s `manual_paper`. Added when the worker's
+# risk counters started being rebuilt from the journal: before that no
+# reader needed to tell the three writers apart, and the worker was the
+# only one leaving `source` unset.
+AUTO_TRADE_SOURCE = "auto_trade"
+
+
+def _written_by_the_auto_trade_worker():
+    """Rows the auto-trade worker wrote.
+
+    The second clause covers rows written before `AUTO_TRADE_SOURCE`
+    existed. Leaving them out would silently under-count the day a
+    deployment lands -- in the unsafe direction, since an unseen loss is a
+    loss the limit does not know about. The worker was the only writer
+    that left `source` unset, and `manual_paper`/`manual_order` both set
+    it, so an unset source plus a strategy attribution is unambiguous.
+    """
+    source = TradeRow.journal["source"].as_string()
+    return or_(
+        source == AUTO_TRADE_SOURCE,
+        and_(source.is_(None), TradeRow.strategy_id.isnot(None)),
+    )
+
+
+async def load_auto_trade_entries_since(
+    db: AsyncSession, user_id: uuid.UUID, *, since: datetime, source_key: str
+) -> int:
+    """Rebuild the auto-trade `RiskWindow.trades_today`.
+
+    Unlike the manual path, this cannot be one row count. That counter
+    moves when an entry *opens*, and this path journals a `trades` row only
+    when a position *closes* -- so an entry taken today and still running
+    has no trade row at all. It is the sum of two disjoint sets:
+
+    - trades opened today (closed ones, by `opened_at`), and
+    - positions opened today that are still open.
+
+    Disjoint because closing a position flips `is_open` to false on the
+    same row rather than deleting it, so a round trip contributes its
+    trade row and is excluded from the open-position count. A second entry
+    on the same instrument the same day gets its own row -- the unique
+    index is partial on `is_open` -- so it is counted once too.
+    """
+    closed_today = (
+        await db.execute(
+            select(func.count(TradeRow.id)).where(
+                TradeRow.user_id == user_id,
+                _written_by_the_auto_trade_worker(),
+                TradeRow.opened_at >= since,
+            )
+        )
+    ).scalar_one()
+    still_open = (
+        await db.execute(
+            select(func.count(PositionRow.id)).where(
+                PositionRow.user_id == user_id,
+                PositionRow.source_key == source_key,
+                PositionRow.is_open.is_(True),
+                PositionRow.created_at >= since,
+            )
+        )
+    ).scalar_one()
+    return int(closed_today) + int(still_open)
+
+
+async def load_auto_trade_realized_pnl_since(
+    db: AsyncSession, user_id: uuid.UUID, *, since: datetime
+) -> float:
+    """Rebuild the auto-trade `RiskWindow.daily_pnl`/`weekly_pnl`. The
+    worker writes `pnl=outcome.closed_position_pnl`, the same value it adds
+    to the window, so summing the journal reproduces the counter exactly.
+    """
+    total = (
+        await db.execute(
+            select(func.coalesce(func.sum(TradeRow.pnl), 0)).where(
+                TradeRow.user_id == user_id,
+                _written_by_the_auto_trade_worker(),
                 TradeRow.closed_at >= since,
             )
         )

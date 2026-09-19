@@ -10496,6 +10496,69 @@ suite trades against `MockBroker` and is therefore PAPER, so there was no
 LIVE row anywhere for the filter to exclude. Both now have tests that
 fail under those injections.
 
+## The auto-trade worker had the same restart gap, on the unwatched path (round 155)
+
+Round 154 rebuilt the manual `/orders` stack's day and week risk counters
+from the journal, because a restart must not lift a limit.
+`AutoTradeSupervisor` has the same shape and had the same gap. It rebuilds
+its `PositionManager` from Postgres on first use — the comment at that
+very site says "same restart gap the manual stack had" — and then built a
+zeroed `RiskWindow` one line below it.
+
+Measured, one strategy on two instruments, `auto_trading_max_trades_per_day=1`:
+
+```
+instrument A, supervisor 1 -> 1 position, trades_today=1
+worker restart
+instrument B, supervisor 2 -> 2 positions against a cap of 1,
+                              0 rejections naming max_trades_per_day
+```
+
+Every worker start handed the account a fresh `max_trades_per_day`,
+`max_daily_loss_pct` and `max_weekly_loss_pct`. This is the same defect as
+round 154's on the path nobody is watching, and the worker restarts on
+every deploy and whenever its supervision loop restarts it.
+
+Rebuilding `trades_today` here is **not** the manual path's single row
+count, and that difference is the interesting part. The counter moves when
+an entry *opens*, and this path journals a `trades` row only when a
+position *closes* — so an entry taken today and still running has no trade
+row at all. It is the sum of two disjoint sets: trades opened today, plus
+positions opened today that are still open. Disjoint because closing flips
+`is_open` on the same row rather than deleting it, so a completed round
+trip contributes its trade row and is excluded from the open-position
+count; a second entry on the same instrument the same day gets its own
+row, since the unique index is partial on `is_open`. Both halves have
+tests, and injections confirm each is load-bearing: counting closed trades
+alone reads zero while a position opened minutes ago sits open, and
+counting every position double-counts a round trip.
+
+Telling this path's rows apart needed a discriminator that did not exist.
+All three writers persist with `ExecutionMode.PAPER` — a manual stack with
+no connected broker uses `MockBroker` too — so the worker's trades now
+carry `journal.source = "auto_trade"`, alongside `manual_order` and
+`manual_paper`. Rows written before that key exists are matched by a
+second clause (`source` unset and a strategy attributed), because leaving
+them out would under-count on the day a deployment lands, and an unseen
+loss is a loss the limit does not know about.
+
+`repeated_rejections` is deliberately **not** rebuilt. It counts
+*consecutive* broker rejections; this path writes no `orders` rows at all
+and nothing durable records a rejection as one, so there is no journal to
+rebuild it from, and a consecutive counter cannot be inferred from a daily
+total. Zero is what a fresh process legitimately knows. A test pins that
+as a decision rather than an omission.
+
+One injection escaped and is recorded rather than papered over: removing
+the two lines that set the rebuilt window's day and week marks left all
+thirteen tests green. `PaperTradingEngine` rolls this window with every
+candle, and `RiskWindow.roll` sets those marks itself when they are
+`None`, so nothing reachable through the supervisor depends on them. The
+manual stack differs only because `GET /positions` builds its stack
+without ever rolling it, which is why the same injection bites there. The
+marks are kept anyway: a window whose counters cover today should say so
+on its own terms rather than depend on a call made somewhere else.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

@@ -51,7 +51,14 @@ from app.notifications.service import create_notification
 from app.paper.engine import PaperTradingEngine, RiskWindow
 from app.risk.limits import RiskLimits
 from app.strategy.dsl import StrategyDefinition
-from app.trading.persistence import load_open_positions, persist_position
+from app.trading.persistence import (
+    AUTO_TRADE_SOURCE,
+    load_auto_trade_entries_since,
+    load_auto_trade_realized_pnl_since,
+    load_open_positions,
+    persist_position,
+    risk_window_starts,
+)
 from app.trading.position_manager import PositionManager
 
 logger = logging.getLogger("workers.autotrade")
@@ -295,7 +302,57 @@ class AutoTradeSupervisor:
                     )
                 )
                 self._position_managers[str(user.id)] = position_manager
-            risk_window = self._risk_windows.setdefault(str(user.id), RiskWindow())
+            risk_window = self._risk_windows.get(str(user.id))
+            if risk_window is None:
+                # The other half of the restart gap the position manager
+                # above already closes. That book is rebuilt from
+                # Postgres; these counters were not, so every worker start
+                # handed the account a fresh `max_trades_per_day`,
+                # `max_daily_loss_pct` and `max_weekly_loss_pct`.
+                #
+                # Measured, one strategy on two instruments, cap of one
+                # trade per day: instrument A opens one entry and the
+                # window reads trades_today=1; a second supervisor -- what
+                # a restart produces -- then opens a second entry on
+                # instrument B, 2 positions against a cap of 1, with zero
+                # rejections naming max_trades_per_day.
+                #
+                # This is the same defect the manual `/orders` stack had,
+                # on the path nobody is watching, and the worker restarts
+                # on every deploy and whenever its supervision loop
+                # restarts it.
+                #
+                # `repeated_rejections` is deliberately NOT rebuilt: it
+                # counts *consecutive* broker rejections, this path
+                # journals no orders at all, and nothing durable records a
+                # rejection as one. Inventing a number for it would be
+                # worse than starting it at zero, which is what a fresh
+                # process legitimately knows.
+                now = datetime.now(timezone.utc)
+                day_start, week_start = risk_window_starts(now)
+                risk_window = RiskWindow(
+                    trades_today=await load_auto_trade_entries_since(
+                        db, user.id, since=day_start, source_key=AUTO_SOURCE_KEY
+                    ),
+                    daily_pnl=await load_auto_trade_realized_pnl_since(db, user.id, since=day_start),
+                    weekly_pnl=await load_auto_trade_realized_pnl_since(db, user.id, since=week_start),
+                    # Set so the rebuilt window states the day it
+                    # covers rather than depending on something later to
+                    # name it. Unlike the manual stack's equivalent, this
+                    # is NOT load-bearing today and that was measured, not
+                    # assumed: injecting these two lines away left all
+                    # thirteen tests green, because `PaperTradingEngine`
+                    # rolls this window with every candle and `roll` sets
+                    # the marks itself when they are None. The manual
+                    # stack differs only because `GET /positions` builds
+                    # it without ever rolling it. Kept because a window
+                    # whose counters cover today should say so on its own
+                    # terms -- the alternative depends on a call made
+                    # somewhere else.
+                    risk_day=now.date(),
+                    risk_week=now.isocalendar()[:2],
+                )
+                self._risk_windows[str(user.id)] = risk_window
             engine = PaperTradingEngine(
                 strategy,
                 symbol=instrument.symbol,
@@ -601,6 +658,11 @@ class AutoTradeSupervisor:
                     opened_at=opened_at,
                     closed_at=latest.timestamp,
                     journal={
+                        # Names this writer, the way `manual_order` and
+                        # `manual_paper` already name theirs. Nothing had
+                        # to tell the three apart until the risk counters
+                        # started being rebuilt from this journal.
+                        "source": AUTO_TRADE_SOURCE,
                         "strategy": owner_row.name,
                         "symbol": instrument.symbol,
                         "timeframe": strategy.timeframe,

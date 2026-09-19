@@ -18,7 +18,7 @@ how `AutoTradeSupervisor` already persists `Trade` rows.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -441,3 +441,71 @@ async def load_recent_orders(
         )
         for row, symbol in rows
     ]
+
+
+# The `journal.source` every `record_trade` row carries. It is what tells
+# the manual/live path's trades apart from `/paper/*`'s ("manual_paper")
+# and the auto-trade worker's rows, which the counters below must not
+# absorb: `execution_mode` cannot do it, because a manual stack with no
+# connected broker trades against `MockBroker` and persists as PAPER too
+# (see `_execution_mode_for`).
+MANUAL_TRADE_SOURCE = "manual_order"
+
+
+def risk_window_starts(now: datetime) -> tuple[datetime, datetime]:
+    """The UTC day and ISO-week boundaries the risk counters are measured
+    from -- the same bucketing `_UserTradingStack._roll_risk_window` uses
+    to decide when to reset them, expressed as timestamps so the journal
+    can be queried over exactly the window the in-memory counter covers.
+    """
+    day_start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+    return day_start, day_start - timedelta(days=now.weekday())
+
+
+async def load_orders_placed_since(
+    db: AsyncSession, user_id: uuid.UUID, execution_mode: ExecutionMode, *, since: datetime
+) -> int:
+    """Rebuild `_UserTradingStack.trades_today`.
+
+    `place_order` increments that counter once per order it actually
+    creates and submits, and `persist_order` writes exactly one row per
+    such order (it is idempotent on `idempotency_key`, so a deduped
+    resubmit updates the row rather than adding one, and increments
+    nothing either). Counting rows is therefore the same number, not an
+    approximation of it. Protective stops do not go through `OrderManager`
+    at all and write no row, and nothing outside `POST /orders` and
+    `POST /options/execute` writes to `orders`.
+    """
+    return int(
+        (
+            await db.execute(
+                select(func.count(OrderRow.id)).where(
+                    OrderRow.user_id == user_id,
+                    OrderRow.execution_mode == execution_mode,
+                    OrderRow.created_at >= since,
+                )
+            )
+        ).scalar_one()
+    )
+
+
+async def load_realized_pnl_since(
+    db: AsyncSession, user_id: uuid.UUID, execution_mode: ExecutionMode, *, since: datetime
+) -> float:
+    """Rebuild `_UserTradingStack.daily_pnl`/`weekly_pnl`.
+
+    `place_order` does `stack.daily_pnl += realized_delta` and passes that
+    same `realized_delta` to `record_trade` as `pnl`, so summing the
+    journal over a window reproduces the counter for that window exactly.
+    """
+    total = (
+        await db.execute(
+            select(func.coalesce(func.sum(TradeRow.pnl), 0)).where(
+                TradeRow.user_id == user_id,
+                TradeRow.execution_mode == execution_mode,
+                TradeRow.journal["source"].as_string() == MANUAL_TRADE_SOURCE,
+                TradeRow.closed_at >= since,
+            )
+        )
+    ).scalar_one()
+    return float(total)

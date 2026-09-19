@@ -34,10 +34,13 @@ from app.trading.order_manager import OrderManager
 from app.trading.persistence import (
     ORDER_REHYDRATION_WINDOW,
     load_open_positions,
+    load_orders_placed_since,
+    load_realized_pnl_since,
     load_recent_orders,
     persist_order,
     persist_position,
     record_trade,
+    risk_window_starts,
 )
 from app.trading.position_manager import PositionManager, PositionRecord
 
@@ -231,6 +234,45 @@ async def _stack_for(user: User, db: AsyncSession) -> _UserTradingStack:
                         since=datetime.now(timezone.utc) - ORDER_REHYDRATION_WINDOW,
                     )
                 )
+                # And the day/week risk counters. Positions and the order
+                # index above were rehydrated because a restart must not
+                # lift a limit; these are the limits themselves, and they
+                # were the ones left behind. `trades_today`, `daily_pnl`
+                # and `weekly_pnl` all started at 0 on every stack build,
+                # so a restart handed the account a fresh day. Measured
+                # through the real endpoint, default limits:
+                #
+                #   10 orders placed -> #11 is 403 "10 trades today vs
+                #   limit 10"; restart -> #12 fills 201 with
+                #   trades_today=1 against 11 orders in the journal.
+                #
+                #   a realized -2500 (2.50% vs the 2.0% daily limit) ->
+                #   403 "Daily loss 2.50% vs limit 2.0%"; restart -> the
+                #   same order fills 201 with daily_pnl 0.00 against a
+                #   -2500 journal row.
+                #
+                # That is the daily circuit breaker being cleared by a
+                # deploy, an OOM kill, or a crash loop -- and a crash loop
+                # clears it again on every pass. Round 72 fixed the
+                # opposite direction (counters that never reset, making a
+                # "daily" limit lifetime-of-process); this is the same
+                # limit failing the other way.
+                #
+                # The window keys are set here too, and that is
+                # load-bearing rather than tidy: `_roll_risk_window` only
+                # resets when the key CHANGES, and leaving `_risk_day`
+                # None would have the first order of the next day adopt
+                # today's key without resetting, carrying these rehydrated
+                # counters into a day they do not belong to.
+                now = datetime.now(timezone.utc)
+                day_start, week_start = risk_window_starts(now)
+                stack.trades_today = await load_orders_placed_since(
+                    db, user.id, execution_mode, since=day_start
+                )
+                stack.daily_pnl = await load_realized_pnl_since(db, user.id, execution_mode, since=day_start)
+                stack.weekly_pnl = await load_realized_pnl_since(db, user.id, execution_mode, since=week_start)
+                stack._risk_day = now.date()
+                stack._risk_week = now.isocalendar()[:2]
                 _STACKS[user.id] = stack
     return _STACKS[user.id]
 

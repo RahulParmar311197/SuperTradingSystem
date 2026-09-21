@@ -42,6 +42,10 @@ from app.trading.persistence import (
     record_trade,
 )
 
+# Fixed namespace for the deterministic batch id below. Any constant UUID
+# works; it is fixed so the id a retry computes matches the original.
+_OPTIONS_BATCH_NAMESPACE = uuid.UUID("6f1d4c2e-9a3b-4f27-8c5d-0e7b1a2f3c48")
+
 router = APIRouter(prefix="/options", tags=["options"])
 
 
@@ -833,7 +837,44 @@ async def execute_options_strategy(
         )
         raise HTTPException(status.HTTP_403_FORBIDDEN, f"Risk engine rejected this strategy: {decision.reason}")
 
-    batch_id = uuid.uuid4()
+    # Derived from the request, never random: a retry must not re-execute
+    # the strategy.
+    #
+    # `POST /orders` has built its idempotency key from the request since
+    # round 206 -- `f"{user.id}:{symbol}:{direction}:{entry}:{stop}:{price}"`
+    # -- so an identical resubmit dedupes onto the first order. This path
+    # minted `uuid.uuid4()` per request and fed it into every leg's key, so
+    # every retry was a brand-new batch with brand-new keys and nothing on
+    # the path deduped. Measured through the real endpoint, the same
+    # one-lot bull call spread submitted twice:
+    #
+    #     first  submit : 201
+    #     second submit : 201
+    #     orders journalled : 4        (2 legs x 2 submissions)
+    #     long leg  : quantity  100.0  (one lot of 50 was asked for)
+    #     short leg : quantity -100.0
+    #
+    # Twice the spread and twice the premium, from a client doing the one
+    # thing every HTTP client does after a timeout.
+    #
+    # `uuid5` rather than a hash written by hand so the batch id stays a
+    # real UUID for the column and the response, and so a retry gets the
+    # SAME batch id back -- the response is then idempotent too, not just
+    # the fills. Legs are folded in order: the same legs in a different
+    # order are a different submission, which is the conservative reading
+    # (it re-executes rather than silently deduping something that might
+    # not be the same strategy).
+    #
+    # The tradeoff is `POST /orders`' own, accepted there for the same
+    # reason: two genuinely separate submissions of the identical strategy
+    # dedupe. A caller who wants two lots asks for two lots.
+    batch_id = uuid.uuid5(
+        _OPTIONS_BATCH_NAMESPACE,
+        ":".join(
+            [str(user.id), payload.strategy_name]
+            + [f"{leg.symbol}|{leg.direction.value}|{leg.quantity}|{leg.premium}" for leg in payload.legs]
+        ),
+    )
     execution_mode = _execution_mode_for(stack)
     leg_results: list[LegExecutionResult] = []
     # Everything this call newly opened, in submission order:

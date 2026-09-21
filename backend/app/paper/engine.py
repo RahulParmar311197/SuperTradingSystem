@@ -77,6 +77,17 @@ class PaperTradeOutcome:
     # callers used before this field existed) was never the price that
     # actually produced `closed_position_pnl`.
     exit_price: float | None = None
+    # The status the entry order actually reached at the broker -- `None`
+    # iff `order_created` is False (nothing was submitted this candle).
+    # Same reasoning as `risk_checks` and `exit_reason` above: this engine
+    # already computes it (`final_order.status` drives `repeated_rejections`
+    # a few lines below), and it vanished the instant `on_candle` returned.
+    # `AutoTradeSupervisor` needs it to label `ORDER_COUNT`, the way
+    # app/api/orders.py and app/api/options.py both already do -- without
+    # it the autonomous path's fills were absent from `orders_total`
+    # entirely, so the one execution path with no human watching it was
+    # also the one invisible to monitoring.
+    order_status: OrderStatus | None = None
 
 
 @dataclass
@@ -492,6 +503,7 @@ class PaperTradingEngine:
         order, created = self.order_manager.create_order(
             idempotency_key, self.account_id, self.symbol, direction, OrderType.MARKET, quantity
         )
+        order_status: OrderStatus | None = None
         if created:
             self.order_manager.transition(order.id, OrderStatus.VALIDATING)
             self.order_manager.transition(order.id, OrderStatus.RISK_APPROVED)
@@ -501,6 +513,7 @@ class PaperTradingEngine:
             # See `_UserTradingStack`'s identical update in
             # app/api/orders.py's `place_order` for why.
             self.repeated_rejections = self.repeated_rejections + 1 if final_order.status == OrderStatus.REJECTED else 0
+            order_status = final_order.status
             new_position = self.position_manager.get(self.account_id, self.symbol)
             if new_position is not None:
                 new_position.stop = result.stop
@@ -512,7 +525,9 @@ class PaperTradingEngine:
                 # PositionManager) can actually see it.
                 new_position.strategy_id = self.strategy_id
 
-        return PaperTradeOutcome(signal=result, order_created=created, risk_checks=risk_checks)
+        return PaperTradeOutcome(
+            signal=result, order_created=created, risk_checks=risk_checks, order_status=order_status
+        )
 
     async def _maybe_exit(
         self, position, candle: Candle

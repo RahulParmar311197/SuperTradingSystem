@@ -10846,6 +10846,49 @@ underlying` exists, so it is implementable; but *which price an options
 gate watches* is a modelling decision, and it is recorded here rather than
 guessed.
 
+## The daily circuit breaker is named on every path (§63)
+
+Blueprint §63 wants the daily loss limit distinguishable from an ordinary
+rejection, and `POST /orders` has made that distinction since round 65: it
+reads the first FAILED check's name and sends `DAILY_LOSS_LIMIT` rather
+than a generic `ORDER_REJECTED` when that is why.
+
+`POST /options/execute` sent `ORDER_REJECTED` unconditionally — though
+`evaluate_options_risk` produces the identically-named `"daily_loss_limit"`
+check, so the information was computed on that path and discarded. Measured
+on one account at one moment, past its 2% daily limit:
+
+```
+equity order     -> 403, notification DAILY_LOSS_LIMIT
+options strategy -> 403, notification ORDER_REJECTED
+```
+
+Same breaker, same instant, two different stories — and the breaker is the
+one an operator most needs to see, because it means the account is done for
+the day.
+
+**A note on method, because this one matters.** Round 162 closed the
+`/orders`-vs-`/options` parity class by diffing every *name* each path
+calls. That sweep **could not have found this**: both paths call
+`create_notification`, and the difference lives in an argument. The sweep
+had a blind spot at exactly the level this class of bug occupies.
+
+So the guard is now at the right level:
+`tests/api/test_notification_parity.py` diffs the notification **types**
+each execution path can emit, across all four paths (`/orders`,
+`/options/execute`, `/paper`, the auto-trade worker), and fails if any of
+them loses the breaker. Two absences in that matrix are deliberate:
+
+- **`SL_HIT`/`TP_HIT` on the two live paths.** A live stop rests at the
+  broker; when it fires, the position goes missing there while still open
+  locally, and `reconcile_positions` surfaces that as a halt (round 108)
+  rather than as an exit reason those paths can read. (The comment at
+  `app/api/orders.py`'s POSITION_CLOSED call still says there is "no live
+  stop-loss enforcement worker yet" — that predates round 189's protective
+  broker orders and is stale, though its conclusion holds.)
+- **`RECONCILIATION_REQUIRED` on `POST /paper`.** A sandbox has no broker
+  to reconcile against.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

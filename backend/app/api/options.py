@@ -849,10 +849,32 @@ async def execute_options_strategy(
         # (another device, GET /notifications, an admin view) ever
         # learned an options strategy was blocked, and no audit trail
         # existed for *any* options risk decision, approved or not.
+        # Blueprint §63: the daily circuit breaker must be
+        # distinguishable from an ordinary rejection. `POST /orders` has
+        # made that distinction since round 65 -- it reads the first
+        # FAILED check's name and sends DAILY_LOSS_LIMIT rather than a
+        # generic ORDER_REJECTED when that is why. This path sent
+        # ORDER_REJECTED unconditionally, though `evaluate_options_risk`
+        # produces the identically-named "daily_loss_limit" check, so the
+        # information was computed here and thrown away. Measured on one
+        # account at one moment, over its 2% daily limit:
+        #
+        #     equity order    -> 403, notification DAILY_LOSS_LIMIT
+        #     options strategy-> 403, notification ORDER_REJECTED
+        #
+        # Same breaker, same instant, two different stories told to the
+        # user -- and the breaker is the one an operator most needs to
+        # see, because it means the account is done for the day.
+        failed_checks = decision.failed_checks
+        notification_type = (
+            NotificationType.DAILY_LOSS_LIMIT
+            if failed_checks and failed_checks[0].name == "daily_loss_limit"
+            else NotificationType.ORDER_REJECTED
+        )
         await create_notification(
             db,
             user_id=user.id,
-            notification_type=NotificationType.ORDER_REJECTED,
+            notification_type=notification_type,
             title=f"{payload.strategy_name} options strategy rejected",
             body=decision.reason or "Risk engine rejected this strategy",
             data={"strategy_name": payload.strategy_name, "reason": decision.reason},

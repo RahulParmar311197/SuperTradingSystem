@@ -10985,6 +10985,80 @@ imported name, because round 159 shipped exactly that escape: a leftover
   round 155's `load_open_positions` rehydration means a restart finds the
   open position and the engine declines to re-enter.
 
+## A `/paper` sandbox was reported as the account's portfolio (round 165)
+
+`GET /portfolio` answers "what does this account hold, and what has it
+made". A `POST /paper` session is a simulation the user creates with its
+own `starting_balance`, consuming none of the account's capital -- PR #179
+excluded it from the exposure GATE for exactly that reason. The reported
+figures never got the same treatment.
+
+Measured through the real endpoints, one account holding one real 50,000
+position plus one live sandbox session:
+
+```
+total_exposure     : 50000.00 -> 65606.06   (+15606.06 simulated)
+total_realized_pnl :  5000.00 ->  6000.00   (+1000.00 simulated)
+```
+
+`compute_portfolio_exposure` filtered on `user_id`, `execution_mode` and
+`is_open` only. A sandbox mirror persists as `execution_mode=PAPER`, and
+an account with no connected broker resolves to `PAPER` too (via
+`_execution_mode_for`), so the simulation and the real positions shared
+one bucket. Both readers were affected: `GET /portfolio` and
+`portfolio_snapshots`, which made the inflation durable.
+
+As round 86 recorded when it met the same number, this is a wrong
+reported figure and never a bypassed control: `RiskEngine`'s
+`current_exposure` comes from the in-memory `PositionManager`, not this
+table.
+
+### Round 86 saw half of this
+
+`app/api/paper.py::delete_session` records driving `total_exposure` to
+"15606 -> 31212 -> 46818 for an account holding nothing" -- the same
+15606 measured here. It diagnosed the cause as an ORPHANED row (a deleted
+session whose mirror stayed `is_open=True` with no route left to address
+it) and fixed that by retiring the mirror on `DELETE`. That closed one way
+in. The rows count identically while the session is alive and entirely
+legitimate, which is the case measured above.
+
+Round 86 also noted "No `Trade` is journaled: the simulation was
+abandoned", which is true of an abandoned session and is why the
+realized-P&L half stayed invisible. A sandbox that runs to target
+journals a `trades` row like any other close.
+
+### The two filters have opposite polarity, deliberately
+
+- **Positions: an allowlist.** `Position.source_key.in_(ACCOUNT_BACKED_SOURCE_KEYS)`,
+  the same named, closed partition set PR #179's gate keys off. Sharing
+  one definition means the gate and the report cannot drift apart without
+  that PR's partition-set test saying so.
+- **Trades: a denylist.** `journal.source IS DISTINCT FROM "manual_paper"`.
+  `Trade` has no `source_key`, and `position_id` is NULL on both the paper
+  and auto writers, so it cannot separate them either. The only
+  discriminator is `journal.source` -- and that field has a legacy NULL
+  state, rows written before `AUTO_TRADE_SOURCE` existed, which
+  `_written_by_the_auto_trade_worker` already special-cases. An allowlist
+  would silently drop those and under-report realized P&L, the unsafe
+  direction for a number a user reads as their own.
+
+`PAPER_SANDBOX_TRADE_SOURCE` now names that value next to its two
+siblings, so the writer in `app/api/paper.py` and the readers cannot
+drift on a bare string literal.
+
+### Round 86's tests were rebuilt, not weakened
+
+Four of them used `GET /portfolio.total_exposure > 0` as the instrument
+for "the mirror row is still open". That instrument is gone by design --
+the number now reads 0 whether the row is open or retired -- and in one
+test the surviving assertion (`remaining == exposure_with_both / 2`) would
+have passed vacuously as `0 == 0/2`. Each was rebuilt to observe
+`Position.is_open` directly, which is what `DELETE` actually acts on, with
+the reason recorded at the site. Re-injecting round 86's original bug
+still fails five tests, including all four rebuilt ones, so the coverage
+is intact rather than merely green.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

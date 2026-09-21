@@ -18,6 +18,8 @@ from datetime import datetime
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.trading.persistence import ACCOUNT_BACKED_SOURCE_KEYS, PAPER_SANDBOX_TRADE_SOURCE
+
 from app.database.models.instruments import Instrument
 from app.database.models.trading import ExecutionMode, Position, Trade
 from app.market.repository import get_candles
@@ -68,6 +70,22 @@ async def compute_portfolio_exposure(
             select(Position).where(
                 Position.user_id == user_id,
                 Position.execution_mode == execution_mode,
+                # The account's OWN partitions only. A `/paper/{id}` session
+                # is a sandbox with its own `starting_balance` that consumes
+                # none of the account's capital -- PR #179 excluded it from
+                # the exposure GATE for exactly that reason, and the same
+                # reasoning says it does not belong in the account's
+                # reported figure either. Measured through the endpoints:
+                # one real 50,000 position plus one live sandbox position
+                # reported `total_exposure` 65,606.06.
+                #
+                # This is an ALLOWLIST, deliberately, while the trades
+                # filter below is a denylist -- see the note there. The
+                # partition set is closed and named in one place, and PR
+                # #179's gate already keys off the same tuple, so the two
+                # cannot drift apart without its partition-set test saying
+                # so.
+                Position.source_key.in_(ACCOUNT_BACKED_SOURCE_KEYS),
                 Position.is_open.is_(True),
             )
         )
@@ -79,6 +97,24 @@ async def compute_portfolio_exposure(
                 select(func.coalesce(func.sum(Trade.pnl), 0)).where(
                     Trade.user_id == user_id,
                     Trade.execution_mode == execution_mode,
+                    # The same exclusion on the realized side. A sandbox
+                    # that runs to target journals a `trades` row like any
+                    # other close, so simulated profit was being reported
+                    # as the account's: measured 5,000.00 -> 6,000.00 from
+                    # one sandbox trade.
+                    #
+                    # A DENYLIST, unlike the positions filter above, and
+                    # the asymmetry is deliberate. `Trade` has no
+                    # `source_key`; `position_id` is NULL on both the paper
+                    # and auto writers, so it cannot separate them either.
+                    # The discriminator is `journal.source`, and that field
+                    # has a legacy NULL state -- rows written before
+                    # `AUTO_TRADE_SOURCE` existed, which
+                    # `_written_by_the_auto_trade_worker` already has to
+                    # special-case. An allowlist would silently drop those,
+                    # under-reporting realized P&L; naming only the sandbox
+                    # keeps every unknown row counted.
+                    Trade.journal["source"].as_string().is_distinct_from(PAPER_SANDBOX_TRADE_SOURCE),
                 )
             )
         ).scalar_one()

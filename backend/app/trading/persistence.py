@@ -528,6 +528,14 @@ async def load_recent_orders(
 # (see `_execution_mode_for`).
 MANUAL_TRADE_SOURCE = "manual_order"
 
+# The same discriminator for `/paper/*`'s sandbox rows. Named rather than
+# spelled as a literal at each site because the writer (app/api/paper.py)
+# and the readers must not drift: the comment above has called this value
+# out since the risk counters needed it, but only as prose, and
+# `app/risk/portfolio.py` now has to exclude it from an account's reported
+# figures as well.
+PAPER_SANDBOX_TRADE_SOURCE = "manual_paper"
+
 
 def risk_window_starts(now: datetime) -> tuple[datetime, datetime]:
     """The UTC day and ISO-week boundaries the risk counters are measured

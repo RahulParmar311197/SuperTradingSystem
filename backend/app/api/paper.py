@@ -22,7 +22,11 @@ from app.notifications.service import create_notification
 from app.paper.engine import PaperTradingEngine
 from app.smc.types import Candle
 from app.api.stored_strategies import parse_stored_definition
-from app.trading.persistence import abandon_position_mirrors, persist_position
+from app.trading.persistence import (
+    PAPER_SANDBOX_TRADE_SOURCE,
+    abandon_position_mirrors,
+    persist_position,
+)
 
 router = APIRouter(prefix="/paper", tags=["paper"])
 
@@ -314,7 +318,7 @@ async def feed_candle(
                 r_multiple=r_multiple,
                 opened_at=opened_at,
                 closed_at=candle.timestamp,
-                journal={"source": "manual_paper", "symbol": engine.symbol},
+                journal={"source": PAPER_SANDBOX_TRADE_SOURCE, "symbol": engine.symbol},
             )
         )
         await db.commit()

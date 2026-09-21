@@ -10802,6 +10802,50 @@ Two deliberate choices:
   This is `POST /orders`' own tradeoff, accepted there for the same reason:
   a caller who wants two lots asks for two lots.
 
+## The options path is swept against /orders, not patched one gap at a time
+
+Five separate rounds (71, 79, 80, 159, 161) each found one capability
+present on `POST /orders` and missing from `POST /options/execute`: the
+reducing-order halt exemption, `broker_account_id` stamping, the RiskEvent
+audit row, the account-wide exposure union, and request-derived
+idempotency. New capabilities land on the single-order path and do not get
+mirrored.
+
+So the sixth was found by construction rather than by luck: a mechanical
+diff of every name each path calls, including the helpers each delegates
+to. That produced the whole remaining set at once.
+
+**Legitimate differences**, not gaps: `TradeRiskProposal` vs
+`OptionsRiskProposal`, `calculate_position_size` (an options quantity is
+client-specified in lots), `ensure_protective_stop` (an options leg carries
+no stop price), `assess_equity_liquidity` vs `evaluate_liquidity`.
+
+**Fixed here.** The options path incremented no metric and published to no
+websocket channel, though it places real orders through the same pipeline.
+Measured on one open socket, same account:
+
+```
+POST /orders          -> 201, /ws/orders received 1 event
+POST /options/execute -> 201, /ws/orders received 0 events
+```
+
+A client watching its own live order feed saw equity orders appear and
+options executions never arrive. `ORDER_COUNT` likewise under-counted every
+options fill. Now: `ORDER_COUNT` and `_publish_order_event` per leg (each
+leg is its own real order, the unit the channel already speaks in), and
+`_publish_position_snapshot` once per batch (the snapshot is the whole
+book, so N legs would publish N identical-by-the-end copies).
+
+**Found and NOT fixed.** The options path has no `no_abnormal_price_jump`
+gate; the equity engine has had one since round 74. It is left alone
+deliberately: the gate measures a jump in the *traded* symbol, and an
+options contract has no candles in this system, so wiring it naively would
+produce a check that always passes vacuously — exactly what round 236 had
+to undo. The right input is the underlying's move, and `Instrument.
+underlying` exists, so it is implementable; but *which price an options
+gate watches* is a modelling decision, and it is recorded here rather than
+guessed.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

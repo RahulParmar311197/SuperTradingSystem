@@ -7,8 +7,15 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.orders import _execution_mode_for, _stack_for, serialize_user_trading
+from app.api.orders import (
+    _execution_mode_for,
+    _publish_order_event,
+    _publish_position_snapshot,
+    _stack_for,
+    serialize_user_trading,
+)
 from app.auth.dependencies import get_current_user, require_permission
+from app.core.metrics import ORDER_COUNT
 from app.brokers.mock import MockBroker
 from app.core.audit import record_audit
 from app.core.redis import account_halt_reason, halt_account
@@ -467,6 +474,21 @@ async def _submit_leg(
                 body=f"Opened {direction.value} position in {symbol}",
                 data={"symbol": symbol, "direction": direction.value, "strategy_name": strategy_name},
             )
+
+    # Parity with app/api/orders.py, which has counted and streamed every
+    # order it places since the metric and the `/ws/orders` channel existed.
+    # This path placed real orders through the same pipeline and did
+    # neither, so `ORDER_COUNT` under-counted every options fill and a
+    # client watching its own live order feed saw equity orders appear and
+    # options executions never arrive at all. Measured on one socket:
+    #
+    #     POST /orders          -> 201, /ws/orders received 1 event
+    #     POST /options/execute -> 201, /ws/orders received 0 events
+    #
+    # Per leg, because each leg IS its own real order at the broker --
+    # the same unit `_to_response` and the orders channel already speak in.
+    ORDER_COUNT.labels(final_order.status.value).inc()
+    await _publish_order_event(user, final_order)
 
     await record_audit(
         db,
@@ -931,6 +953,10 @@ async def execute_options_strategy(
         leg_results=leg_results,
         opened=opened,
     )
+
+    # Once per batch rather than per leg: the snapshot is the whole book,
+    # so N legs would publish N identical-by-the-end copies of it.
+    await _publish_position_snapshot(user, stack)
 
     return ExecuteOptionsStrategyResponse(
         batch_id=batch_id,

@@ -10713,10 +10713,15 @@ and `POST /options/execute`. That count is the point. The change that
 introduced the union wired the first two and shipped, leaving the options
 path measuring one partition for a release — an account auto-trading at
 its exposure limit could still put on options. `tests/api/
-test_cross_engine_exposure.py` now asserts the set of sites structurally
-(labelled as such, since exercising `POST /options/execute` end to end
-needs registered `option_contracts` and fresh `option_snapshots` rows),
-so a fourth site cannot appear without the union. The first version of
+test_cross_engine_exposure.py` now asserts the set of sites structurally,
+so a fourth site cannot appear without the union. That structural test was
+originally justified on the grounds that exercising `POST /options/execute`
+end to end needs fresh `option_snapshots` rows — **that was wrong**. A leg
+with no snapshot adds a liquidity warning and is skipped for assessment, so
+the endpoint runs on registered `Instrument` rows alone. The behavioural
+cover it should have had is
+`tests/api/test_options_idempotency.py::test_options_execution_counts_the_other_engines_exposure`;
+the structural test stays for what it alone catches, a fourth site. The first version of
 that structural check was itself vacuous — it looked for the helper's
 name, which the leftover `import` line satisfied even with the call
 deleted — so it now asserts the call and the union expression.
@@ -10752,6 +10757,50 @@ auto-trading only. If those become user-configurable on the manual path
 too, the count-limit decision above should be revisited at the same time:
 the blueprint's §57 list has a single "Maximum open positions", not one per
 engine.
+
+## An options batch id is derived, not random (§37, §120)
+
+`POST /orders` has built its idempotency key from the request since round
+206 — `f"{user.id}:{symbol}:{direction}:{entry}:{stop}:{price}"` — so an
+identical resubmit dedupes onto the first order instead of filling twice.
+
+`POST /options/execute` minted `batch_id = uuid.uuid4()` per request and
+fed it into every leg's key (`f"{user.id}:{batch_id}:{leg.symbol}"`), so
+every retry was a brand-new batch with brand-new keys, and nothing else on
+the path deduped. Measured through the real endpoint, one bull call spread
+of one lot (`lot_size` 50) submitted twice:
+
+```
+first  submit     : 201
+second submit     : 201
+batch ids differ  : True
+orders journalled : 4          (2 legs x 2 submissions)
+long leg          : quantity  100.0
+short leg         : quantity -100.0
+```
+
+Twice the spread and twice the premium, from a client doing the one thing
+every HTTP client does after a timeout. After the fix: 2 orders, ±50, and
+the same batch id returned.
+
+`_execute_leg` already submitted to the broker only when `create_order`
+reported `created` — the dedup machinery was there all along and was
+defeated purely by the random id in the key. So the fix is one expression:
+`batch_id` is now `uuid5` over `(user id, strategy name, each leg's symbol,
+direction, quantity, premium)`. `uuid5` rather than a hand-written hash so
+the id stays a real UUID for the column and the response, and so a retry
+gets the **same** batch id back — the response is idempotent too, not just
+the fills.
+
+Two deliberate choices:
+
+- **Leg order is part of the identity.** The same legs in a different order
+  compute a different batch. That is the conservative reading: it
+  re-executes rather than silently deduping something that might not be the
+  same strategy.
+- **Two genuinely separate submissions of an identical strategy dedupe.**
+  This is `POST /orders`' own tradeoff, accepted there for the same reason:
+  a caller who wants two lots asks for two lots.
 
 ## Multi-leg options execution (§37-40)
 

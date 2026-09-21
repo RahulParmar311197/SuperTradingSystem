@@ -216,6 +216,21 @@ async def feed_candle(
             )
         )
         await db.commit()
+        # DELIBERATELY no RISK_REJECTION_COUNT / ORDER_COUNT here, unlike
+        # the other three execution paths. `risk_rejections_total` and
+        # `orders_total` are process-wide counters with no user label: they
+        # answer "is this deployment's trading healthy", which is why a
+        # rejection on the autonomous path (app/workers/auto_trade_worker.py)
+        # must reach them. A `/paper` session is a named sandbox the user
+        # created with its own `starting_balance`, driven by hand-fed
+        # candles -- one user replaying a long series would emit thousands
+        # of increments unrelated to any account's real trading and drown
+        # the very signal those counters exist to carry. Counting the
+        # sandbox would degrade the alert, not complete it.
+        #
+        # This is NOT the same call as `POST /orders` counting a
+        # MockBroker-backed order: that is the account's own trading stack
+        # with no broker connected yet, not a separate simulation.
 
     if outcome.order_created:
         session.opened_at = candle.timestamp

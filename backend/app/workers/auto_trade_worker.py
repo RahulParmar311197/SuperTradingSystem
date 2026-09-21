@@ -33,6 +33,7 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 
 from app.core.audit import record_audit
+from app.core.metrics import ORDER_COUNT, RISK_REJECTION_COUNT
 from app.core.redis import account_halt_reason, heartbeat
 from app.database.models.instruments import Instrument
 from app.database.models.strategy import Direction
@@ -562,9 +563,29 @@ class AutoTradeSupervisor:
                 )
             )
             await db.commit()
+            if outcome.risk_rejected_reason is not None:
+                # `risk_rejections_total` is the metric an operator alerts
+                # on to learn an account has stopped trading. Only
+                # app/api/orders.py incremented it, so THIS path -- the
+                # unattended one, running 24/7 with nobody watching -- was
+                # the one invisible to monitoring. Measured with a cap of
+                # one trade a day and two instruments: the supervisor
+                # opened a position and had a second entry refused by the
+                # risk engine, writing RiskEvent rows for both, and the
+                # counter stayed at 0.0 throughout.
+                RISK_REJECTION_COUNT.inc()
 
         if outcome.order_created:
             self._opened_at[key] = latest.timestamp
+            # Same gap on the fill side: `orders_total` counted manual
+            # (app/api/orders.py) and options (app/api/options.py, round
+            # 162) orders and no autonomous one. `order_status` is the
+            # status this order actually reached at the broker, which the
+            # engine computes and used to throw away -- labelling it with
+            # anything else would put autonomous fills in a bucket the
+            # other two paths never use.
+            if outcome.order_status is not None:
+                ORDER_COUNT.labels(outcome.order_status.value).inc()
             direction = outcome.signal.direction if outcome.signal else None
             await record_audit(
                 db,

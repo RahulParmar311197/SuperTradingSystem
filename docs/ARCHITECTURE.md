@@ -10889,6 +10889,102 @@ them loses the breaker. Two absences in that matrix are deliberate:
 - **`RECONCILIATION_REQUIRED` on `POST /paper`.** A sandbox has no broker
   to reconcile against.
 
+## Risk metrics across the four execution paths (round 164)
+
+`RISK_REJECTION_COUNT` (`risk_rejections_total`, "Total orders rejected by
+the risk engine") and `ORDER_COUNT` (`orders_total`, "Total orders
+submitted") are process-wide counters with no user label. They answer "is
+this deployment's trading healthy", and a spike in rejections is how an
+operator learns an account has stopped trading -- the daily breaker
+tripped, exposure is exhausted, the kill switch is engaged.
+
+Only `POST /orders` incremented the rejection counter. Measured on one
+account at one instant, both refusals produced by the same risk engine
+with the same reason:
+
+```
+POST /orders          -> 403 "Daily loss 12.50% vs limit 2.0%"
+POST /options/execute -> 403 "Daily loss 12.50% vs limit 2.0%"
+
+risk_rejections_total: 0.0 -> 1.0 (equity) -> 1.0 (options, +0.0)
+```
+
+And through the real `AutoTradeSupervisor`, one strategy on two
+instruments with `auto_trading_max_trades_per_day=1` -- the supervisor
+opened a position and had a second entry refused, writing `RiskEvent`
+rows for both:
+
+```
+orders_total          : 0.0 -> 0.0 (fill) -> 0.0 (rejection)
+risk_rejections_total : 0.0 -> 0.0 (fill) -> 0.0 (rejection)
+```
+
+So the one execution path with nobody watching it was also the one
+invisible to monitoring. Both counters now fire from
+`app/api/options.py` and `app/workers/auto_trade_worker.py`.
+
+`PaperTradeOutcome` gained `order_status` to carry this, for the same
+reason it gained `risk_checks` (round 81) and `exit_reason` (round 63):
+the engine already computed it -- `final_order.status` drives
+`repeated_rejections` two lines below -- and threw it away when
+`on_candle` returned. The autonomous path labels `ORDER_COUNT` with the
+status the order really reached, `MONITORING`, which is the same bucket
+`POST /orders` lands in; a constant label would have put autonomous fills
+somewhere the other paths never look, which is the same invisibility in a
+new place.
+
+### The `/paper` sandbox is deliberately NOT counted
+
+This is a decision, pinned by
+`test_the_paper_sandbox_is_deliberately_not_counted` and by a comment at
+the call site in `app/api/paper.py`. These counters are process-wide with
+no user label. A `/paper` session is a named sandbox the user created
+with its own `starting_balance`, driven by hand-fed candles: one user
+replaying a long series would emit thousands of increments unrelated to
+any account's real trading and drown the very signal the counters exist
+to carry. Counting the sandbox would degrade the alert, not complete it.
+
+That is NOT the same call as `POST /orders` counting a MockBroker-backed
+order. That is the account's own trading stack with no broker connected
+yet, not a separate simulation.
+
+### Method note: why round 162 did not find this
+
+Round 162 swept `/orders` against `/options/execute` and fixed
+`ORDER_COUNT` on the options path. Paper and auto were never in that
+sweep's scope, so this survived it. The structural test in
+`tests/api/test_metrics_parity.py` runs the check across all four paths at
+once -- every path that writes a `RiskEvent` row must also increment the
+rejection counter, with the sandbox as the one documented exception -- so
+a fifth execution path cannot appear without either counting or
+documenting why not. It asserts the `.inc()` CALL rather than the
+imported name, because round 159 shipped exactly that escape: a leftover
+`from ... import` satisfied a name-level check with the call deleted.
+
+### Negative results from the same round, recorded so they are not re-run
+
+- **Enum-constant parity across all four paths: CLEAN.** A sweep of every
+  `NotificationType`/`OrderStatus`/`ExecutionMode`/`OrderType` member each
+  path reaches found no genuine divergence, and independently confirmed
+  round 163's `DAILY_LOSS_LIMIT` fix. The `ExecutionMode` and
+  `OrderStatus` rows it printed were false positives of the sweep's own
+  same-module walk: `app/api/options.py` reaches those members through
+  `_execution_mode_for`, imported from `app/api/orders.py`, and paper/auto
+  delegate to `PaperTradingEngine`.
+- **`RiskEvent` field set is identical** across all four writers
+  (`user_id`, `decision`, `reason`, `checks`); `reason` is `None` on
+  approval in both engines.
+- **`RiskEvent.related_order_id` is representable on only ONE of the four
+  paths.** `POST /orders` maps one decision to one persisted `Order` row.
+  An options decision covers N leg orders and the column is singular.
+  Paper and auto write no `Order` rows at all -- only `POST /orders` and
+  `POST /options/execute` call `persist_order`. Any future work on that
+  column has to start from that, not from "add a writer to four sites".
+- **A worker restart cannot re-enter the same candle.** The missing order
+  journal on the autonomous path suggested a lost idempotency index, but
+  round 155's `load_open_positions` rehydration means a restart finds the
+  open position and the engine declines to re-enter.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

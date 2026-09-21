@@ -15,7 +15,7 @@ from app.api.orders import (
     serialize_user_trading,
 )
 from app.auth.dependencies import get_current_user, require_permission
-from app.core.metrics import ORDER_COUNT
+from app.core.metrics import ORDER_COUNT, RISK_REJECTION_COUNT
 from app.brokers.mock import MockBroker
 from app.core.audit import record_audit
 from app.core.redis import account_halt_reason, halt_account
@@ -839,6 +839,15 @@ async def execute_options_strategy(
     await db.commit()
 
     if not decision.approved:
+        # `risk_rejections_total` is what an operator alerts on to learn
+        # that an account has stopped trading -- the daily breaker tripped,
+        # exposure is exhausted, the kill switch is engaged. Only
+        # app/api/orders.py incremented it, so a refusal here was audited
+        # and notified but never reached the metric. Measured on one
+        # account at one instant, both paths refused by the same engine
+        # with the same reason: the equity rejection moved the counter
+        # 0 -> 1, the options rejection left it at 1.
+        RISK_REJECTION_COUNT.inc()
         # Blueprint §63 mandates an "Order rejected" notification -- the
         # equity path (POST /orders, app/api/orders.py) already fires one
         # and writes this same RiskEvent audit row on rejection; this

@@ -155,7 +155,14 @@ async def test_deleting_a_session_with_an_open_position_retires_its_mirror(requi
 
             before = await _rows(user_id)
             assert len(before) == 1 and before[0].is_open is True, "fixture must open a real position"
-            assert client.get("/portfolio", headers=headers).json()["total_exposure"] > 0
+            # Round 165 removed sandbox rows from the account's reported
+            # figures entirely, so `total_exposure` can no longer witness
+            # whether this row is open -- it reads 0 either way. The
+            # `_rows` assertions above/below are the real instrument, and
+            # they observe `Position.is_open`, which is what DELETE acts on.
+            assert client.get("/portfolio", headers=headers).json()["total_exposure"] == 0.0, (
+                "a sandbox is never the account's exposure, open or retired"
+            )
 
             assert client.delete(f"/paper/{session_id}", headers=headers).status_code == 204
 
@@ -246,7 +253,6 @@ async def test_deleting_one_session_leaves_another_sessions_position_alone(requi
             first = _run_session(client, headers, strategy_id, symbol)
             second = _run_session(client, headers, strategy_id, symbol)
             assert len({first, second}) == 2
-            exposure_with_both = client.get("/portfolio", headers=headers).json()["total_exposure"]
 
             client.delete(f"/paper/{first}", headers=headers)
 
@@ -254,9 +260,13 @@ async def test_deleting_one_session_leaves_another_sessions_position_alone(requi
             assert rows[f"paper:{first}"] is False
             assert rows[f"paper:{second}"] is True, "the surviving session still holds its position"
 
-            remaining = client.get("/portfolio", headers=headers).json()["total_exposure"]
-            assert remaining > 0
-            assert remaining == pytest.approx(exposure_with_both / 2, rel=1e-6)
+            # This used to assert the reported exposure halved. Round 165
+            # excludes sandbox rows from that number, so both sides are now 0
+            # and the comparison would pass while proving nothing. The row map
+            # above is the assertion that carries this test's point: one
+            # session's DELETE retired its own mirror and left the other's
+            # alone.
+            assert client.get("/portfolio", headers=headers).json()["total_exposure"] == 0.0
         finally:
             await _cleanup([user_id], [strategy_id], [symbol])
 
@@ -362,7 +372,12 @@ async def test_a_restart_no_longer_strands_the_mirrored_position(require_infra):
         try:
             session_id = _run_session(client, headers, strategy_id, symbol)
             assert (await _rows(user_id))[0].is_open is True, "fixture must open a real position"
-            assert client.get("/portfolio", headers=headers).json()["total_exposure"] > 0
+            # Round 165 removed sandbox rows from the account's reported
+            # figures entirely, so `total_exposure` can no longer witness
+            # whether this row is open -- it reads 0 either way. The
+            # `_rows` assertions above/below are the real instrument, and
+            # they observe `Position.is_open`, which is what DELETE acts on.
+            assert client.get("/portfolio", headers=headers).json()["total_exposure"] == 0.0
 
             _restart()
 
@@ -406,7 +421,12 @@ async def test_another_user_cannot_retire_a_stranded_mirror(require_infra):
 
             assert client.delete(f"/paper/{session_id}", headers=other_headers).status_code == 404
             assert (await _rows(owner_id))[0].is_open is True, "the intruder retired someone else's position"
-            assert client.get("/portfolio", headers=owner_headers).json()["total_exposure"] > 0
+            # Round 165 removed sandbox rows from the account's reported
+            # figures entirely, so `total_exposure` can no longer witness
+            # whether this row is open -- it reads 0 either way. The
+            # `_rows` assertions above/below are the real instrument, and
+            # they observe `Position.is_open`, which is what DELETE acts on.
+            assert client.get("/portfolio", headers=owner_headers).json()["total_exposure"] == 0.0
 
             # And the owner can still clean it up afterwards -- the refused
             # call left the row addressable.

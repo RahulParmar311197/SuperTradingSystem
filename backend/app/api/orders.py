@@ -963,6 +963,31 @@ async def cancel_order(
     order_id: uuid.UUID,
     user: User = Depends(require_permission(TradingPermission.LIVE_TRADE)),
     db: AsyncSession = Depends(get_db),
+    # The same per-user lock `place_order` takes, and for the same reason:
+    # everything below is check-then-act across an await. The status guard
+    # reads the order, `broker.cancel_order` then yields for a network
+    # round trip, and only afterwards does `transition` run -- so two
+    # concurrent cancels of one order both passed the guard, both cancelled
+    # at the broker, and the second reached
+    # `transition(..., CANCELLED)` on an order already CANCELLED.
+    # `_ALLOWED_TRANSITIONS[CANCELLED]` is the empty set, so that raised
+    # `IllegalTransitionError` out of the handler: a 500.
+    #
+    # Measured against the real ASGI app, one resting ACKNOWLEDGED order,
+    # two concurrent cancels:
+    #
+    #     cancel 1: 200
+    #     cancel 2: IllegalTransitionError: Cannot move order from
+    #               CANCELLED to CANCELLED
+    #
+    # Round 87 (PR #100) fixed the SEQUENTIAL 500 on this route; this is
+    # the concurrent one. Serialized, the second request reads CANCELLED
+    # and gets the clean 409 this handler already has a branch for.
+    #
+    # MockBroker's `cancel_order` RETURNS on an already-terminal order
+    # rather than raising, so there is no `BrokerError`/502 on the way to
+    # absorb the second request -- see app/brokers/mock.py.
+    _serialized: None = Depends(serialize_user_trading),
 ) -> OrderResponse:
     stack = await _stack_for(user, db)
     order = stack.order_manager.get(order_id)

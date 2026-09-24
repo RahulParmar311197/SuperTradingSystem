@@ -11059,6 +11059,64 @@ the reason recorded at the site. Re-injecting round 86's original bug
 still fails five tests, including all four rebuilt ones, so the coverage
 is intact rather than merely green.
 
+## Two concurrent cancels of one order escaped as a 500 (round 166)
+
+`POST /orders/{id}/cancel` is check-then-act across an await:
+
+```
+order = stack.order_manager.get(order_id)            # reads status
+if order.status not in (SUBMITTED, ACKNOWLEDGED): 409
+await stack.broker.cancel_order(...)                 # network round trip
+stack.order_manager.transition(order_id, CANCELLED)
+```
+
+`place_order` has taken the per-user `serialize_user_trading` lock since
+round 152, and `POST /options/execute` since round 159. This route never
+did. So two concurrent cancels both passed the status guard, both
+cancelled at the broker, and the second reached `transition` on an order
+already CANCELLED. `_ALLOWED_TRANSITIONS[CANCELLED]` is the empty set, so
+that raised `IllegalTransitionError` out of the handler. Measured against
+the real ASGI app, one resting ACKNOWLEDGED order:
+
+```
+cancel 1: 200
+cancel 2: IllegalTransitionError: Cannot move order from CANCELLED to CANCELLED
+```
+
+Round 87 (PR #100) fixed the SEQUENTIAL 500 on this route; this is the
+concurrent one. `MockBroker.cancel_order` RETURNS on an already-terminal
+order rather than raising, so no `BrokerError`/502 absorbs the second
+request on the way to the transition.
+
+Serialized, the losing request reads CANCELLED and gets the clean 409 the
+handler already had a branch for, and the broker is asked to cancel
+exactly once.
+
+### Reproducing it needed a broker that actually yields
+
+The first two probe runs reported no bug, and that is worth recording. A
+mock broker whose `cancel_order` contains no real await never yields to
+the event loop, so request 1 ran the entire critical section atomically
+and request 2 saw a clean 409 — a false negative. A 0.05s sleep still did
+not reproduce it; 2.0s did. This is the same trap round 160 hit, where
+`asyncio.gather` failed to overlap the critical sections.
+
+A race whose test depends on a sleep being long enough is a flaky test on
+someone else's CI, so `tests/api/test_concurrent_cancel.py` uses a broker
+that blocks on an `asyncio.Event` the test releases itself. The window is
+opened deliberately and the test is deterministic in both the fixed and
+the broken world.
+
+### The risk the fix introduces, and its own test
+
+Adding a lock creates a failure mode the bug did not have: a handler that
+raises inside the critical section must still release it, or that user's
+account is wedged for the life of the process — every later order and
+cancel blocking forever. `test_a_failing_cancel_still_releases_the_lock`
+drives the 502 path and then requires a second request to be answered.
+Injecting a `serialize_user_trading` that acquires without `async with`
+fails exactly that test, on its deadline rather than by hanging the suite.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

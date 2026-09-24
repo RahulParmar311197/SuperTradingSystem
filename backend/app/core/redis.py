@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
+import uuid
 import weakref
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
@@ -330,3 +332,86 @@ async def check_rate_limit(key: str, limit: int, window_seconds: int) -> bool:
     redis_key = f"ratelimit:{key}"
     count = await get_redis().eval(_RATE_LIMIT_SCRIPT, 1, redis_key, window_seconds)
     return int(count) <= limit
+
+
+# ---------------------------------------------------------------------------
+# Per-account trade lock (cross-process)
+#
+# `app/api/orders.py::serialize_user_trading` is an `asyncio.Lock` held in the
+# API process. docker-compose.yml runs `api` and `worker` as SEPARATE
+# services, so `AutoTradeSupervisor` is always a different process and that
+# lock cannot span them. Measured on current main, with the worker held
+# provably mid-fill (past its risk gate, position not yet in Postgres):
+#
+#     race    Postgres exposure 0.00      POST /orders -> 201
+#             final: manual 80,000 + auto 31,212 = 111.2% of a 100,000 account
+#     control Postgres exposure 31,212.12 SAME order   -> 403 "Projected
+#             exposure 111.21%"
+#
+# Same order, same sizes; only the timing differs. The gate names the very
+# figure it should have refused -- it simply could not see the other
+# process's exposure yet. `max_exposure_pct` is 100.
+#
+# Redis rather than anything new: it is already this system's cross-process
+# coordination layer (the kill switch, account halts, and the atomic Lua
+# rate limiter above), and docker-compose runs it with `--appendonly yes`.
+_TRADE_LOCK_PREFIX = "tradelock:account:"
+
+# BOTH of these must stay inside `RiskLimits.market_data_max_staleness_seconds`
+# (10.0). That coupling is not obvious and it bit during development: with a
+# 15s TTL and a 20s wait, a queued order waited ~15s and was then refused
+# with `Data age 15.03` -- the lock had manufactured the very staleness that
+# rejected the trade, and the user saw a confusing freshness error after a
+# long hang instead of either a fill or a clean "account busy".
+#
+# Long enough to cover a broker round trip plus the persist that follows,
+# short enough that a process killed mid-trade does not wedge an account for
+# long. A holder that outlives this loses the lock rather than holding it
+# forever: the same "acquired and never released" failure the in-process lock
+# needed its own test for.
+TRADE_LOCK_TTL_SECONDS = 8
+
+# How long a caller waits for a busy account before giving up. The point is
+# to queue behind the other process rather than refuse, so this covers a
+# full hold -- but no more, for the reason above.
+TRADE_LOCK_WAIT_SECONDS = 8
+
+_LOCK_POLL_SECONDS = 0.05
+
+# Release only if we still hold it. Without the value check, a holder whose
+# TTL had already expired would delete the NEXT holder's lock on its way
+# out, handing the account to two processes at once -- the bug this exists
+# to prevent, wearing a different hat.
+_TRADE_LOCK_RELEASE_SCRIPT = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
+
+
+async def acquire_trade_lock(account_id: str, *, wait_seconds: float | None = None) -> str | None:
+    """Take this account's cross-process trade lock.
+
+    Returns an opaque token to pass to `release_trade_lock`, or None if the
+    account stayed busy for `wait_seconds`. Redis errors propagate: the
+    caller decides fail-open vs fail-closed, the way
+    `app/core/rate_limit.py` already does for the limiter.
+    """
+    token = uuid.uuid4().hex
+    key = f"{_TRADE_LOCK_PREFIX}{account_id}"
+    deadline = time.monotonic() + (TRADE_LOCK_WAIT_SECONDS if wait_seconds is None else wait_seconds)
+    while True:
+        # NX+PX in one call: two processes cannot both see it free.
+        if await get_redis().set(key, token, nx=True, px=TRADE_LOCK_TTL_SECONDS * 1000):
+            return token
+        if time.monotonic() >= deadline:
+            return None
+        await asyncio.sleep(_LOCK_POLL_SECONDS)
+
+
+async def release_trade_lock(account_id: str, token: str) -> None:
+    """Release a lock taken with `acquire_trade_lock`. A no-op if the TTL
+    already expired and someone else holds it now."""
+    key = f"{_TRADE_LOCK_PREFIX}{account_id}"
+    await get_redis().eval(_TRADE_LOCK_RELEASE_SCRIPT, 1, key, token)

@@ -34,7 +34,8 @@ from sqlalchemy import select
 
 from app.core.audit import record_audit
 from app.core.metrics import ORDER_COUNT, RISK_REJECTION_COUNT
-from app.core.redis import account_halt_reason, heartbeat
+from app.core.config import get_settings
+from app.core.redis import account_halt_reason, acquire_trade_lock, heartbeat, release_trade_lock
 from app.database.models.instruments import Instrument
 from app.database.models.strategy import Direction
 from app.database.models.strategy import Strategy as StrategyRow
@@ -402,7 +403,23 @@ class AutoTradeSupervisor:
         latest = candles[-1]
         if self._last_candle_seen.get(key) == latest.timestamp:
             return None
+        previously_seen = self._last_candle_seen.get(key)
         self._last_candle_seen[key] = latest.timestamp
+
+        def defer_this_candle() -> None:
+            """Undo the mark above so the next pass retries this candle.
+
+            Only the paths that decline to PROCESS the candle at all may
+            call this. Without it, deferring on a busy account did not cost
+            one candle -- it dropped the entry permanently, because the
+            guard above would refuse to look at that timestamp again.
+            Measured: the account's lock held by another process, the
+            worker skipped the entry bar, and the next pass opened nothing.
+            """
+            if previously_seen is None:
+                self._last_candle_seen.pop(key, None)
+            else:
+                self._last_candle_seen[key] = previously_seen
 
         # This loop trades unattended, and until now it traded whatever the
         # newest *stored* candle was, however old that was.
@@ -530,191 +547,233 @@ class AutoTradeSupervisor:
         if managed is not None:
             managed.add((str(user.id), str(instrument.id)))
 
-        outcome = await engine.on_candle(latest, db)
-
-        # Blueprint §9/§86: mirrors app/api/paper.py's feed_candle fix --
-        # this is the same PaperTradingEngine driving blueprint §54's
-        # flagship autonomous trading loop, and it never persisted a
-        # `positions` row either. Every position this supervisor ever
-        # opened was invisible to GET /portfolio, GET /admin/
-        # portfolio-snapshot, and the correlated-exposure risk check for
-        # its entire open lifetime -- those only ever saw it once it
-        # closed and a Trade row appeared, understating a user's real
-        # (simulated) exposure by however much autonomous trading itself
-        # was holding, for as long as it stayed open.
-        position_after = engine.position_manager.get(engine.account_id, engine.symbol)
-        if position_after is not None:
-            await persist_position(
-                db, user.id, instrument.id, position_after, execution_mode=ExecutionMode.PAPER, source_key=AUTO_SOURCE_KEY
-            )
-
-        if outcome.risk_checks is not None:
-            # Same audit gap and fix as app/api/paper.py's feed_candle -- this
-            # supervisor drives the identical PaperTradingEngine/RiskEngine
-            # unattended, 24/7, with no synchronous caller to see a rejection;
-            # without this, `GET /admin/risk-events` never saw a single
-            # autonomous-trading decision, approved or rejected.
-            db.add(
-                RiskEvent(
-                    user_id=user.id,
-                    decision=RiskEventDecision.REJECT if outcome.risk_rejected_reason is not None else RiskEventDecision.APPROVE,
-                    reason=outcome.risk_rejected_reason,
-                    checks=outcome.risk_checks,
+        # The other half of the cross-process race that
+        # `app/api/orders.py::serialize_user_trading` guards. This
+        # supervisor runs as its own docker-compose service, so an
+        # `asyncio.Lock` in the API process cannot reach it: both read the
+        # account's exposure, neither sees the other's in-flight fill, and
+        # both approve. Measured with this side held provably mid-fill --
+        # past its risk gate, position not yet in Postgres -- a manual
+        # order that the same gate refuses when run sequentially was
+        # accepted, taking the account to 111.2% of a 100% limit.
+        #
+        # Unattended, so there is no 503 to return: failing closed means
+        # skipping this entry and taking it on the next pass, which costs
+        # one candle rather than a breached limit.
+        try:
+            lock_token = await acquire_trade_lock(str(user.id))
+        except Exception:
+            logger.exception("Could not reach Redis for the trade lock on account %s", user.id)
+            if not get_settings().trade_lock_fail_open:
+                defer_this_candle()
+                return
+            lock_token = None
+        else:
+            if lock_token is None:
+                logger.info(
+                    "Account %s is busy in another process; deferring this candle", user.id
                 )
-            )
-            await db.commit()
+                defer_this_candle()
+                return
+        try:
+            outcome = await engine.on_candle(latest, db)
+
+            # Blueprint §9/§86: mirrors app/api/paper.py's feed_candle fix --
+            # this is the same PaperTradingEngine driving blueprint §54's
+            # flagship autonomous trading loop, and it never persisted a
+            # `positions` row either. Every position this supervisor ever
+            # opened was invisible to GET /portfolio, GET /admin/
+            # portfolio-snapshot, and the correlated-exposure risk check for
+            # its entire open lifetime -- those only ever saw it once it
+            # closed and a Trade row appeared, understating a user's real
+            # (simulated) exposure by however much autonomous trading itself
+            # was holding, for as long as it stayed open.
+            position_after = engine.position_manager.get(engine.account_id, engine.symbol)
+            if position_after is not None:
+                await persist_position(
+                    db, user.id, instrument.id, position_after, execution_mode=ExecutionMode.PAPER, source_key=AUTO_SOURCE_KEY
+                )
+
+            if outcome.risk_checks is not None:
+                # Same audit gap and fix as app/api/paper.py's feed_candle -- this
+                # supervisor drives the identical PaperTradingEngine/RiskEngine
+                # unattended, 24/7, with no synchronous caller to see a rejection;
+                # without this, `GET /admin/risk-events` never saw a single
+                # autonomous-trading decision, approved or rejected.
+                db.add(
+                    RiskEvent(
+                        user_id=user.id,
+                        decision=RiskEventDecision.REJECT if outcome.risk_rejected_reason is not None else RiskEventDecision.APPROVE,
+                        reason=outcome.risk_rejected_reason,
+                        checks=outcome.risk_checks,
+                    )
+                )
+                await db.commit()
+                if outcome.risk_rejected_reason is not None:
+                    # `risk_rejections_total` is the metric an operator alerts
+                    # on to learn an account has stopped trading. Only
+                    # app/api/orders.py incremented it, so THIS path -- the
+                    # unattended one, running 24/7 with nobody watching -- was
+                    # the one invisible to monitoring. Measured with a cap of
+                    # one trade a day and two instruments: the supervisor
+                    # opened a position and had a second entry refused by the
+                    # risk engine, writing RiskEvent rows for both, and the
+                    # counter stayed at 0.0 throughout.
+                    RISK_REJECTION_COUNT.inc()
+
+            if outcome.order_created:
+                self._opened_at[key] = latest.timestamp
+                # Same gap on the fill side: `orders_total` counted manual
+                # (app/api/orders.py) and options (app/api/options.py, round
+                # 162) orders and no autonomous one. `order_status` is the
+                # status this order actually reached at the broker, which the
+                # engine computes and used to throw away -- labelling it with
+                # anything else would put autonomous fills in a bucket the
+                # other two paths never use.
+                if outcome.order_status is not None:
+                    ORDER_COUNT.labels(outcome.order_status.value).inc()
+                direction = outcome.signal.direction if outcome.signal else None
+                await record_audit(
+                    db,
+                    actor="system",
+                    action="autotrade.order_placed",
+                    user_id=user.id,
+                    details={"strategy": strategy_row.name, "symbol": instrument.symbol, "direction": direction},
+                )
+                # Blueprint §63 mandates a "Trade executed" notification -- the
+                # sibling risk_rejected_reason/closed_position_pnl branches
+                # below both notify, but this one, the actual open of a
+                # position, never did. This path has no synchronous HTTP
+                # response for anyone to see the way manual POST /orders does,
+                # so without this an opened autonomous trade was as invisible
+                # as a rejected one used to be.
+                await create_notification(
+                    db,
+                    user_id=user.id,
+                    notification_type=NotificationType.TRADE_EXECUTED,
+                    title=f"{instrument.symbol} auto-trade executed",
+                    body=f"Opened {direction or 'a'} position in {instrument.symbol}",
+                    data={"strategy": strategy_row.name, "symbol": instrument.symbol, "direction": direction},
+                )
+
             if outcome.risk_rejected_reason is not None:
-                # `risk_rejections_total` is the metric an operator alerts
-                # on to learn an account has stopped trading. Only
-                # app/api/orders.py incremented it, so THIS path -- the
-                # unattended one, running 24/7 with nobody watching -- was
-                # the one invisible to monitoring. Measured with a cap of
-                # one trade a day and two instruments: the supervisor
-                # opened a position and had a second entry refused by the
-                # risk engine, writing RiskEvent rows for both, and the
-                # counter stayed at 0.0 throughout.
-                RISK_REJECTION_COUNT.inc()
-
-        if outcome.order_created:
-            self._opened_at[key] = latest.timestamp
-            # Same gap on the fill side: `orders_total` counted manual
-            # (app/api/orders.py) and options (app/api/options.py, round
-            # 162) orders and no autonomous one. `order_status` is the
-            # status this order actually reached at the broker, which the
-            # engine computes and used to throw away -- labelling it with
-            # anything else would put autonomous fills in a bucket the
-            # other two paths never use.
-            if outcome.order_status is not None:
-                ORDER_COUNT.labels(outcome.order_status.value).inc()
-            direction = outcome.signal.direction if outcome.signal else None
-            await record_audit(
-                db,
-                actor="system",
-                action="autotrade.order_placed",
-                user_id=user.id,
-                details={"strategy": strategy_row.name, "symbol": instrument.symbol, "direction": direction},
-            )
-            # Blueprint §63 mandates a "Trade executed" notification -- the
-            # sibling risk_rejected_reason/closed_position_pnl branches
-            # below both notify, but this one, the actual open of a
-            # position, never did. This path has no synchronous HTTP
-            # response for anyone to see the way manual POST /orders does,
-            # so without this an opened autonomous trade was as invisible
-            # as a rejected one used to be.
-            await create_notification(
-                db,
-                user_id=user.id,
-                notification_type=NotificationType.TRADE_EXECUTED,
-                title=f"{instrument.symbol} auto-trade executed",
-                body=f"Opened {direction or 'a'} position in {instrument.symbol}",
-                data={"strategy": strategy_row.name, "symbol": instrument.symbol, "direction": direction},
-            )
-
-        if outcome.risk_rejected_reason is not None:
-            # Blueprint §63 mandates an "Order rejected" notification. This
-            # path has no synchronous HTTP response the way manual
-            # POST /orders does (that endpoint at least returns a 403 with
-            # the reason) -- without this, an autonomous entry the risk
-            # engine blocked left absolutely no record anywhere the user
-            # could ever see it happened.
-            await record_audit(
-                db,
-                actor="system",
-                action="autotrade.order_rejected",
-                user_id=user.id,
-                details={"strategy": strategy_row.name, "symbol": instrument.symbol, "reason": outcome.risk_rejected_reason},
-            )
-            # Blueprint §63 lists "Daily loss limit" as its own
-            # notification event, distinct from a generic order rejection
-            # -- see the identical comment in app/api/paper.py's
-            # feed_candle.
-            rejection_notification_type = (
-                NotificationType.DAILY_LOSS_LIMIT
-                if outcome.risk_failed_check == "daily_loss_limit"
-                else NotificationType.ORDER_REJECTED
-            )
-            await create_notification(
-                db,
-                user_id=user.id,
-                notification_type=rejection_notification_type,
-                title=f"{instrument.symbol} auto-trade rejected",
-                body=outcome.risk_rejected_reason,
-                data={"strategy": strategy_row.name, "symbol": instrument.symbol, "reason": outcome.risk_rejected_reason},
-            )
-
-        if outcome.closed_position_pnl is not None and snapshot is not None:
-            # Journal against whoever opened the position, not whoever
-            # happened to observe the close -- see `owner_strategy_id`
-            # above. The owner's row carries the `version` that was live
-            # when the entry was taken, which is what blueprint §91 means
-            # by "always know exactly which version created a trade".
-            owner_row = strategy_row
-            owner_key = key
-            if owner_strategy_id is not None and owner_strategy_id != str(strategy_row.id):
-                owner_row = await db.get(StrategyRow, uuid.UUID(owner_strategy_id)) or strategy_row
-                owner_key = (str(user.id), owner_strategy_id, str(instrument.id))
-            # The opener stamped `_opened_at` under its own triple, so pop
-            # the owner's key -- popping this engine's would miss and fall
-            # back to the closing candle, collapsing the holding period to
-            # zero.
-            opened_at = self._opened_at.pop(owner_key, latest.timestamp)
-            risk_per_unit = abs(snapshot["entry_price"] - snapshot["stop"]) if snapshot["stop"] else None
-            r_multiple = (
-                (outcome.closed_position_pnl / snapshot["quantity"]) / risk_per_unit if risk_per_unit else None
-            )
-            db.add(
-                TradeRow(
+                # Blueprint §63 mandates an "Order rejected" notification. This
+                # path has no synchronous HTTP response the way manual
+                # POST /orders does (that endpoint at least returns a 403 with
+                # the reason) -- without this, an autonomous entry the risk
+                # engine blocked left absolutely no record anywhere the user
+                # could ever see it happened.
+                await record_audit(
+                    db,
+                    actor="system",
+                    action="autotrade.order_rejected",
                     user_id=user.id,
-                    instrument_id=instrument.id,
-                    strategy_id=owner_row.id,
-                    strategy_version=owner_row.version,
-                    execution_mode=ExecutionMode.PAPER,
-                    direction=snapshot["direction"],
-                    entry_price=snapshot["entry_price"],
-                    exit_price=outcome.exit_price,
-                    quantity=snapshot["quantity"],
-                    stop=snapshot["stop"],
-                    target=snapshot["target"],
-                    pnl=outcome.closed_position_pnl,
-                    r_multiple=r_multiple,
-                    opened_at=opened_at,
-                    closed_at=latest.timestamp,
-                    journal={
-                        # Names this writer, the way `manual_order` and
-                        # `manual_paper` already name theirs. Nothing had
-                        # to tell the three apart until the risk counters
-                        # started being rebuilt from this journal.
-                        "source": AUTO_TRADE_SOURCE,
-                        "strategy": owner_row.name,
-                        "symbol": instrument.symbol,
-                        "timeframe": strategy.timeframe,
-                    },
+                    details={"strategy": strategy_row.name, "symbol": instrument.symbol, "reason": outcome.risk_rejected_reason},
                 )
-            )
-            await db.commit()
-            # Blueprint §63 lists SL/TP hits as their own notification
-            # events, distinct from a generic "position closed" -- see the
-            # identical comment in app/api/paper.py's feed_candle.
-            notification_type = {
-                "stop_loss": NotificationType.SL_HIT,
-                "take_profit": NotificationType.TP_HIT,
-            }.get(outcome.exit_reason, NotificationType.POSITION_CLOSED)
-            await create_notification(
-                db,
-                user_id=user.id,
-                notification_type=notification_type,
-                title=f"{instrument.symbol} auto-trade closed",
-                body=f"Realized P&L: {outcome.closed_position_pnl:.2f}",
-                data={"strategy": owner_row.name, "pnl": outcome.closed_position_pnl, "exit_reason": outcome.exit_reason},
-            )
+                # Blueprint §63 lists "Daily loss limit" as its own
+                # notification event, distinct from a generic order rejection
+                # -- see the identical comment in app/api/paper.py's
+                # feed_candle.
+                rejection_notification_type = (
+                    NotificationType.DAILY_LOSS_LIMIT
+                    if outcome.risk_failed_check == "daily_loss_limit"
+                    else NotificationType.ORDER_REJECTED
+                )
+                await create_notification(
+                    db,
+                    user_id=user.id,
+                    notification_type=rejection_notification_type,
+                    title=f"{instrument.symbol} auto-trade rejected",
+                    body=outcome.risk_rejected_reason,
+                    data={"strategy": strategy_row.name, "symbol": instrument.symbol, "reason": outcome.risk_rejected_reason},
+                )
 
-        return {
-            "user_id": str(user.id),
-            "strategy_id": str(strategy_row.id),
-            "instrument_id": str(instrument.id),
-            "order_created": outcome.order_created,
-            "closed_pnl": outcome.closed_position_pnl,
-        }
+            if outcome.closed_position_pnl is not None and snapshot is not None:
+                # Journal against whoever opened the position, not whoever
+                # happened to observe the close -- see `owner_strategy_id`
+                # above. The owner's row carries the `version` that was live
+                # when the entry was taken, which is what blueprint §91 means
+                # by "always know exactly which version created a trade".
+                owner_row = strategy_row
+                owner_key = key
+                if owner_strategy_id is not None and owner_strategy_id != str(strategy_row.id):
+                    owner_row = await db.get(StrategyRow, uuid.UUID(owner_strategy_id)) or strategy_row
+                    owner_key = (str(user.id), owner_strategy_id, str(instrument.id))
+                # The opener stamped `_opened_at` under its own triple, so pop
+                # the owner's key -- popping this engine's would miss and fall
+                # back to the closing candle, collapsing the holding period to
+                # zero.
+                opened_at = self._opened_at.pop(owner_key, latest.timestamp)
+                risk_per_unit = abs(snapshot["entry_price"] - snapshot["stop"]) if snapshot["stop"] else None
+                r_multiple = (
+                    (outcome.closed_position_pnl / snapshot["quantity"]) / risk_per_unit if risk_per_unit else None
+                )
+                db.add(
+                    TradeRow(
+                        user_id=user.id,
+                        instrument_id=instrument.id,
+                        strategy_id=owner_row.id,
+                        strategy_version=owner_row.version,
+                        execution_mode=ExecutionMode.PAPER,
+                        direction=snapshot["direction"],
+                        entry_price=snapshot["entry_price"],
+                        exit_price=outcome.exit_price,
+                        quantity=snapshot["quantity"],
+                        stop=snapshot["stop"],
+                        target=snapshot["target"],
+                        pnl=outcome.closed_position_pnl,
+                        r_multiple=r_multiple,
+                        opened_at=opened_at,
+                        closed_at=latest.timestamp,
+                        journal={
+                            # Names this writer, the way `manual_order` and
+                            # `manual_paper` already name theirs. Nothing had
+                            # to tell the three apart until the risk counters
+                            # started being rebuilt from this journal.
+                            "source": AUTO_TRADE_SOURCE,
+                            "strategy": owner_row.name,
+                            "symbol": instrument.symbol,
+                            "timeframe": strategy.timeframe,
+                        },
+                    )
+                )
+                await db.commit()
+                # Blueprint §63 lists SL/TP hits as their own notification
+                # events, distinct from a generic "position closed" -- see the
+                # identical comment in app/api/paper.py's feed_candle.
+                notification_type = {
+                    "stop_loss": NotificationType.SL_HIT,
+                    "take_profit": NotificationType.TP_HIT,
+                }.get(outcome.exit_reason, NotificationType.POSITION_CLOSED)
+                await create_notification(
+                    db,
+                    user_id=user.id,
+                    notification_type=notification_type,
+                    title=f"{instrument.symbol} auto-trade closed",
+                    body=f"Realized P&L: {outcome.closed_position_pnl:.2f}",
+                    data={"strategy": owner_row.name, "pnl": outcome.closed_position_pnl, "exit_reason": outcome.exit_reason},
+                )
+
+            return {
+                "user_id": str(user.id),
+                "strategy_id": str(strategy_row.id),
+                "instrument_id": str(instrument.id),
+                "order_created": outcome.order_created,
+                "closed_pnl": outcome.closed_position_pnl,
+            }
+        finally:
+            # Released only once every write this candle produced has
+            # committed. An earlier version released it directly after
+            # `on_candle`, which left the position row -- the very state
+            # the other process's exposure gate reads -- still uncommitted
+            # for the width of `persist_position` below. Measured with the
+            # gate held in exactly that gap: the same manual order came
+            # back 201 and the account reached 111.21%, i.e. the fix did
+            # not hold at all. Covering the whole tail, rather than just
+            # that one call, is deliberate: a later edit that journals
+            # something else a risk gate reads cannot fall outside it.
+            if lock_token is not None:
+                await release_trade_lock(str(user.id), lock_token)
 
     async def run(self) -> None:
         logger.info("AutoTradeSupervisor starting, interval=%ss timeframe=%s", self.interval_seconds, self.timeframe)

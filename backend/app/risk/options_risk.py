@@ -143,33 +143,56 @@ def evaluate_options_risk(
     # executed sanely right now, which applies to a close as much as
     # to an open -- as does the kill switch above.
     if not proposal.is_reducing:
-        projected_exposure_pct = (
-            (proposal.current_exposure + risk_amount) / proposal.account_balance * 100 if proposal.account_balance else 100.0
-        )
-        checks.append(
-            RiskCheck(
-                "exposure_limit",
-                projected_exposure_pct <= limits.max_exposure_pct,
-                f"Projected exposure {projected_exposure_pct:.2f}% vs limit {limits.max_exposure_pct}%",
+        if proposal.account_balance <= 0:
+            # The same fail-open the equity engine had, in the second of
+            # the two evaluators: all three percentages below divide by the
+            # balance and fell back to a PASSING value when it was falsy
+            # (0% for the loss gates, a flat 100.0 for exposure, which
+            # clears the default `max_exposure_pct` of 100). An account
+            # with no money had no limits. Fixing only
+            # `app/risk/engine.py` would leave `POST /options/execute`
+            # wide open, so the guard is repeated here rather than shared
+            # -- the two evaluators take different proposals and neither
+            # can stand in for the other.
+            #
+            # The checks below that need no balance still run, and the
+            # three that cannot be computed are skipped rather than
+            # recorded with a fabricated number.
+            checks.append(
+                RiskCheck(
+                    "account_funded",
+                    False,
+                    f"Account balance {proposal.account_balance:.2f} cannot support a new position",
+                )
             )
-        )
+        else:
+            projected_exposure_pct = (
+                (proposal.current_exposure + risk_amount) / proposal.account_balance * 100
+            )
+            checks.append(
+                RiskCheck(
+                    "exposure_limit",
+                    projected_exposure_pct <= limits.max_exposure_pct,
+                    f"Projected exposure {projected_exposure_pct:.2f}% vs limit {limits.max_exposure_pct}%",
+                )
+            )
 
-        daily_loss_pct = max(-proposal.daily_pnl, 0) / proposal.account_balance * 100 if proposal.account_balance else 0
-        checks.append(
-            RiskCheck(
-                "daily_loss_limit",
-                daily_loss_pct < limits.max_daily_loss_pct,
-                f"Daily loss {daily_loss_pct:.2f}% vs limit {limits.max_daily_loss_pct}%",
+            daily_loss_pct = max(-proposal.daily_pnl, 0) / proposal.account_balance * 100
+            checks.append(
+                RiskCheck(
+                    "daily_loss_limit",
+                    daily_loss_pct < limits.max_daily_loss_pct,
+                    f"Daily loss {daily_loss_pct:.2f}% vs limit {limits.max_daily_loss_pct}%",
+                )
             )
-        )
-        weekly_loss_pct = max(-proposal.weekly_pnl, 0) / proposal.account_balance * 100 if proposal.account_balance else 0
-        checks.append(
-            RiskCheck(
-                "weekly_loss_limit",
-                weekly_loss_pct < limits.max_weekly_loss_pct,
-                f"Weekly loss {weekly_loss_pct:.2f}% vs limit {limits.max_weekly_loss_pct}%",
+            weekly_loss_pct = max(-proposal.weekly_pnl, 0) / proposal.account_balance * 100
+            checks.append(
+                RiskCheck(
+                    "weekly_loss_limit",
+                    weekly_loss_pct < limits.max_weekly_loss_pct,
+                    f"Weekly loss {weekly_loss_pct:.2f}% vs limit {limits.max_weekly_loss_pct}%",
+                )
             )
-        )
         checks.append(
             RiskCheck(
                 "max_open_positions",

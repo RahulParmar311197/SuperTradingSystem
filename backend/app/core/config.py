@@ -106,6 +106,23 @@ class Settings(BaseSettings):
     # outranks brute-force protection, and know that is the trade.
     rate_limit_fail_open: bool = False
 
+    # The same question for the cross-process trade lock
+    # (app/core/redis.py::acquire_trade_lock), answered the other way by
+    # default. The limiter's fail-open is a judgement about login
+    # AVAILABILITY; this one guards a risk limit, and a risk gate that
+    # cannot be evaluated has to refuse rather than guess -- the same
+    # fail-closed call round 129 made for stale market data.
+    #
+    # Measured cost of failing open here: the API process and the
+    # auto-trade worker each read the account's exposure, neither sees the
+    # other's in-flight fill, and both approve -- 111.2% of a 100,000
+    # account against a 100% limit.
+    #
+    # Set it True only for a deployment that would rather keep trading
+    # through a Redis outage than hold that limit, and know that is the
+    # trade.
+    trade_lock_fail_open: bool = False
+
     # How many trusted reverse proxies sit in front of this process.
     # 0 (the default) means "none": the rate limiter keys on the socket
     # peer, which is then the real client. Behind a proxy the peer is the

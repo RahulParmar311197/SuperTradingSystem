@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import uuid
 from datetime import datetime, timezone
 
@@ -12,7 +13,19 @@ from app.brokers.base import BrokerError
 from app.brokers.mock import MockBroker
 from app.core.audit import record_audit
 from app.core.metrics import ORDER_COUNT, RISK_REJECTION_COUNT
-from app.core.redis import account_halt_reason, channel_name, get_latest_price, get_price_age_seconds, get_price_jump_pct, halt_account, publish
+from app.core.config import get_settings
+from app.core.redis import (
+    TRADE_LOCK_TTL_SECONDS,
+    account_halt_reason,
+    acquire_trade_lock,
+    channel_name,
+    get_latest_price,
+    get_price_age_seconds,
+    get_price_jump_pct,
+    halt_account,
+    publish,
+    release_trade_lock,
+)
 from app.database.models.instruments import Instrument
 from app.database.models.notifications import NotificationType
 from app.database.models.risk import RiskDecision as RiskEventDecision
@@ -150,6 +163,8 @@ _STACK_LOCKS: dict[uuid.UUID, asyncio.Lock] = {}
 # same documented limitation the rest of this in-memory stack already
 # carries (see docs/ARCHITECTURE.md's "Multiple API replicas for the
 # manual /orders path").
+logger = logging.getLogger("api.orders")
+
 _TRADE_LOCKS: dict[uuid.UUID, asyncio.Lock] = {}
 
 
@@ -166,7 +181,51 @@ async def serialize_user_trading(user: User = Depends(get_current_user)):
     """
     lock = _TRADE_LOCKS.setdefault(user.id, asyncio.Lock())
     async with lock:
-        yield
+        # The in-process lock above makes ONE process correct. It cannot
+        # reach the auto-trade worker, which docker-compose.yml runs as a
+        # separate service -- so `AutoTradeSupervisor` and this handler
+        # each read the account's exposure, neither sees the other's
+        # in-flight fill, and both approve. Measured with the worker held
+        # provably mid-fill: 111.2% of a 100,000 account against a 100%
+        # limit, and the refusal the control produces names that very
+        # figure ("Projected exposure 111.21%").
+        #
+        # Redis because it is already this system's cross-process
+        # coordination layer (kill switch, account halts, the atomic Lua
+        # rate limiter), and it is durable (`--appendonly yes`).
+        try:
+            token = await acquire_trade_lock(str(user.id))
+        except Exception:
+            # A risk gate that cannot be evaluated refuses rather than
+            # guesses -- round 129's call for stale market data, and the
+            # shape app/core/rate_limit.py already uses for its own
+            # dependency: log, honour the fail-open setting, and answer
+            # 503 rather than 500. This is a dependency being unreachable,
+            # not a defect in this service.
+            logger.exception("Could not reach Redis for the trade lock on account %s", user.id)
+            if not get_settings().trade_lock_fail_open:
+                raise HTTPException(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "Trade serialization is temporarily unavailable — try again shortly",
+                    headers={"Retry-After": str(TRADE_LOCK_TTL_SECONDS)},
+                ) from None
+            yield
+            return
+        if token is None:
+            # The other process held it for the whole wait. Refusing is
+            # right: the exposure this handler would gate against is
+            # actively being changed by someone else.
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "This account is busy placing another trade — try again shortly",
+                headers={"Retry-After": str(TRADE_LOCK_TTL_SECONDS)},
+            )
+        try:
+            yield
+        finally:
+            # Must survive the handler raising, or one 403 would wedge the
+            # account until the TTL expired.
+            await release_trade_lock(str(user.id), token)
 
 
 async def _stack_for(user: User, db: AsyncSession) -> _UserTradingStack:

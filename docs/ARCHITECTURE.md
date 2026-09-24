@@ -11117,6 +11117,114 @@ drives the 502 path and then requires a second request to be answered.
 Injecting a `serialize_user_trading` that acquires without `async with`
 fails exactly that test, on its deadline rather than by hanging the suite.
 
+## The API process and the auto-trade worker raced each other's risk gates
+
+`serialize_user_trading` in `app/api/orders.py` has held a per-user
+`asyncio.Lock` since round 152, which makes **one process** correct.
+`docker-compose.yml` runs `api` and `worker` as separate services, so that
+lock cannot reach `AutoTradeSupervisor` at all: both read the account's
+exposure out of Postgres, neither sees the other's in-flight fill, and both
+approve.
+
+Measured against the real ASGI app with the worker held provably mid-fill —
+stopped inside `execution_engine.submit`, past its own risk gate, with
+nothing yet written to `positions` — on a 100,000 account whose
+`max_exposure_pct` is 100:
+
+```
+before   Postgres exposure 0.00   POST /orders -> 201
+         final: manual 80,000 + auto 31,212 = 111,212 = 111.2%
+control  worker settled first     SAME order   -> 403
+         "Projected exposure 111.21% vs limit 100"        final 31.2%
+after    Postgres exposure 0.00   POST /orders -> 403, same reason
+```
+
+The after-state matches the sequential control exactly, reason included.
+That control is what makes the fix meaningful: a 503 from the lock itself
+would also have stopped the trade, but it would not have been the risk
+engine's verdict.
+
+### The fix: an account lock in Redis, taken by both processes
+
+`acquire_trade_lock` / `release_trade_lock` in `app/core/redis.py` are a
+`SET NX PX` lock keyed `tradelock:account:<user_id>`, released through a Lua
+compare-and-delete. Redis because it is already this system's cross-process
+coordination layer — the kill switch, account halts and the atomic Lua rate
+limiter all live there — and because it is durable (`--appendonly yes`,
+round 109).
+
+The API takes it inside `serialize_user_trading`, so all three
+account-backed entry paths (`POST /orders`, `POST /orders/{id}/cancel`,
+`POST /options/execute`) inherit it from the dependency they already share.
+The worker takes it around its whole per-candle block.
+
+### The first version of the fix did not hold
+
+The worker originally released the lock as soon as `engine.on_candle`
+returned. That is too early: `persist_position` — the write the *other*
+process's exposure gate reads — had not committed yet. Re-measured with a
+gate held in exactly that window, the same manual order came back 201 and
+the account reached 111.21% again.
+
+The critical section now covers the whole tail of the candle's processing
+rather than just `persist_position`, so that a later edit journalling
+something else a risk gate reads cannot fall outside it.
+`test_the_lock_is_held_until_the_position_row_is_committed` is that
+measurement, and injecting the original early release fails it.
+
+### A deferred candle has to be retryable
+
+`AutoTradeSupervisor` marks `_last_candle_seen[key]` *before* it reaches the
+lock. So the first version's "failing closed just costs one candle" was
+false: the worker skipped the entry bar and the guard then refused to look
+at that timestamp ever again — the entry was dropped permanently, not
+deferred. The two paths that decline to process a candle (the account is
+busy elsewhere, and Redis is unreachable under the fail-closed default) now
+roll that mark back, and the test asserts the next pass really does take the
+trade.
+
+### Two timing constants, and what couples them
+
+`TRADE_LOCK_TTL_SECONDS` and `TRADE_LOCK_WAIT_SECONDS` are both 8, and both
+must stay inside `RiskLimits.market_data_max_staleness_seconds` (10.0). That
+coupling is not obvious and it bit during development: a 15s TTL with a 20s
+wait meant a queued order sat long enough to be refused with
+`Data age 15.03s vs max 10.0s` — the lock manufacturing the staleness that
+rejected the trade.
+
+### Limitations, stated rather than hidden
+
+- **The lock is best-effort under a pathologically slow holder.** The TTL
+  exists so a crashed process cannot wedge an account forever, which means a
+  holder slower than 8s loses it while still believing it holds it. Held
+  artificially past the TTL during development, the 111.2% breach reappeared.
+  The Lua compare-and-delete bounds the damage — a lapsed holder's release
+  cannot delete its successor's lock, which is tested directly — but it does
+  not prevent the overlap itself.
+- **It serializes an account, not a symbol.** Two unrelated orders on one
+  account queue behind each other. That is the intended trade-off: the limit
+  being defended (`max_exposure_pct`) is account-wide.
+
+### What deliberately does not take it
+
+`POST /paper/{id}/candle` does not. A sandbox neither reads nor writes the
+account's book (round 165), so locking it would serialize a simulation
+against real trading for nothing.
+`test_every_process_that_can_open_a_position_takes_the_account_lock`
+asserts the set of participants, so a fourth writer cannot be added without
+one — and asserts `/paper`'s absence, so the exclusion stays a decision
+rather than an omission.
+
+### Fail-closed, with an escape hatch
+
+A risk gate that cannot be evaluated refuses rather than guesses — round
+129's call for stale market data, applied here. If Redis is unreachable the
+API answers 503 with `Retry-After` (not 500, and not a silent approval) and
+the worker skips the candle. `trade_lock_fail_open` defaults to `False` and
+flips that for an operator who would rather trade than stop; both directions
+are tested, because a fix that hard-coded either one would pass a
+single-sided test.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

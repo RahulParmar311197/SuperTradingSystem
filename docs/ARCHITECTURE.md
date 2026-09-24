@@ -11225,6 +11225,91 @@ flips that for an operator who would rather trade than stop; both directions
 are tested, because a fix that hard-coded either one would pass a
 single-sided test.
 
+## An account with no money had no risk limits at all
+
+Every percentage gate in both risk evaluators divides BY the account
+balance, and each one fell back to a **passing** value when that balance
+was falsy — the loss gates to 0%, the exposure gates to a flat 100.0,
+which clears a `max_*_pct` of 100 (the default for `max_exposure_pct`,
+`max_strategy_allocation_pct` and `max_correlated_exposure_pct`).
+
+Measured on one equity proposal — 100,000,000 of fresh notional against a
+50,000 daily loss and 10,000,000 of exposure already open, with the stock
+`RiskLimits`:
+
+```
+balance  100,000.00 -> refused, 5 checks failed
+balance        0.00 -> APPROVED, 0 checks failed
+balance   -5,000.00 -> APPROVED, 0 checks failed
+```
+
+This is not a hypothetical state. `UpstoxBroker.get_account` returns the
+broker's real figure, so an account funded to zero — or one whose balance
+an adapter could not parse — reports exactly this, and every
+capital-preservation control switches off at the moment the account can
+least afford it. A negative balance is worse than a zero one: the
+division flips sign, so a larger loss reads as a *smaller* percentage.
+
+### Two evaluators, two guards
+
+`app/risk/engine.py` gates equity orders (`POST /orders`,
+`PaperTradingEngine`, `AutoTradeSupervisor`) and
+`app/risk/options_risk.py` gates `POST /options/execute`. They take
+different proposals and share no code, so neither guard stands in for the
+other. With only the equity engine fixed, an options entry still went
+through on a blown account — caught by
+`tests/api/test_options_execute.py`, not by reasoning about it.
+
+### What the audit row says
+
+One `account_funded` check names the cause. The checks that *cannot* be
+computed are **skipped**, not recorded carrying a fabricated number: a
+percentage of nothing is not a number, and "we could not check" is no
+more "we checked and it failed" than it is "we checked and it is fine".
+That is the rule rounds 121 and 134 settled for `liquidity_acceptable`
+and the options gates, so a `RiskEvent` row still lists exactly what
+governed the decision.
+
+The checks that need no denominator keep running — `max_open_positions`,
+`max_trades_per_day`, the kill switch, market-data freshness, broker
+health. An earlier shape of this fix skipped the whole entry-only block
+and dropped those two caps as well, which are precisely the ones an
+emptied account is most likely to be hitting;
+`test_the_checks_that_need_no_balance_still_run` pins that.
+
+### Entry-only, deliberately
+
+An exit takes on no risk, and refusing one would strand a user in a
+position exactly when their account is emptiest — the same reasoning
+behind the reducing-order exemption these gates already sit inside. The
+guard fires at `<= 0` and nowhere else: a balance of one rupee is a real
+denominator, and the gates then refuse on their own arithmetic, which is
+a more informative refusal than "unfunded".
+
+### Found while measuring something else, and split from it
+
+This came out of a separate investigation: `MockBroker._balance` and
+`_equity` are assigned once in `__init__` and no fill ever touches them,
+so the risk model's denominator is a constant for every account with no
+connected broker — which is every account today. Measured over 100 losing
+trades on a 100,000 account: true equity 50,000, reported equity 100,000,
+every entry still risking the configured 0.5% of a balance that no longer
+existed, i.e. 1.0% of what was left.
+
+That fix is **not** in this change, and deliberately so. Making the
+balance move surfaced a pre-existing divergence between two books: a
+protective stop fires at the broker and `PositionManager` never learns of
+the fill, so after a round trip the broker holds a phantom short while
+the app believes it is flat. Measured identically on `main` and on the
+patched tree, so the balance change does not cause it — but it does make
+it harmful, because a closing order is sized from the balance while its
+quantity cap comes from the other book. That needs its own measurement
+and its own fix.
+
+The two are separable in the right order: this guard makes an unfunded
+account fail closed, so whenever the balance *does* start moving, running
+it to zero refuses trades rather than unlocking them.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

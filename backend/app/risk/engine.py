@@ -176,77 +176,107 @@ class RiskEngine:
         # an entry matching the market, fresh data, a healthy broker,
         # no abnormal price jump), which applies to exits just as much.
         if not proposal.is_reducing:
-            daily_loss_pct = max(-proposal.daily_pnl, 0) / proposal.account_balance * 100 if proposal.account_balance else 0
-            checks.append(
-                RiskCheck(
-                    "daily_loss_limit",
-                    daily_loss_pct < limits.max_daily_loss_pct,
-                    f"Daily loss {daily_loss_pct:.2f}% vs limit {limits.max_daily_loss_pct}%",
+            if proposal.account_balance <= 0:
+                # Every percentage check in this block divides BY the account
+                # balance, and each used to fall back to a passing value when
+                # that balance was falsy -- the loss gates to 0% and the
+                # exposure gates to a flat 100.0, which clears a `max_*_pct`
+                # of 100 (the default for two of them). Measured on one
+                # proposal, 100,000,000 of fresh notional against a 50,000
+                # daily loss and 10,000,000 already open:
+                #
+                #   balance  100,000.00 -> refused, 5 checks failed
+                #   balance        0.00 -> APPROVED, 0 checks failed
+                #   balance   -5,000.00 -> APPROVED, 0 checks failed
+                #
+                # So an account with no money had no limits at all -- not
+                # hypothetical, since `UpstoxBroker.get_account` reports the
+                # real figure and a funded-to-zero account gives exactly this.
+                # One check names the cause and the ones that cannot be
+                # computed are SKIPPED rather than recorded with a fabricated
+                # number, the rule rounds 121 and 134 settled for
+                # `liquidity_acceptable` and the options gates. The checks
+                # below that need no balance still run, so the audit row keeps
+                # everything that really was evaluated.
+                checks.append(
+                    RiskCheck(
+                        "account_funded",
+                        False,
+                        f"Account balance {proposal.account_balance:.2f} cannot support a new position",
+                    )
                 )
-            )
+            else:
+                daily_loss_pct = max(-proposal.daily_pnl, 0) / proposal.account_balance * 100 if proposal.account_balance else 0
+                checks.append(
+                    RiskCheck(
+                        "daily_loss_limit",
+                        daily_loss_pct < limits.max_daily_loss_pct,
+                        f"Daily loss {daily_loss_pct:.2f}% vs limit {limits.max_daily_loss_pct}%",
+                    )
+                )
 
-            weekly_loss_pct = max(-proposal.weekly_pnl, 0) / proposal.account_balance * 100 if proposal.account_balance else 0
-            checks.append(
-                RiskCheck(
-                    "weekly_loss_limit",
-                    weekly_loss_pct < limits.max_weekly_loss_pct,
-                    f"Weekly loss {weekly_loss_pct:.2f}% vs limit {limits.max_weekly_loss_pct}%",
+                weekly_loss_pct = max(-proposal.weekly_pnl, 0) / proposal.account_balance * 100 if proposal.account_balance else 0
+                checks.append(
+                    RiskCheck(
+                        "weekly_loss_limit",
+                        weekly_loss_pct < limits.max_weekly_loss_pct,
+                        f"Weekly loss {weekly_loss_pct:.2f}% vs limit {limits.max_weekly_loss_pct}%",
+                    )
                 )
-            )
 
-            projected_exposure_pct = (
-                (proposal.current_exposure + position_notional) / proposal.account_balance * 100
-                if proposal.account_balance
-                else 100.0
-            )
-            checks.append(
-                RiskCheck(
-                    "exposure_limit",
-                    projected_exposure_pct <= limits.max_exposure_pct,
-                    f"Projected exposure {projected_exposure_pct:.2f}% vs limit {limits.max_exposure_pct}%",
+                projected_exposure_pct = (
+                    (proposal.current_exposure + position_notional) / proposal.account_balance * 100
+                    if proposal.account_balance
+                    else 100.0
                 )
-            )
+                checks.append(
+                    RiskCheck(
+                        "exposure_limit",
+                        projected_exposure_pct <= limits.max_exposure_pct,
+                        f"Projected exposure {projected_exposure_pct:.2f}% vs limit {limits.max_exposure_pct}%",
+                    )
+                )
 
-            strategy_allocation_pct = (
-                (proposal.strategy_allocation + position_notional) / proposal.account_balance * 100
-                if proposal.account_balance
-                else 100.0
-            )
-            checks.append(
-                RiskCheck(
-                    "strategy_allocation_limit",
-                    strategy_allocation_pct <= limits.max_strategy_allocation_pct,
-                    f"Strategy allocation {strategy_allocation_pct:.2f}% vs limit {limits.max_strategy_allocation_pct}%",
+                strategy_allocation_pct = (
+                    (proposal.strategy_allocation + position_notional) / proposal.account_balance * 100
+                    if proposal.account_balance
+                    else 100.0
                 )
-            )
+                checks.append(
+                    RiskCheck(
+                        "strategy_allocation_limit",
+                        strategy_allocation_pct <= limits.max_strategy_allocation_pct,
+                        f"Strategy allocation {strategy_allocation_pct:.2f}% vs limit {limits.max_strategy_allocation_pct}%",
+                    )
+                )
 
-            # `correlated_exposure` is *signed*, relative to this
-            # instrument's price going up (see
-            # app.risk.correlation.correlated_exposure), so this trade's
-            # own notional joins it with its own sign before the magnitude
-            # is taken. `evaluate` has already returned above unless
-            # `entry != stop`, so the direction is never ambiguous here: a
-            # stop below the entry is a long, a stop above it is a short.
-            #
-            # Netting rather than summing absolute notionals is what makes
-            # this a *concentration* limit instead of a second gross-size
-            # limit. Gross size is `exposure_limit` immediately above,
-            # which is untouched by this and still caps the book.
-            signed_target_notional = (
-                position_notional if proposal.stop < proposal.entry else -position_notional
-            )
-            correlated_exposure_pct = (
-                abs(proposal.correlated_exposure + signed_target_notional) / proposal.account_balance * 100
-                if proposal.account_balance
-                else 100.0
-            )
-            checks.append(
-                RiskCheck(
-                    "correlated_exposure_limit",
-                    correlated_exposure_pct <= limits.max_correlated_exposure_pct,
-                    f"Correlated exposure {correlated_exposure_pct:.2f}% vs limit {limits.max_correlated_exposure_pct}%",
+                # `correlated_exposure` is *signed*, relative to this
+                # instrument's price going up (see
+                # app.risk.correlation.correlated_exposure), so this trade's
+                # own notional joins it with its own sign before the magnitude
+                # is taken. `evaluate` has already returned above unless
+                # `entry != stop`, so the direction is never ambiguous here: a
+                # stop below the entry is a long, a stop above it is a short.
+                #
+                # Netting rather than summing absolute notionals is what makes
+                # this a *concentration* limit instead of a second gross-size
+                # limit. Gross size is `exposure_limit` immediately above,
+                # which is untouched by this and still caps the book.
+                signed_target_notional = (
+                    position_notional if proposal.stop < proposal.entry else -position_notional
                 )
-            )
+                correlated_exposure_pct = (
+                    abs(proposal.correlated_exposure + signed_target_notional) / proposal.account_balance * 100
+                    if proposal.account_balance
+                    else 100.0
+                )
+                checks.append(
+                    RiskCheck(
+                        "correlated_exposure_limit",
+                        correlated_exposure_pct <= limits.max_correlated_exposure_pct,
+                        f"Correlated exposure {correlated_exposure_pct:.2f}% vs limit {limits.max_correlated_exposure_pct}%",
+                    )
+                )
 
             checks.append(
                 RiskCheck(

@@ -11310,6 +11310,71 @@ The two are separable in the right order: this guard makes an unfunded
 account fail closed, so whenever the balance *does* start moving, running
 it to zero refuses trades rather than unlocking them.
 
+## A seeded quote fired the protective stop it should never have reached
+
+`POST /orders` seeds `MockBroker` with the client's `payload.entry` so a
+simulated order has something to fill against. That seed also acted as the
+broker's tape, so it gave the resting protective stop a chance to fire —
+at a price the market never printed, taken from the caller's own request.
+The stop sold the whole position, and the closing order then went out on
+top of it.
+
+Measured through the real ASGI app, a 100-unit long closed at 75 against a
+stop of 95:
+
+```
+after open   broker +100 @ 100   resting 1   app +100
+after close  broker -100 @  75   resting 0   app    0
+```
+
+The account is left **short 100 units nobody asked for**, with no stop of
+its own, while `PositionManager` reports flat — so no endpoint,
+notification or journal row would ever mention it, and only
+`ReconciliationWorker` could notice. It is not a rare race: it fires
+whenever a long is closed below its own stop, which is the ordinary shape
+of a losing exit.
+
+The comment on that very call site already forbade this — *"Never let a
+real order's fill price be dictated by the caller"* — and the seed was
+doing exactly that, one layer down.
+
+### The fix
+
+`set_quote(..., is_market_print=False)` records the price without running
+the tape. `ensure_protective_stop` still withdraws the stop after the
+fill, which is where withdrawing it belongs — and a test pins that, because
+the lazy version of this fix (never fire the seed, never cancel the stop)
+leaves a live stop resting against a flat position, which at a real broker
+becomes the same naked reversal by a slower route.
+
+The flag is honoured in two places and needs both: the call site has to ask
+for it and `MockBroker.set_quote` has to obey. An injection that makes the
+broker ignore the flag fails the same two headline tests as the original
+bug, so neither half stands in for the other.
+
+### What this does not change
+
+A **real broker is unaffected**: nothing seeds its price, and it fires its
+own resting orders off its own tape. `set_quote`'s default still runs the
+tape, which is how a paper stop-loss fills at all — `app/paper/engine.py`
+feeds every candle through it, and a control test asserts a genuine print
+still triggers the resting stop. An over-fix that stopped resting orders
+firing anywhere would switch paper stop-losses off entirely and passes
+every other test in the file.
+
+### The related window, stated and not fixed
+
+On a real-broker path the protective stop is cancelled only **after** the
+closing fill (`ensure_protective_stop` runs on `position_after`). A stop
+that triggers in that interval would double-sell the same way. That is
+reasoned, not measured — there is no adapter here to reproduce it against —
+so it is recorded rather than patched. Fixing it means cancelling before
+the closing order is submitted, which introduces its own question: a
+reducing order can still be refused after the cancel (kill switch, stale
+data, an unhealthy broker), and cancelling first would leave a live
+position unprotected while its exit is refused. That trade-off needs a
+measurement before it gets a fix.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

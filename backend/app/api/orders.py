@@ -587,7 +587,25 @@ async def place_order(
         # own price from the market, not from what the client submitted
         # as "entry". Never let a real order's fill price be dictated by
         # the caller.
-        stack.broker.set_quote(payload.symbol, ltp=payload.entry)
+        #
+        # `is_market_print=False` because this is a seed, not a print. It
+        # used to act as the tape, so seeding it gave any resting
+        # protective stop a chance to fire at a price the market never
+        # made -- the caller's own number. Closing a long below its stop
+        # therefore sold twice: the stop fired for the full size during
+        # this line, and the closing order went out on top of it.
+        # Measured, one 100-unit long closed at 75 against a stop of 95:
+        #
+        #     after open   broker +100 @ 100   resting 1   app +100
+        #     after close  broker -100 @  75   resting 0   app    0
+        #
+        # The account is left SHORT 100 units nobody asked for, with no
+        # stop, and `PositionManager` reporting flat -- so nothing in the
+        # app would ever mention it and only `ReconciliationWorker` could
+        # notice. The stop is still cancelled after the fill, by
+        # `ensure_protective_stop` below, which is where withdrawing it
+        # belongs.
+        stack.broker.set_quote(payload.symbol, ltp=payload.entry, is_market_print=False)
 
     # Blueprint §56/§57: `payload.entry` is otherwise trusted input used
     # both to size the position (calculate_position_size) and to size that

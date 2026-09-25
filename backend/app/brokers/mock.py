@@ -42,9 +42,41 @@ class MockBroker(Broker):
         self._quotes: dict[str, Quote] = {}
         self._healthy = True
 
-    def set_quote(self, symbol: str, ltp: float, bid: float | None = None, ask: float | None = None) -> None:
+    def set_quote(
+        self,
+        symbol: str,
+        ltp: float,
+        bid: float | None = None,
+        ask: float | None = None,
+        *,
+        is_market_print: bool = True,
+    ) -> None:
+        """Record a quote, and by default let it act as this broker's tape.
+
+        `is_market_print=False` records the price WITHOUT giving resting
+        orders a chance to fire. Exactly one caller needs it, and needs it
+        badly: `app/api/orders.py` seeds this broker from `payload.entry`
+        so a simulated order has something to fill against, and that
+        number is the CLIENT'S, not a print the market ever made. Firing a
+        resting stop off it is the very thing the comment at that call
+        site forbids -- "never let a real order's fill price be dictated
+        by the caller".
+
+        Measured before this existed, one long closed below its own stop:
+        seeding the quote fired the resting SL_M for the full size, the
+        closing order then went out on top of it, and the account ended
+        up SHORT 100 units it never asked for while
+        `PositionManager` reported flat.
+
+            after open   broker +100 @ 100   resting 1   app +100
+            after close  broker -100 @  75   resting 0   app    0
+
+        A real broker is unaffected either way: nothing seeds its price,
+        and it fires its own resting orders off its own tape.
+        """
         self._quotes[symbol] = Quote(symbol=symbol, ltp=ltp, bid=bid, ask=ask, timestamp=datetime.now(timezone.utc))
-        self._trigger_resting_orders(symbol, ltp)
+        if is_market_print:
+            self._trigger_resting_orders(symbol, ltp)
 
     def _trigger_resting_orders(self, symbol: str, ltp: float) -> None:
         """Fill any resting stop whose trigger this price has crossed.

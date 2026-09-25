@@ -346,8 +346,25 @@ async def test_a_bar_just_inside_the_allowance_is_still_traded(require_infra):
     symbol = f"AHBD{uuid.uuid4().hex[:6].upper()}"
     bar_minutes = timeframe_to_minutes("15m")
     allowance_minutes = bar_minutes * MAX_CANDLE_AGE_IN_BARS
-    # One minute inside the limit, measured the correct way.
-    minutes_ago = bar_minutes + allowance_minutes - 1
+    # Anywhere strictly between the two readings will do, so sit in the
+    # MIDDLE of that window rather than at its edge.
+    #
+    # This used to be `bar_minutes + allowance_minutes - 1`, one minute
+    # inside the limit, which left 60 seconds of total slack -- and
+    # `_seed_at` floors `now` to the minute, so the bar starts out
+    # `now.second` seconds older than intended, spending a uniformly
+    # random 0-59 of those before any work happens. Whatever remained had
+    # to cover seeding three days of bars and running a full supervisor
+    # pass. It failed in CI on exactly that: the test is ~1s locally and
+    # the whole job took 359s on a loaded runner. Nothing about the
+    # supervisor was wrong; the fixture was timing itself out.
+    #
+    # The midpoint keeps every property the test relies on -- 38 < 45
+    # trades on the correct reading, 52 > 45 refuses on the wrong one --
+    # and raises the slack from 60 seconds to 420.
+    # The window is (allowance_minutes, bar_minutes + allowance_minutes)
+    # exclusive at both ends -- (45, 60) here -- so the midpoint is 53.
+    minutes_ago = (allowance_minutes + 1 + bar_minutes + allowance_minutes) // 2
     assert minutes_ago - bar_minutes < allowance_minutes
     assert minutes_ago - 1 > allowance_minutes, (
         "the fixture must straddle the two readings, or this test proves nothing"

@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -124,7 +124,27 @@ class ProposeTradeRequest(BaseModel):
     strategy_id: uuid.UUID
     instrument_id: uuid.UUID
     timeframe: str
-    max_risk_percent: float = 1.0
+    # The caller's ceiling on what the AI may propose risking, and the one
+    # number on this request that gates anything: `validate_ai_trade_proposal`
+    # rejects a proposal whose `risk_percent` exceeds it. Unbounded, it did
+    # the opposite of gating. Measured against that validator with a
+    # proposal asking for 99% of the account:
+    #
+    #     ceiling 1.0  -> valid=False, "risk_percent 99.0 exceeds ... 1.0%"
+    #     ceiling NaN  -> valid=True, errors=[]
+    #     ceiling inf  -> valid=True, errors=[]
+    #
+    # because every comparison against NaN is False. The endpoint did not
+    # return that false pass -- it 500'd instead, one step later: the value
+    # is echoed into `AIDecision.input_context`, `json.dumps` writes a bare
+    # `NaN`, and Postgres refuses it ("invalid input syntax for type json"),
+    # so the audit row this endpoint exists to write could not be written
+    # either. One bound closes both, and closes 0 and negatives with them:
+    # a `Field` comparison against NaN is False the same way, so a bounded
+    # field rejects it (measured -- this is why every field bounded by
+    # rounds 101/144/149/150 is already immune, and these were the
+    # leftovers). A percentage of an account cannot exceed 100.
+    max_risk_percent: float = Field(default=1.0, gt=0, le=100)
 
 
 class ProposeTradeResponse(BaseModel):

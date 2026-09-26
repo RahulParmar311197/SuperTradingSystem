@@ -141,12 +141,37 @@ async def compute_greeks(payload: GreeksRequest, user: User = Depends(get_curren
 # are both a slipped decimal point rather than an order anyone means.
 _MAX_QUANTITY = 1e12
 _MAX_LOT_SIZE = 1_000_000
+# Same ceiling as `POST /orders`: every price and quantity column is
+# `Numeric(18, 6)`, which holds at most 999999999999.999999. Declared here
+# rather than beside `ExecuteOptionLegRequest` because the payoff path
+# below needs it too.
+_MAX_PREMIUM = 1e12
 
 
 class StrategyLegInput(BaseModel):
-    strike: float
-    premium_call: float | None = None
-    premium_put: float | None = None
+    """One strike's quotes, as `POST /options/strategy` receives them.
+
+    Bounded for the same reason `ExecuteOptionLegRequest` below is, and
+    the comment there already spelled out the half that was missing:
+    non-finite values were being rejected only "incidentally, ... because
+    every comparison against `inf`/NaN is False". On this path nothing
+    compared them at all, so they flowed straight into the payoff
+    arithmetic and out into the response. Measured on a 25000/25200 bull
+    call spread:
+
+        premium_call 120.0    -> 200, legs and payoff as expected
+        premium_call NaN      -> ValueError: Out of range float values
+                                 are not JSON compliant
+        premium_call Infinity -> the same
+
+    That is the response serializer refusing to encode the numbers this
+    endpoint computed -- a 500 on a read-only endpoint whose whole job is
+    to answer "what does this spread pay off?" before someone trades it.
+    """
+
+    strike: float = Field(gt=0, lt=_MAX_PREMIUM)
+    premium_call: float | None = Field(default=None, gt=0, lt=_MAX_PREMIUM)
+    premium_put: float | None = Field(default=None, gt=0, lt=_MAX_PREMIUM)
 
 
 class BuildStrategyRequest(BaseModel):
@@ -258,11 +283,6 @@ async def build_option_strategy(payload: BuildStrategyRequest, user: User = Depe
         net_premium=summary.net_premium,
         capital_requirement=summary.capital_requirement,
     )
-
-
-# Same ceiling as `POST /orders`: every price and quantity column is
-# `Numeric(18, 6)`, which holds at most 999999999999.999999.
-_MAX_PREMIUM = 1e12
 
 
 class ExecuteOptionLegRequest(BaseModel):

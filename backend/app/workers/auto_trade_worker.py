@@ -112,6 +112,16 @@ class AutoTradeSupervisor:
         self._engines: dict[tuple[str, str, str], PaperTradingEngine] = {}
         self._engine_strategy_versions: dict[tuple[str, str, str], int] = {}
         self._opened_at: dict[tuple[str, str, str], datetime] = {}
+        # The strategy version that was live when each open position was
+        # ENTERED, keyed by the opener's triple exactly as `_opened_at` is.
+        # Blueprint §91 is "always know exactly which version created a
+        # trade", and `PATCH /strategies/{id}` bumps `version` whenever the
+        # user edits, so reading the row's version at CLOSE time answers a
+        # different question. `POST /paper` already gets this right --
+        # `app/api/paper.py` captures `strategy_row.version` when the
+        # session starts and journals that -- and this is the same capture
+        # on the unattended path.
+        self._opened_version: dict[tuple[str, str, str], int] = {}
         self._last_candle_seen: dict[tuple[str, str, str], datetime] = {}
         # One PositionManager per *user* (not per engine) -- an engine
         # exists per (strategy, instrument) pair, but a user's
@@ -649,6 +659,7 @@ class AutoTradeSupervisor:
 
             if outcome.order_created:
                 self._opened_at[key] = latest.timestamp
+                self._opened_version[key] = strategy_row.version
                 # Same gap on the fill side: `orders_total` counted manual
                 # (app/api/orders.py) and options (app/api/options.py, round
                 # 162) orders and no autonomous one. `order_status` is the
@@ -730,6 +741,24 @@ class AutoTradeSupervisor:
                 # back to the closing candle, collapsing the holding period to
                 # zero.
                 opened_at = self._opened_at.pop(owner_key, latest.timestamp)
+                # ...and the version that was live then, not now. Measured:
+                # a position entered under version 1, the strategy edited
+                # mid-trade, and the closing `Trade` row stamped version 2 --
+                # so `GET /strategies/{id}/versions/{version}` hands back a
+                # DSL that did not produce the trade, which is the one thing
+                # blueprint §91 exists to prevent. The comment on the engine
+                # swap above had already named this ("the `Trade` row
+                # journaled below still stamped `strategy_row.version` (the
+                # *current* version), making the audit trail actively
+                # wrong"); that fix corrected the ENGINE and left the stamp.
+                #
+                # The fallback is the same one `opened_at` uses and has the
+                # same limitation: this registry lives in memory, so a worker
+                # restart between entry and exit loses the entry version and
+                # the row records the current one. `positions` has no version
+                # column to rehydrate from -- recorded in
+                # docs/ARCHITECTURE.md rather than silently narrowed.
+                opened_version = self._opened_version.pop(owner_key, owner_row.version)
                 risk_per_unit = abs(snapshot["entry_price"] - snapshot["stop"]) if snapshot["stop"] else None
                 r_multiple = (
                     (outcome.closed_position_pnl / snapshot["quantity"]) / risk_per_unit if risk_per_unit else None
@@ -739,7 +768,7 @@ class AutoTradeSupervisor:
                         user_id=user.id,
                         instrument_id=instrument.id,
                         strategy_id=owner_row.id,
-                        strategy_version=owner_row.version,
+                        strategy_version=opened_version,
                         execution_mode=ExecutionMode.PAPER,
                         direction=snapshot["direction"],
                         entry_price=snapshot["entry_price"],

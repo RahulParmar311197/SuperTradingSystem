@@ -11640,6 +11640,66 @@ the endpoint maps that `ValueError` to a 422. Both layers now have a test
 pinning it, so the absence of a bound there is a recorded decision rather
 than an oversight.
 
+## A trade was stamped with the strategy version live at its close
+
+Blueprint §91 is *"always know exactly which version created a trade"*,
+and `app/api/strategies.py` states the guarantee plainly: a trade's
+`strategy_version` *"can always be resolved back to the exact DSL that
+produced it via `GET /strategies/{id}/versions/{version}`"*.
+`PATCH /strategies/{id}` bumps `version` on every edit, and the
+auto-trade worker read that number off the strategy row **at close
+time**.
+
+Measured, one position across two candles with an edit in between:
+
+```
+version at entry                  1
+version after the edit            2
+strategy_version on the trade     2     <- resolves to the wrong DSL
+```
+
+The audit trail does not merely lose information — it points at a
+definition that provably did not produce the trade, which is worse than
+recording nothing, because it reads as authoritative.
+
+### The comment already said so
+
+The engine-swap branch in `app/workers/auto_trade_worker.py` had named
+this exact consequence:
+
+> *the `Trade` row journaled below still stamped `strategy_row.version`
+> (the current version), making the audit trail actively wrong, not just
+> stale*
+
+That earlier fix corrected **which DSL the engine evaluates** for future
+candles and left the stamp reading live. Fixing the engine and leaving
+the journal is the whole shape of this round's defect.
+
+### The fix, and the reference it copies
+
+`POST /paper` already gets this right: `app/api/paper.py` captures
+`strategy_row.version` when the session is created and journals
+`session.strategy_version` at trade time, so it never consults the live
+row. The worker now captures the same fact at entry, in
+`_opened_version`, keyed by the opener's `(user, strategy, instrument)`
+triple exactly as `_opened_at` already is — and popped at close for the
+same reason, so the next trade on a reused key cannot inherit the
+previous trade's version.
+
+A structural test pins the paper path as that reference: if it ever
+starts reading the live row, this file's premise is gone and that path
+needs the same fix.
+
+### The restart limitation, stated not narrowed
+
+`_opened_version` lives in memory, like `_opened_at` beside it. A worker
+restart between entry and exit loses the entry version, and the closing
+row records the current one — today's behaviour, unchanged. `positions`
+has no version column to rehydrate from, so closing that window means a
+schema change; the fallback is the same one `opened_at` already uses and
+the same "best answer available" convention as `owner_strategy_id`
+being `None`. Recorded here rather than silently narrowed.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

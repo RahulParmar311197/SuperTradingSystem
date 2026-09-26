@@ -121,6 +121,20 @@ def validate_ai_trade_proposal(
             f"Proposed risk/reward {risk_reward} is below the computed {deterministic_result.risk_reward}"
         )
 
+    # A ceiling this function cannot compare against is not a ceiling. Every
+    # comparison against NaN is False, so `risk_percent > nan` waved through
+    # a proposal asking for 99% of the account -- measured, `valid=True,
+    # errors=[]`, where the same proposal against a ceiling of 1.0 is
+    # correctly refused. `POST /ai/propose-trade` now bounds the field so
+    # this cannot arrive from there, but this function is public, has its
+    # own tests, and is the layer that decides: a gate that fails OPEN on
+    # an unusable limit is the wrong default for the next caller too.
+    if not math.isfinite(max_risk_percent) or max_risk_percent <= 0:
+        return AIValidationResult(
+            valid=False,
+            errors=[f"Unusable max_risk_percent {max_risk_percent}: cannot validate the proposed risk"],
+        )
+
     risk_percent = _numeric_field(proposal, "risk_percent", errors)
     if risk_percent is not None and (risk_percent <= 0 or risk_percent > max_risk_percent):
         errors.append(f"Proposed risk_percent {risk_percent} exceeds the maximum allowed {max_risk_percent}%")

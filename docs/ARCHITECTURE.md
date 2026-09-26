@@ -11569,6 +11569,77 @@ that drops the flag fails exactly that test.
 The helper's existing rule is unchanged: a symbol with no cached tick is
 left as-is rather than marked at a guessed price, on both paths.
 
+## NaN and Infinity got in through two client floats
+
+Python's `json.loads` accepts the bare tokens `NaN`, `Infinity` and
+`-Infinity`. They are not valid JSON, but every JSON body this app parses
+goes through it, so a client can send them. A Pydantic field with no
+constraints takes them verbatim; a field with `gt=`/`lt=` rejects them,
+because every comparison against NaN is False. **That is why the fields
+bounded by rounds 101/144/149/150 were already immune, and why these two
+were the leftovers** — the property was a side effect of those bounds, so
+the two fields nobody had bounded were the two that let them through.
+
+Both measured through the real ASGI app.
+
+### 1. A risk ceiling that could not be compared against
+
+`POST /ai/propose-trade`'s `max_risk_percent` is the ceiling
+`validate_ai_trade_proposal` enforces on what the AI may propose risking.
+Against a proposal asking for 99% of the account:
+
+```
+ceiling 1.0  -> valid=False, "risk_percent 99.0 exceeds the maximum allowed 1.0%"
+ceiling NaN  -> valid=True, errors=[]
+ceiling inf  -> valid=True, errors=[]
+```
+
+The endpoint never returned that false pass — it 500'd one step later
+instead. The value is echoed into `AIDecision.input_context`,
+`json.dumps` emits a bare `NaN`, and Postgres refuses it (`invalid input
+syntax for type json`), so the audit row this endpoint exists to write
+could not be written either. Blueprint §79's "you can't evaluate AI
+behavior over time without a record of what it actually said" is exactly
+what the crash destroys.
+
+**Two layers, and neither stands in for the other.** The request model
+now bounds the field (`gt=0, le=100` — a percentage of an account cannot
+exceed 100, and the same bound closes 0 and negatives). And
+`validate_ai_trade_proposal` now refuses a ceiling it cannot enforce
+rather than waving the proposal through: that function is public, has its
+own tests, and is the layer that decides — **a gate that fails OPEN on an
+unusable limit is the wrong default for the next caller too.**
+
+### 2. A payoff computed from numbers that could not be serialized
+
+`POST /options/strategy`'s leg quotes were unbounded, so nothing compared
+them and they flowed into the payoff arithmetic and out into the
+response:
+
+```
+premium_call 120.0    -> 200, legs and payoff as expected
+premium_call NaN      -> ValueError: Out of range float values are not JSON compliant
+premium_call Infinity -> the same
+```
+
+A 500 on a read-only endpoint whose answer is what someone reads *before*
+choosing a strategy. `POST /options/execute`'s legs were already bounded
+by round 102, and that comment had noted non-finite values were rejected
+there only "incidentally, ... because every comparison against `inf`/NaN
+is False" — on this path nothing compared them at all. `strike`,
+`premium_call` and `premium_put` now carry the same `_MAX_PREMIUM` bound
+the execution path uses.
+
+### Not a third site, checked rather than assumed
+
+`train_pct` and `validation_pct` on `POST /backtest/validate` are
+unbounded in the request model too, and the obvious guess is that they
+are a third instance. They are not: `split_periods` already rejects
+anything outside `(0, 1)` — NaN included, since `0 < nan` is False — and
+the endpoint maps that `ValueError` to a 422. Both layers now have a test
+pinning it, so the absence of a bound there is a recorded decision rather
+than an oversight.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

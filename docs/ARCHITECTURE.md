@@ -11506,6 +11506,69 @@ its coverage survived the rebuild. For any positive balance some stop
 width still flattens; at a zero balance the floor above is what keeps
 that true.
 
+## Reported equity ignored every open position
+
+`AccountInfo.equity` means `balance + open unrealized` — that is what a
+real adapter returns (`UpstoxBroker.get_account`) and what round 170 made
+`MockBroker` derive. Three readers report it: `GET /portfolio`,
+`GET /paper/{id}`, and every `portfolio_snapshots` row. Two of the three
+were wrong, for three separate reasons.
+
+Measured, a 100-share long opened at 100 with the market at 120:
+
+```
+GET /portfolio -> balance              100000.0
+                  equity               100000.0   <- as if nothing were open
+                  total_unrealized_pnl   2000.0   <- the same payload
+
+snapshot       -> balance 100000.0   equity 100000.0
+                  position_manager unrealized 0.0  <- nothing marked at all
+```
+
+The `/portfolio` response contradicts itself in a single body. Round 170
+made this worse in the way that matters: before it, `equity` was frozen
+at `starting_balance`, which is wrong in a way a reader notices. Now it
+tracks realized P&L exactly and silently omits unrealized — plausible,
+and therefore trusted.
+
+### Three causes, and the first alone fixes neither endpoint
+
+1. **`_mark_open_positions_to_market` marked one book of two.** It marked
+   `PositionManager` and not the broker, so `BrokerPosition.unrealized_pnl`
+   stayed 0.0 and the derived equity was just cash.
+   `PaperTradingEngine.on_candle` already marks both, two lines apart —
+   which is why `GET /paper/{id}` was the one correct reader, and is the
+   reference this now matches.
+2. **`GET /portfolio` read the account before marking.** With (1) fixed
+   and the ordering left alone, the broker's position showed +2,000 and
+   the response still said `equity == balance`. The mark was happening on
+   the very next line, which is what made the ordering invisible — it was
+   caught by re-running the measurement after the fix, not by reading it.
+3. **`portfolio_snapshots._snapshot_one` never called that helper**, and
+   read the account first as well. Standing alone, with nothing else
+   touching the stack, it marked neither book.
+
+Cause 3 is the one with a lasting consequence. `snapshot_all_stacks`
+deliberately skips any stack with nothing open, so **every row it writes
+is for exactly the case this got wrong**, and the table has no
+`unrealized_pnl` column — `equity` is the only place open P&L can appear
+in the stored history. The persisted equity curve, which is what a
+drawdown or performance review reads, recorded cash and called it equity.
+
+### Why the mark is not a print
+
+The broker mark passes `is_market_print=False`, and that is load-bearing
+rather than cautious. `set_quote`'s default lets a price act as the
+broker's tape, so a cached Redis price would give resting protective
+stops a chance to fire — the round-169 phantom-short divergence, this
+time triggered by *reading* the portfolio. A test pins it: with a cached
+price straight through the protective stop, `GET /portfolio` must leave
+the resting order resting and the broker's book untouched. The over-fix
+that drops the flag fails exactly that test.
+
+The helper's existing rule is unchanged: a symbol with no cached tick is
+left as-is rather than marked at a guessed price, on both paths.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

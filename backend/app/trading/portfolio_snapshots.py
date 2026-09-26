@@ -24,7 +24,12 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.orders import _execution_mode_for, _UserTradingStack, all_stacks
+from app.api.orders import (
+    _execution_mode_for,
+    _mark_open_positions_to_market,
+    _UserTradingStack,
+    all_stacks,
+)
 from app.database.models.instruments import Instrument
 from app.options.snapshots import latest_option_snapshot
 from app.database.models.trading import PortfolioSnapshot
@@ -63,8 +68,21 @@ async def _net_greeks(db: AsyncSession, positions) -> tuple[float, float, float,
 
 async def _snapshot_one(db: AsyncSession, user_id: uuid.UUID, stack: _UserTradingStack) -> None:
     execution_mode = _execution_mode_for(stack)
+    # Marked BEFORE the account is read, and through the same helper
+    # `GET /portfolio` uses. This wrote `open_positions` raw, so it marked
+    # neither book: `equity` was cash even for an account deep in profit,
+    # and this row is the only place unrealized P&L can appear in the
+    # stored history -- there is no `unrealized_pnl` column. Measured with
+    # nothing else touching the stack, a 100-share long at 100 with the
+    # market at 120:
+    #
+    #     snapshot balance 100000.0   equity 100000.0
+    #     position_manager unrealized 0.0
+    #
+    # `snapshot_all_stacks` skips any stack with nothing open, so every
+    # row it does write is for exactly the case this got wrong.
+    positions = await _mark_open_positions_to_market(stack, str(user_id))
     account = await stack.broker.get_account()
-    positions = stack.position_manager.open_positions(str(user_id))
     exposure = await compute_portfolio_exposure(db, user_id, execution_mode=execution_mode)
     net_delta, net_gamma, net_theta, net_vega = await _net_greeks(db, positions)
 

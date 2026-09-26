@@ -29,8 +29,14 @@ class PortfolioResponse(BaseModel):
 @router.get("/portfolio", response_model=PortfolioResponse)
 async def get_portfolio(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> PortfolioResponse:
     stack = await _stack_for(user, db)
-    account = await stack.broker.get_account()
+    # Mark BEFORE reading the account, not after. `equity` is
+    # `balance + open unrealized`, so reading it first reported the
+    # pre-mark figure -- and because the mark was happening on the very
+    # next line, the ordering was invisible: with the marking fixed but
+    # this order left alone, the broker's position showed +2,000 while
+    # this response still said equity == balance.
     positions = await _mark_open_positions_to_market(stack, str(user.id))
+    account = await stack.broker.get_account()
     # Positions are persisted under whichever execution_mode actually
     # produced them (blueprint §101) -- a user with no connected broker
     # trades PAPER against MockBroker, and querying the LIVE default here

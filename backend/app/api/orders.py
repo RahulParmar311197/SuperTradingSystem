@@ -410,12 +410,31 @@ async def _mark_open_positions_to_market(stack: "_UserTradingStack", user_id: st
     dataclass default of 0.0 forever, no matter how far price moved,
     silently misreporting real P&L on the one path that risks real money.
     Uses whatever price `MarketDataWorker` last cached in Redis; a symbol
-    with no cached tick yet is left as-is rather than guessed at."""
+    with no cached tick yet is left as-is rather than guessed at.
+
+    BOTH books are marked at the same price, because two of them exist and
+    each has a reader. The broker's copy feeds `AccountInfo.equity`
+    (`balance + open unrealized`), which `GET /portfolio`,
+    `GET /paper/{id}` and every `portfolio_snapshots` row report. Marking
+    only the manager gave `GET /portfolio` a payload that contradicted
+    itself -- measured, a 100-share long at 100 with the market at 120:
+
+        balance                100000.0
+        equity                 100000.0     <- cash, as if nothing were open
+        total_unrealized_pnl     2000.0     <- same response
+
+    `PaperTradingEngine.on_candle` already marks both, two lines apart;
+    this path marked one. `is_market_print=False` is load-bearing rather
+    than cautious: letting a cached Redis price act as the broker's tape
+    would fire resting protective stops behind the app's back, which is
+    exactly the phantom-short divergence `set_quote`'s own docstring
+    records."""
     positions = stack.position_manager.open_positions(user_id)
     for position in positions:
         price = await get_latest_price(position.symbol)
         if price is not None:
             stack.position_manager.mark_to_market(user_id, position.symbol, price)
+            stack.broker.set_quote(position.symbol, ltp=price, is_market_print=False)
     return positions
 
 

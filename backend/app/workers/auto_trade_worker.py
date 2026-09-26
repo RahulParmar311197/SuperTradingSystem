@@ -50,6 +50,7 @@ from app.database.session import async_session_factory
 from app.market.repository import get_candles
 from app.market.timeframes import timeframe_to_minutes
 from app.notifications.service import create_notification
+from app.brokers.mock import MockBroker
 from app.paper.engine import PaperTradingEngine, RiskWindow
 from app.risk.limits import RiskLimits
 from app.strategy.dsl import StrategyDefinition
@@ -83,6 +84,10 @@ AUTO_SOURCE_KEY = "auto"
 # closes, so applying the tick limit here would refuse every candle this
 # loop has ever seen.
 MAX_CANDLE_AGE_IN_BARS = 3
+
+# "Every auto trade ever", for rebuilding this account's cash -- the one
+# quantity whose window is the whole history.
+_EPOCH = datetime.min.replace(tzinfo=timezone.utc)
 
 
 def candle_age_seconds(candle, timeframe: str, now: datetime) -> float:
@@ -126,6 +131,14 @@ class AutoTradeSupervisor:
         # the cap they configured -- and the daily-loss halt only fired
         # once a *single* pair had lost the whole limit by itself.
         self._risk_windows: dict[str, RiskWindow] = {}
+        # One broker per ACCOUNT, for the same reason `_position_managers`
+        # and `_risk_windows` are per-account: `PaperTradingEngine` builds
+        # its own `MockBroker` when none is passed, and this supervisor
+        # runs one engine per (user, strategy, instrument). Cash is an
+        # account-level quantity, so N engines with N brokers would give
+        # one account N independent balances -- harmless only while that
+        # balance never moved, which is what this round changed.
+        self._brokers: dict[str, MockBroker] = {}
         # Positions already reported as unmanaged, so the error below is one
         # line per position rather than one per 60-second pass.
         self._reported_unmanaged: set[str] = set()
@@ -355,6 +368,18 @@ class AutoTradeSupervisor:
                     risk_week=now.isocalendar()[:2],
                 )
                 self._risk_windows[str(user.id)] = risk_window
+            broker = self._brokers.get(str(user.id))
+            if broker is None:
+                broker = MockBroker()
+                # Cash rebuilt from the journal, exactly as the counters
+                # above are and for the same reason: this process holds
+                # the only copy, so without it every worker restart hands
+                # the risk gates a denominator that has reverted to the
+                # starting balance.
+                broker.restore_realized_pnl(
+                    await load_auto_trade_realized_pnl_since(db, user.id, since=_EPOCH)
+                )
+                self._brokers[str(user.id)] = broker
             engine = PaperTradingEngine(
                 strategy,
                 symbol=instrument.symbol,
@@ -368,6 +393,7 @@ class AutoTradeSupervisor:
                 position_manager=position_manager,
                 strategy_id=str(strategy_row.id),
                 risk_window=risk_window,
+                broker=broker,
                 source_key=AUTO_SOURCE_KEY,
             )
             self._engines[key] = engine

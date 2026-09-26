@@ -11375,6 +11375,137 @@ data, an unhealthy broker), and cancelling first would leave a live
 position unprotected while its exit is refused. That trade-off needs a
 measurement before it gets a fix.
 
+## The account's cash never moved, so every risk limit was a constant
+
+`MockBroker` is what every account with no connected broker account trades
+against — every paper account, every autonomous account, and every manual
+`/orders` stack in this deployment. Its `_balance` and `_equity` were both
+assigned once in `__init__` and no fill ever touched them.
+
+Four callers read `get_account()`: `PaperTradingEngine._maybe_enter`
+(which sizes every paper and autonomous entry), `POST /orders`,
+`POST /options/execute`, and `GET /portfolio`/`portfolio_snapshots`. So
+the denominator of the entire risk model was frozen at 100,000 for the
+life of the process.
+
+Measured over 100 losing trades on a 100,000 account:
+
+```
+cycle  0   realized      0.00   balance 100000.00   sized qty 151.5152
+cycle 99   realized -39118.55   balance  60881.45   sized qty  92.2446
+final      balance  60577.04 == 100000 + realized (-39422.96)
+```
+
+Every one of those 100 entries used to size 151.5152 — the configured
+0.5% of a balance that no longer existed, which by the end was 0.82% of
+what was actually left. `max_exposure_pct`, `max_daily_loss_pct`,
+`max_weekly_loss_pct`, `max_strategy_allocation_pct` and
+`max_correlated_exposure_pct` are all fractions of that same number, so
+**every percentage limit loosened in real terms exactly as the account
+shrank** — the opposite of what a risk limit is for. `GET /portfolio`
+also contradicted itself, printing equity 100,000 beside a correct
+negative `total_realized_pnl`.
+
+### The fix, and the two layers it exposed
+
+`_apply_fill_to_position` takes realized P&L into `_balance` on the
+reducing branch, re-basing the cost basis when a fill sells through zero
+and out the other side (without that, the flipped remainder carries the
+old side's average and invents a second P&L when it closes).
+`_mark_to_market` writes `unrealized_pnl` on every quote, and
+`get_account` derives `equity = balance + unrealized`. Opening a position
+deliberately does **not** debit the notional: this is cash, not margin,
+and `max_exposure_pct` is a percentage *of* the account, so debiting
+would make the exposure gate tighten itself as positions open.
+
+Making the balance move turned two dormant things into live defects.
+
+**1. It lives in this process.** Rounds 154 and 155 rebuilt
+`trades_today`, `daily_pnl` and `weekly_pnl` from the journal because a
+restart must not lift a limit. The denominator those three are measured
+*against* was left behind, which was harmless only while it was a
+constant. Measured through `POST /orders` on a -5,000 realized:
+
+```
+before restart -> 403 "Daily loss 5.26% vs limit 2.0%"
+after  restart -> 403 "Daily loss 5.00% vs limit 2.0%"
+```
+
+Same loss, same journal, two different numbers — and always in the
+direction of reporting the account as healthier than it is. Both callers
+now rebuild cash from the journal beside the counters:
+`_stack_for` for the manual path, and `AutoTradeSupervisor` for the
+autonomous one. The window is the **whole history** (`_EPOCH`), not
+`day_start`: a loss from last month is outside every risk window but it
+is still gone from the account.
+
+The rebuild is guarded by `isinstance(stack.broker, MockBroker)`. A real
+adapter's balance lives at the broker and is authoritative; overwriting
+it with `starting_balance + our journal sum` would be a worse bug than
+the one this fixes.
+
+**2. One account had N balances on the autonomous path.**
+`PaperTradingEngine` builds its own `MockBroker` when none is passed, and
+`AutoTradeSupervisor` runs one engine per `(user, strategy, instrument)`.
+In the test database a single user resolves to 492 engines — 492
+independent 100,000 accounts, where a loss booked by one was invisible to
+every other's risk budget forever. Fixed the same way, and for the same
+reason, as the `_position_managers` and `_risk_windows` registries beside
+it: one `MockBroker` per account, in `_brokers`.
+
+### An exit could be sized down to nothing
+
+`calculate_position_size` returns 0 for any balance `<= 0`, and
+`POST /orders` sizes a **reducing** order from it too. Once the balance
+could reach zero, so could this. Measured, an account whose journal
+totals -100,000 holding an open 100-share long:
+
+```
+POST /orders SHORT entry=99 stop=103 -> 201, quantity 0.0
+positions still open                 -> [100.0]
+```
+
+A `201` reporting a zero-share fill with the position untouched, and no
+stop tight enough to help, because every width divides into a zero
+budget. `POST /orders` is the only way out of a position —
+`app/api/positions.py` and `app/api/portfolio.py` are read-only, and
+`POST /orders/{id}/cancel` refuses anything already filled — so that is a
+user locked into a trade, told it closed.
+
+The floor is narrow on purpose: when a reducing order's budget-derived
+size is zero, it closes the whole open quantity. The risk budget is how
+much *new* risk to take and an exit takes none, so when the budget cannot
+express an exit at all, the position closes. Partial close is untouched —
+it lives in the `min(quantity, abs(existing.quantity))` clamp above the
+floor, which only binds while the budget is positive.
+
+An **entry** on such an account is unaffected: round 168's
+`account_funded` gate refuses it with a 403 before sizing matters, and a
+test pins that it is still refused rather than falling through to the
+floor or becoming a 201 for zero shares.
+
+### What this changes for an existing test
+
+`test_a_position_can_still_be_closed_after_the_daily_loss_limit_trips`
+closed its position with a stop the same width as the entry's. With the
+balance now moving, the realized -5,000 in that test drops the budget to
+95,000 x 0.5% = 475, so a 5-wide close is 95 of the 100 open:
+
+```
+stop 104 (5 wide) -> quantity  95.0, 5.0 left open
+stop 103 (4 wide) -> quantity 100.0, flat
+```
+
+That is the documented partial-close capability (a **wider** closing stop
+closes less, see
+`test_partial_close_journals_only_the_quantity_actually_closed`) showing
+through a smaller budget, not a regression. The test was rebuilt around
+the fix with a tighter stop, and the original bug it guards — entry risk
+checks applied to a reducing order — was re-injected afterwards to prove
+its coverage survived the rebuild. For any positive balance some stop
+width still flattens; at a zero balance the floor above is what keeps
+that true.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

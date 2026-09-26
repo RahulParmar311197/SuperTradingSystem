@@ -27,8 +27,15 @@ class MockBroker(Broker):
         reject_probability: float = 0.0,
         partial_fill_probability: float = 0.0,
     ) -> None:
+        # Cash: the starting balance plus every realized P&L this broker
+        # has produced. Not a margin model -- opening a position does not
+        # debit the notional, because `max_exposure_pct` is defined as a
+        # percentage of the account and debiting would make the exposure
+        # gate tighten itself as positions open. Equity is derived in
+        # `get_account` as this plus open unrealized P&L, which is what a
+        # real adapter's `equity` means (see UpstoxBroker.get_account).
         self._balance = starting_balance
-        self._equity = starting_balance
+        self.starting_balance = starting_balance
         self.slippage_pct = slippage_pct
         self.reject_probability = reject_probability
         self.partial_fill_probability = partial_fill_probability
@@ -75,8 +82,21 @@ class MockBroker(Broker):
         and it fires its own resting orders off its own tape.
         """
         self._quotes[symbol] = Quote(symbol=symbol, ltp=ltp, bid=bid, ask=ask, timestamp=datetime.now(timezone.utc))
+        self._mark_to_market(symbol, ltp)
         if is_market_print:
             self._trigger_resting_orders(symbol, ltp)
+            # Again after the resting stops: one that just fired changed
+            # the position this price marks, and the stale mark would
+            # otherwise survive until the next tick.
+            self._mark_to_market(symbol, ltp)
+
+    def _mark_to_market(self, symbol: str, ltp: float) -> None:
+        """`BrokerPosition.unrealized_pnl` had no writer, so it was 0.0 for
+        the life of every position. `set_quote` is this broker's only tape,
+        so it is where a real broker's mark would happen."""
+        position = self._positions.get(symbol)
+        if position is not None:
+            position.unrealized_pnl = (ltp - position.average_price) * position.quantity
 
     def _trigger_resting_orders(self, symbol: str, ltp: float) -> None:
         """Fill any resting stop whose trigger this price has crossed.
@@ -110,11 +130,49 @@ class MockBroker(Broker):
             order.updated_at = datetime.now(timezone.utc)
             self._apply_fill_to_position(request.symbol, request.direction, request.quantity, fill_price)
 
+    def restore_realized_pnl(self, realized_pnl: float) -> None:
+        """Rebuild this broker's cash from the journal after a restart.
+
+        A real adapter needs nothing like this: its balance lives at the
+        broker and survives our process dying. This one's lives in
+        `_balance`, so without this a restart silently resets the account
+        to `starting_balance` -- and now that the balance actually moves,
+        that is the risk denominator jumping back up. Exactly the defect
+        rounds 154 and 155 removed for `trades_today`/`daily_pnl`/
+        `weekly_pnl`, which are rebuilt from the same journal a few lines
+        from each caller of this.
+
+        Measured before this existed: an account past its daily loss
+        limit was refused with one percentage, and after a restart
+        refused with a different one -- same loss, same journal, a
+        denominator that had reverted.
+        """
+        self._balance = self.starting_balance + realized_pnl
+
     def set_healthy(self, healthy: bool) -> None:
         self._healthy = healthy
 
     async def get_account(self) -> AccountInfo:
-        return AccountInfo(account_id="MOCK", balance=self._balance, equity=self._equity)
+        """Balance and equity that actually move with this account's P&L.
+
+        Both used to be frozen at `starting_balance`: `_balance`/`_equity`
+        were assigned once in `__init__` and no fill ever touched them.
+        Four callers read this -- `PaperTradingEngine._maybe_enter` (which
+        sizes every paper and autonomous entry from it), `POST /orders`,
+        `POST /options/execute`, and `GET /portfolio` /
+        `portfolio_snapshots` -- and every account with no connected
+        broker resolves to this broker, so the risk model's denominator
+        was a constant for the whole platform.
+
+        Measured over 100 losing trades on a 100,000 account: true equity
+        50,000, reported equity 100,000, and every entry still risking
+        500 -- the configured 0.5% of a balance that no longer existed,
+        i.e. 1.0% of what was left. `GET /portfolio` also contradicted
+        itself, printing equity 100,000 beside a correct negative
+        `total_realized_pnl`.
+        """
+        unrealized = sum(position.unrealized_pnl for position in self._positions.values())
+        return AccountInfo(account_id="MOCK", balance=self._balance, equity=self._balance + unrealized)
 
     async def get_positions(self) -> list[BrokerPosition]:
         return list(self._positions.values())
@@ -257,13 +315,29 @@ class MockBroker(Broker):
             return
 
         new_quantity = position.quantity + signed_qty
-        if new_quantity == 0:
-            del self._positions[symbol]
-            return
         if (position.quantity > 0) == (signed_qty > 0):
             total_cost = position.average_price * position.quantity + price * signed_qty
             position.average_price = total_cost / new_quantity
+        else:
+            # A reducing, closing or flipping fill: this is the only place
+            # this broker learns a P&L, and it used to throw it away.
+            closed = min(abs(signed_qty), abs(position.quantity))
+            direction_sign = 1.0 if position.quantity > 0 else -1.0
+            self._balance += (price - position.average_price) * closed * direction_sign
+            if new_quantity != 0 and (new_quantity > 0) != (position.quantity > 0):
+                # Sold through zero and out the other side: what is left
+                # was opened at this fill, not at the old average. Without
+                # this the flipped position would carry the previous
+                # side's cost basis and realize a second, invented P&L
+                # when it closed.
+                position.average_price = price
+        if new_quantity == 0:
+            del self._positions[symbol]
+            return
         position.quantity = new_quantity
+        quote = self._quotes.get(symbol)
+        if quote is not None:
+            self._mark_to_market(symbol, quote.ltp)
 
     async def modify_order(self, broker_order_id: str, **changes) -> OrderResult:
         order = self._orders.get(broker_order_id)

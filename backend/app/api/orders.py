@@ -165,6 +165,11 @@ _STACK_LOCKS: dict[uuid.UUID, asyncio.Lock] = {}
 # manual /orders path").
 logger = logging.getLogger("api.orders")
 
+# "Every trade ever", for rebuilding a MockBroker's cash. The journal
+# helpers all take a window start, and the account's balance is the one
+# quantity whose window is the whole history.
+_EPOCH = datetime.min.replace(tzinfo=timezone.utc)
+
 _TRADE_LOCKS: dict[uuid.UUID, asyncio.Lock] = {}
 
 
@@ -362,6 +367,21 @@ async def _stack_for(user: User, db: AsyncSession) -> _UserTradingStack:
                 )
                 stack.daily_pnl = await load_realized_pnl_since(db, user.id, execution_mode, since=day_start)
                 stack.weekly_pnl = await load_realized_pnl_since(db, user.id, execution_mode, since=week_start)
+                if isinstance(stack.broker, MockBroker):
+                    # The same rebuild, for the denominator those two
+                    # counters are measured AGAINST. `MockBroker` keeps
+                    # its cash in memory, so a restart reset the account
+                    # to `starting_balance` while the counters above came
+                    # back from the journal -- an account past its daily
+                    # loss limit was refused with one percentage before
+                    # the restart and a different one after, same loss,
+                    # same journal. A real adapter is skipped because its
+                    # balance lives at the broker and is authoritative;
+                    # overwriting that with our arithmetic would be the
+                    # actual bug.
+                    stack.broker.restore_realized_pnl(
+                        await load_realized_pnl_since(db, user.id, execution_mode, since=_EPOCH)
+                    )
                 stack._risk_day = now.date()
                 stack._risk_week = now.isocalendar()[:2]
                 _STACKS[user.id] = stack
@@ -716,6 +736,25 @@ async def place_order(
         # every exposure, loss and count limit by sending it as a larger
         # opposing order.
         quantity = min(quantity, abs(existing.quantity))
+        if quantity <= 0:
+            # ...but never down to nothing. `calculate_position_size`
+            # returns 0 for any balance <= 0, and now that the balance
+            # actually follows realized P&L that is reachable: an account
+            # whose journal totals -100,000 rehydrates to exactly 0. Its
+            # open position then had no exit at all -- measured through
+            # this endpoint, a 100-share long against a 0 balance:
+            #
+            #   POST /orders SHORT entry=99 stop=103 -> 201, quantity 0.0
+            #   positions still open -> [100.0]
+            #
+            # A 201 reporting a zero-share fill, the position untouched,
+            # and no stop tight enough to help because every width
+            # divides into a zero budget. The risk budget is how much NEW
+            # risk to take; an exit takes none, so when it cannot express
+            # one the position closes in full. Partial close is
+            # untouched: it lives in the `min` above and only applies
+            # while the budget is positive.
+            quantity = abs(existing.quantity)
     # Blueprint §57: the first real equity liquidity gate. Passes a genuine
     # bool when there is volume history to judge from and `None` when there
     # is not -- the engine skips an unassessed check rather than recording

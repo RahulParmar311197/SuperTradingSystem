@@ -1230,12 +1230,34 @@ async def test_a_position_can_still_be_closed_after_the_daily_loss_limit_trips(r
             # through. This returned 403 before the fix, leaving the user
             # holding a losing position with no way out until the UTC day
             # rolled over -- after the NSE session had closed.
+            #
+            # The closing stop is 103, not the 104 that mirrored the
+            # entry's 5-wide stop, and that is the fix of round 170
+            # showing through rather than a weakened test. The realized
+            # -5,000 above now moves the balance to 95,000, so the risk
+            # budget a reducing order is sized from is 95,000 * 0.5% =
+            # 475 rather than 500, and a 5-wide close is 475/5 = 95 of
+            # the 100 open -- a partial close, which is a documented
+            # capability (see
+            # test_partial_close_journals_only_the_quantity_actually_closed:
+            # a WIDER closing stop closes less). Measured here:
+            #
+            #   stop 104 (5 wide) -> quantity 95.0, 5.0 left open
+            #   stop 103 (4 wide) -> quantity 100.0, flat
+            #
+            # A tighter stop still flattens for any positive balance, and
+            # round 170 added the floor that keeps that true at a zero
+            # balance too. What this test is for -- that the exit is not
+            # REFUSED by the entry gates -- is unchanged, and the 403
+            # asserted just above is the control that proves those gates
+            # are live while this order goes through.
             close = client.post(
                 "/orders",
-                json={"symbol": keeper.symbol, "direction": "SHORT", "entry": 99.0, "stop": 104.0},
+                json={"symbol": keeper.symbol, "direction": "SHORT", "entry": 99.0, "stop": 103.0},
                 headers=headers,
             )
             assert close.status_code == 201, close.text
+            assert close.json()["quantity"] == 100.0, close.text
 
             async with async_session_factory() as db:
                 still_open = (

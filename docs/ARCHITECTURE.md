@@ -11700,6 +11700,75 @@ schema change; the fallback is the same one `opened_at` already uses and
 the same "best answer available" convention as `owner_strategy_id`
 being `None`. Recorded here rather than silently narrowed.
 
+## A fraction of an options lot was executable
+
+`ExecuteOptionLegRequest.quantity` on `POST /options/execute` is
+documented in its own comment as *"number of lots"*. Round 102 bounded
+that field after a negative premium was found to be **approved and
+executed**, and round 140 bounded the payoff path beside it. Both
+bounded magnitude and sign. Neither bounded **integrality**, and the
+field was declared `float`.
+
+Measured through the real route, on two contracts registered with
+`lot_size=50`:
+
+```
+quantity 0.5  lots -> 201, position  25.0 contracts
+quantity 0.33 lots -> 201, position  41.5 contracts
+```
+
+A lot is the exchange's indivisible unit: you trade one lot or two,
+never half. 41.5 option contracts is not a position any venue can
+represent. It was priced, it cleared every risk gate including the ones
+rounds 134/138 brought to life, it went to the broker, and it was
+journaled.
+
+### Why the truncation half is the worse half
+
+Against `MockBroker` a fractional fill is merely fictional. Against a
+real venue the order is either rejected -- which is loud, and survivable
+-- or **silently truncated to a whole lot**. Truncation leaves the app's
+book claiming a position the broker does not hold, which is the same
+divergence class as round 169's phantom short: no endpoint, notification
+or journal row disagrees, and only `ReconciliationWorker` could ever
+notice.
+
+### One layer, deliberately
+
+`execute_options_strategy` is the only entry to this path and it takes
+`ExecuteOptionsStrategyRequest`, so the request model is the single gate
+rather than the outer half of a pair. There is no second layer that
+could stand in for it, and adding one would put a bound where no failure
+was measured -- the rule rounds 148 and 172 already follow.
+
+`int` was chosen over a `float` plus an integrality validator because it
+is the type the value has always been in fact: it rejects `0.5` while
+still accepting the `1.0` that this repo's own tests and any
+float-serialising JSON client send, and it makes
+`leg.quantity * instrument.lot_size` whole by construction. A test pins
+that integral-float case specifically, because the fix must reject a
+FRACTION and not the float type.
+
+### Not fixed here, and why
+
+Two neighbouring gaps share this shape and are **not** touched, because
+neither could be measured in this environment and both need a modelling
+decision rather than a bound:
+
+- **Equity quantity is never rounded at all.** `calculate_position_size`
+  returns a fractional share count (round 170 measured `151.5152`), and
+  `app/brokers/upstox/adapter.py` passes `request.quantity` straight
+  into the order payload. Whether that is wrong depends on the
+  instrument -- whole shares for equities, lot multiples for F&O,
+  genuine fractions for some venues -- and `Instrument.lot_size` is read
+  only by the options path today.
+- **`Instrument.tick_size` has no reader anywhere.** No price on any
+  path is validated against the instrument's minimum increment.
+
+Both only bite against a real exchange, which is outside this
+environment, so they are recorded rather than patched -- the same
+treatment round 189's stop-cancel ordering got.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

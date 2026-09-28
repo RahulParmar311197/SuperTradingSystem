@@ -302,7 +302,25 @@ class ExecuteOptionLegRequest(BaseModel):
     # too -- but incidentally, by an exposure limit computed from the
     # *other* leg, or because every comparison against `inf`/NaN is False.
     # Neither is validation; both would stop protecting if a limit moved.
-    quantity: float = Field(gt=0, lt=_MAX_PREMIUM)  # number of lots
+    # A LOT IS INDIVISIBLE. Rounds 102/140 bounded this field's magnitude
+    # and sign but never its integrality, and `float` let a fraction of a
+    # lot through. Measured on two instruments registered with
+    # `lot_size=50`:
+    #
+    #     quantity 0.5  lots -> 201, position  25.0 contracts
+    #     quantity 0.33 lots -> 201, position  41.5 contracts
+    #
+    # 41.5 option contracts is not a position any exchange can represent.
+    # It cleared every risk gate, went to the broker and was journaled, and
+    # a real broker would reject or silently truncate the order -- which is
+    # the worse half, because the app's book would then disagree with the
+    # broker's about a position it thinks it holds.
+    #
+    # `int` rather than a float plus a validator: it is the type the value
+    # has always been in fact, it rejects 0.5 while still accepting the
+    # `1.0` that callers (and this repo's own tests) send, and it makes
+    # `leg.quantity * instrument.lot_size` below whole by construction.
+    quantity: int = Field(gt=0, lt=_MAX_PREMIUM)  # number of lots
     # Current market price per unit for this leg — no live options feed
     # exists in this environment (see docs/ARCHITECTURE.md), so this
     # mirrors POST /orders's `entry` field: MockBroker is fed this price

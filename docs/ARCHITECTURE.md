@@ -11943,6 +11943,105 @@ in `backend/app/workers/auto_trade_worker.py` — and are now `PUT`. Every
 other mention in this file already said `PUT`; round 173's was the
 inconsistent one.
 
+## `GET /health` reported both brokers as a constant (round 177)
+
+`app/monitoring/health.py` probed `database`, `redis` and `workers`, and
+derived `ai` from settings — but `dhan` and `upstox` were the literal
+`ComponentStatus.NOT_CONFIGURED.value`, written into the response dict and
+never computed from anything:
+
+```python
+"ai": (ComponentStatus.HEALTHY if settings.ai_api_key else ComponentStatus.NOT_CONFIGURED).value,
+"dhan": ComponentStatus.NOT_CONFIGURED.value,
+"upstox": ComponentStatus.NOT_CONFIGURED.value,
+```
+
+Measured against the real app, in three steps:
+
+```
+1. nothing configured at all      upstox NOT_CONFIGURED   ai NOT_CONFIGURED
+2. credentials set in settings    upstox NOT_CONFIGURED   ai HEALTHY
+3. one ACTIVE UPSTOX account      upstox NOT_CONFIGURED
+     resolve_broker -> UpstoxBroker account bc73e12c-…
+```
+
+Step 2 is the clearest proof it was a constant: `ai` on the very same
+response flips to HEALTHY and these two do not move. Step 3 is the harm —
+`resolve_broker` hands that user a real `UpstoxBroker`, so their orders go
+to Upstox for real, and `/health` says no broker is configured.
+
+`/health` is public, unauthenticated, and — as round 125 put it when it
+stopped this endpoint 500ing during a Redis outage — "the one endpoint you
+consult during an outage". Reporting no broker connected while a live
+venue is executing orders is the wrong direction for a monitoring surface
+to be wrong in: it hides the thing an operator most needs to see.
+
+### Why it is NOT derived from `settings`, which looked like the fix
+
+`upstox_client_id`/`upstox_secret` and `dhan_client_id`/`dhan_secret` all
+exist, and reading them would have been the exact parallel of the `ai`
+line above. It would also have fixed nothing for the measured case. Those
+settings gate only the OAuth routes (`GET /brokers/upstox/authorize` and
+`/callback`); `POST /brokers/connect` takes a credentials dict directly
+and never reads them. So an account can be ACTIVE, and placing live
+orders, on a deployment where both are unset — and a settings-derived
+answer would still have said NOT_CONFIGURED.
+
+This is the standing lesson that fixing the obvious layer may fix nothing,
+and it is pinned rather than asserted:
+`test_a_live_broker_is_visible_even_with_no_oauth_settings_at_all` fails
+under exactly that implementation (injection B below).
+
+### What it reports now
+
+`check_brokers()` reads `broker_accounts` and maps each broker's rows:
+
+| accounts for that broker | status | meaning |
+|---|---|---|
+| at least one ACTIVE | `HEALTHY` | `resolve_broker` would hand someone a real adapter; orders reach this broker |
+| some, none ACTIVE | `DOWN` | it was set up and cannot be used now — the state worth paging on |
+| none at all | `NOT_CONFIGURED` | nothing has ever been connected |
+
+One usable account is enough to call the broker usable, however many dead
+ones sit beside it. `BrokerName.PAPER` is deliberately not reported: it is
+not an external service whose reachability an operator can act on.
+
+**Disclosure, considered rather than overlooked.** This tells an
+unauthenticated caller whether the deployment has any connected account
+per broker. That is an aggregate deployment fact of the same kind as the
+`ai`, `database` and `workers` lines already there, it names no user and
+counts nothing, and it is the fact this endpoint exists to report.
+
+**Round 125's guarantee is preserved.** The new database read is guarded
+exactly like `check_workers`' Redis read, because `/health` must not die
+with the dependency it is reporting on. An unreadable `broker_accounts`
+degrades to `DOWN` rather than raising — the true answer, since with the
+database unreachable no order can be placed through any broker, and the
+`database: DOWN` line beside it is the explanation. A test asserts
+`/health` still answers 200 with the session factory raising.
+
+### Tests
+
+`backend/tests/api/test_health_reports_brokers.py`, 12 tests: the headline,
+the no-OAuth-settings case, an independence control (connecting Upstox
+must not make Dhan claim to be connected), the DOWN and NOT_CONFIGURED
+cases, the six-way mapping table as a pure function, and the
+database-outage guarantee.
+
+The database-level tests assert an explicit precondition that no other
+test has left a row for the broker they judge, and fail loudly if one has,
+rather than flaking. The suite shares one database and it currently holds
+26 leftover PAPER accounts from earlier runs, so "no rows for this broker"
+is a thing to check, not to assume.
+
+Five injections, each biting only what it should: the original constants
+restored (4 end-to-end tests), the settings-derived near-miss above (the
+same 4, including the test written for it), `_status_for` treating any row
+as usable (the DOWN test and 3 mapping rows), `_status_for` treating no
+rows as DOWN (the NOT_CONFIGURED tests and 1 mapping row), and the outage
+guard re-raising instead of degrading (the outage test — which fails
+rather than hangs).
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

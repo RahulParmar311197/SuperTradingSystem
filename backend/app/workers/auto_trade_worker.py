@@ -115,7 +115,7 @@ class AutoTradeSupervisor:
         # The strategy version that was live when each open position was
         # ENTERED, keyed by the opener's triple exactly as `_opened_at` is.
         # Blueprint §91 is "always know exactly which version created a
-        # trade", and `PATCH /strategies/{id}` bumps `version` whenever the
+        # trade", and `PUT /strategies/{id}` bumps `version` whenever the
         # user edits, so reading the row's version at CLOSE time answers a
         # different question. `POST /paper` already gets this right --
         # `app/api/paper.py` captures `strategy_row.version` when the

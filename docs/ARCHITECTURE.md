@@ -11646,7 +11646,7 @@ Blueprint §91 is *"always know exactly which version created a trade"*,
 and `app/api/strategies.py` states the guarantee plainly: a trade's
 `strategy_version` *"can always be resolved back to the exact DSL that
 produced it via `GET /strategies/{id}/versions/{version}`"*.
-`PATCH /strategies/{id}` bumps `version` on every edit, and the
+`PUT /strategies/{id}` bumps `version` on every edit, and the
 auto-trade worker read that number off the strategy row **at close
 time**.
 
@@ -11844,6 +11844,104 @@ bounded by URL length: 500 symbols answered in 0.06s, and a longer query
 string is refused by the HTTP client and by any real proxy before it
 reaches the handler. A limit here would be a bound where no failure was
 measured -- the rule rounds 148, 172 and 174 follow.
+
+## Two concurrent strategy edits: a 500, and a lost version (round 176)
+
+`PUT /strategies/{id}` is read-modify-write across an await:
+
+```python
+row = await db.get(StrategyRow, strategy_id)   # reads version
+row.version += 1                               # computes the next one
+await _snapshot_version(db, row)                # INSERT into strategy_versions
+await db.commit()
+```
+
+and `strategy_versions` carries `UniqueConstraint("strategy_id", "version")`
+(`app/database/models/strategy.py`). Nothing serialized that sequence, so
+two concurrent edits of one strategy both read version 1 and both computed
+2. Measured against the real ASGI app, with the first request held open
+between its read and its commit:
+
+```
+versions computed by each request: [2, 2]
+put[0]: 500 Traceback (most recent call last):
+put[1]: 200 {... "name":"Edit B","version":2 ...}
+strategies row:     (2, 'Edit B')
+strategy_versions:  [(1, 'Bullish Liquidity Sweep'), (2, 'Edit B')]
+```
+
+Two distinct harms. One editor got a **500 with a raw traceback** for a
+request that was entirely valid — it had passed validation, passed the
+ownership check, and failed only because another request had taken the
+version number it had already decided on. And that editor's work was
+**lost without a trace**: no `strategies` row, no `strategy_versions` row,
+nothing. §91 exists so that "a trade's `strategy_version` resolves back to
+the exact DSL that produced it"; for the definition that briefly won the
+race and was then rolled back, there was nothing to resolve back to.
+
+`app/api/strategies.py` had no `IntegrityError` handling and no 409
+anywhere, so the `UniqueViolationError` went all the way out of the
+handler to the catch-all 500.
+
+**The fix** is `with_for_update=True` on the strategy row read, so the
+second editor waits and reads the version the first one actually wrote.
+Both edits then land, as versions 2 and 3:
+
+```
+versions computed by each request: [2, 3]
+put[0]: 200 {... "name":"Edit A","version":2 ...}
+put[1]: 200 {... "name":"Edit B","version":3 ...}
+strategy_versions: [(1, 'Bullish ...'), (2, 'Edit A'), (3, 'Edit B')]
+```
+
+**Why serializing rather than answering 409.** A 409 is the usual answer
+to a lost update, and it is the answer round 166 shipped for two concurrent
+cancels of one order — but that case had one real outcome (the order is
+cancelled once) and a second request asking for something already done.
+Here both edits are legitimate and `strategy_versions` is append-only, so
+applying them in arrival order loses nothing, while a 409 would discard an
+edit outright for a client that has no retry logic to discard it safely.
+The lock covers one INSERT and a commit on a single row, so it cannot
+deadlock against itself.
+
+**The one risk the lock introduces** is that the row is now locked *before*
+the ownership check, so a stranger's 404 briefly takes a lock on someone
+else's strategy. `get_db`'s `async with` closes the session on the way out,
+which rolls the transaction back and releases it. That is pinned by a test,
+and the test is not vacuous: holding the same row locked from outside the
+app (`SELECT ... FOR UPDATE`, uncommitted) makes the owner's subsequent
+edit block past a 5s deadline instead of answering — measured.
+
+**Why the regression test forces the interleave with an event, not a
+sleep.** Fired as a plain `asyncio.gather` of two PUTs, this does not
+reproduce at all. The handler's only awaits are quick local round trips, so
+request 0 ran its whole critical section before request 1 started and the
+first probe reported a perfectly clean `[2, 3]` — a false negative that
+would have ended the round. `tests/api/test_concurrent_strategy_edit.py`
+gates request 0 inside `_snapshot_version`, after it has computed its
+version and before it commits, which is exactly the window. Same technique
+as round 166, for the same reason, and the test is deterministic in both
+the fixed and the broken world.
+
+The gate is armed *after* the strategy is created, not before:
+`install_library_strategy` calls `_snapshot_version` too, and a gate armed
+earlier catches that setup call instead of the first edit, so the test
+never reaches the race. Both the original probe and the first version of
+the test made exactly that mistake.
+
+### A method name corrected in the same change
+
+Round 173 shipped documentation and comments saying `PATCH /strategies/{id}`
+bumps `version`. The behavioural claim is right but the method is not:
+the endpoint is `PUT /{strategy_id}`, and the only `PATCH` under
+`/strategies/{id}` is `PATCH /{strategy_id}/status`, which deliberately
+does *not* touch `version` (promoting a strategy to auto-trading is not an
+edit). Four occurrences named a route that does not exist —
+`docs/ARCHITECTURE.md`, two docstrings in
+`backend/tests/workers/test_auto_trade_strategy_version.py`, and a comment
+in `backend/app/workers/auto_trade_worker.py` — and are now `PUT`. Every
+other mention in this file already said `PUT`; round 173's was the
+inconsistent one.
 
 ## Multi-leg options execution (§37-40)
 

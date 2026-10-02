@@ -140,8 +140,32 @@ async def update_strategy(
     the new definition into `strategy_versions` before committing, so a
     trade's `strategy_version` can always be resolved back to the exact
     DSL that produced it via GET /strategies/{id}/versions/{version} —
-    editing the strategy again never loses that snapshot."""
-    row = await db.get(StrategyRow, strategy_id)
+    editing the strategy again never loses that snapshot.
+
+    `with_for_update` because the version bump is read-modify-write and
+    `strategy_versions` carries UniqueConstraint(strategy_id, version).
+    Unlocked, two concurrent edits of one strategy both read version 1 and
+    both computed 2 -- measured, holding the first request open between
+    its read and its commit:
+
+        versions computed by each request: [2, 2]
+        put[0]: 500 Traceback (most recent call last):
+        put[1]: 200 {... "name":"Edit B","version":2 ...}
+        strategy_versions: [(1, 'Bullish ...'), (2, 'Edit B')]
+
+    So one editor got a 500 with a raw traceback for a request that was
+    entirely valid, and their edit vanished without a trace: no row, no
+    version, nothing in the history §91 exists to preserve. Locking the
+    strategy row makes the second reader wait and read the version the
+    first one actually wrote, so both edits land, as versions 2 and 3.
+
+    Serialising beats answering 409 here: both edits are legitimate and
+    the snapshot table is append-only, so applying them in arrival order
+    loses nothing, while a 409 would discard an edit the client has no
+    retry logic for. The lock is held for one INSERT and a commit, and
+    only ever on a single row, so it cannot deadlock against itself.
+    """
+    row = await db.get(StrategyRow, strategy_id, with_for_update=True)
     if row is None or row.user_id != user.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Strategy not found")
     row.definition = payload.model_dump(mode="json")

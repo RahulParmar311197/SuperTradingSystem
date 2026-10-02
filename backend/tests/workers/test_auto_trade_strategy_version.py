@@ -3,7 +3,7 @@
 Blueprint §91 is "always know exactly which version created a trade",
 and `app/api/strategies.py` says it plainly: a trade's `strategy_version`
 "can always be resolved back to the exact DSL that produced it via
-GET /strategies/{id}/versions/{version}". `PATCH /strategies/{id}` bumps
+GET /strategies/{id}/versions/{version}". `PUT /strategies/{id}` bumps
 `version` on every edit, and the auto-trade worker read that number off
 the strategy row at close time.
 
@@ -90,7 +90,7 @@ async def _feed_bars(supervisor, instrument_id, candles, start, stop) -> None:
 
 
 async def _edit_strategy(user_id: uuid.UUID) -> int:
-    """Exactly what `PATCH /strategies/{id}` does: bump the version and
+    """Exactly what `PUT /strategies/{id}` does: bump the version and
     snapshot the definition. The definition is left identical on purpose
     -- this isolates the version stamp from any change in behaviour."""
     async with async_session_factory() as db:

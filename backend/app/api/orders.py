@@ -14,6 +14,8 @@ from app.brokers.mock import MockBroker
 from app.core.audit import record_audit
 from app.core.metrics import ORDER_COUNT, RISK_REJECTION_COUNT
 from app.core.config import get_settings
+from redis.exceptions import RedisError
+
 from app.core.redis import (
     TRADE_LOCK_TTL_SECONDS,
     account_halt_reason,
@@ -431,7 +433,32 @@ async def _mark_open_positions_to_market(stack: "_UserTradingStack", user_id: st
     records."""
     positions = stack.position_manager.open_positions(user_id)
     for position in positions:
-        price = await get_latest_price(position.symbol)
+        try:
+            price = await get_latest_price(position.symbol)
+        except RedisError:
+            # An unreachable cache is the same thing as no cached tick, for
+            # this helper's purpose: leave the position marked as it is
+            # rather than at a guess -- the rule the `price is not None`
+            # branch below already follows.
+            #
+            # Measured before this, with Redis stopped and ONE position
+            # open: `GET /portfolio` raised ConnectionError -- a 500 with a
+            # traceback. With nothing open it answered 200, because this
+            # loop body never ran. So the endpoint broke in exactly the
+            # case you would consult it ("what am I holding?") and looked
+            # healthy in the case you would not. Rounds 124/125 settled
+            # this posture for login/register and `/health`; these readers
+            # were left behind.
+            #
+            # The rest of the payload -- balance, realized P&L, position
+            # count, the positions themselves -- comes from Postgres and is
+            # still true during a cache outage, which is why serving it
+            # unmarked beats refusing the whole response.
+            #
+            # `break`, not `continue`: Redis being down is a property of
+            # the process, not of one symbol, so retrying per position buys
+            # nothing and costs a failed round trip each.
+            break
         if price is not None:
             stack.position_manager.mark_to_market(user_id, position.symbol, price)
             stack.broker.set_quote(position.symbol, ltp=price, is_market_print=False)

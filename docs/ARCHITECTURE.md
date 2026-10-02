@@ -11769,6 +11769,82 @@ Both only bite against a real exchange, which is outside this
 environment, so they are recorded rather than patched -- the same
 treatment round 189's stop-cancel ordering got.
 
+## A Redis outage raised a traceback on two read paths
+
+Rounds 124 and 125 settled this posture for `POST /auth/login`,
+`POST /auth/register` and `GET /health`: a Redis outage gets a legible
+refusal, not a traceback. Round 125's note calls `/health` *"the one
+endpoint you consult during an outage"*. Two readers of
+`get_latest_price` were left behind.
+
+Measured through the real app with Redis actually stopped:
+
+```
+GET /quotes                        -> raised ConnectionError (500)
+GET /portfolio, one position open  -> raised ConnectionError (500)
+GET /portfolio, nothing open       -> 200
+POST /orders                       -> 503, already legible
+GET /health                        -> 200, "redis": "DOWN"
+```
+
+### How it was found, and the false negative in the middle of it
+
+Not by reading code. A mechanical sweep asked which HTTP routes have **no
+test anywhere mentioning their path**: 86 of 89 are covered, and the three
+that were not are `GET /auth/me`, `GET /quotes` and `POST /ai/strategy`.
+That sweep has form -- `explain_trade` still carries a comment saying it
+500'd on *every* call because "this endpoint had never had a test hit it".
+
+`/auth/me` and `/ai/strategy` turned out fine (200, and a graceful 503 for
+an unconfigured provider). `/quotes` raised.
+
+`/portfolio` then looked **fine on the first probe** -- 200 under a full
+outage -- because that user held nothing, so
+`_mark_open_positions_to_market`'s loop body never executed. It is broken
+only when a position is open, which is to say it failed in exactly the
+case you would consult it and looked healthy in the case you would not.
+Re-measuring with a position open is the only reason this is in the diff.
+
+### `POST /orders` was not a third site
+
+Checked rather than assumed, and the prediction was wrong: its trade lock
+already converts an unreachable Redis into `503 "Trade serialization is
+temporarily unavailable"`, so the order path fails **closed and legibly**
+without this change.
+
+### Two different right answers
+
+Deliberately not one blanket guard, because the two paths owe the caller
+different things:
+
+- **`/quotes` returns 503.** `None` already means "no tick for this
+  symbol". Returning it for "the cache is unreachable" would report the
+  absence of data *as* data, and a caller pricing or sizing against that
+  would be reading a fabricated fact. The endpoint's whole job is to tell
+  those two apart.
+- **`/portfolio` still answers 200, with positions unmarked.** Balance,
+  realized P&L, position count and the positions themselves come from
+  Postgres and remain true during a cache outage; refusing the whole
+  response would withhold facts the system holds. Treating an unreachable
+  cache like a missing tick is the rule that path already follows for a
+  symbol with no cached price -- round 171 fixed it to mark both books,
+  and left "no price means leave it alone" intact.
+
+The `except RedisError` in the marking loop `break`s rather than
+`continue`s: Redis being down is a property of the process, not of one
+symbol, so retrying per position buys nothing and costs a failed round
+trip each. `redis.exceptions.ConnectionError` is a direct `RedisError`
+subclass, which is what the live measurement produced.
+
+### Not bounded, and why
+
+`GET /quotes` takes an unbounded `symbols` list with one sequential read
+each, which looks like an obvious N-round-trip problem. It is already
+bounded by URL length: 500 symbols answered in 0.06s, and a longer query
+string is refused by the HTTP client and by any real proxy before it
+reaches the handler. A limit here would be a bound where no failure was
+measured -- the rule rounds 148, 172 and 174 follow.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

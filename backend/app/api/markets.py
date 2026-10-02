@@ -9,6 +9,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.dependencies import get_current_user
+from redis.exceptions import RedisError
+
 from app.core.redis import get_latest_price
 from app.database.models.instruments import Instrument, MarketType, OptionType
 from app.database.models.strategy import Setup
@@ -277,4 +279,29 @@ async def list_setups(
 
 @router.get("/quotes")
 async def get_quotes(symbols: list[str] = Query(...), user: User = Depends(get_current_user)) -> dict[str, float | None]:
-    return {symbol: await get_latest_price(symbol) for symbol in symbols}
+    """Latest cached price per symbol, or `None` for one nothing has been
+    seen for.
+
+    503 rather than `None` when the cache itself is unreachable. The two
+    are not the same answer and this endpoint's whole job is to tell them
+    apart: `None` means "no tick for this symbol", and returning it for
+    "we cannot reach the cache" would report absence of data as data --
+    a caller sizing or pricing against that would be reading a fabricated
+    fact. Measured before this: with Redis stopped the endpoint raised
+    ConnectionError, i.e. a 500 with a traceback, and it had no test of
+    any kind. Rounds 124/125 settled the posture for login/register and
+    `/health` -- an outage gets a legible refusal, not a traceback.
+
+    Deliberately NOT bounded in the number of symbols. The obvious worry
+    is N sequential round trips, but it is bounded already by URL length:
+    500 symbols answered in 0.06s, and a longer query string is refused by
+    the client and by any real proxy before it reaches here. A limit here
+    would be a bound where no failure was measured.
+    """
+    try:
+        return {symbol: await get_latest_price(symbol) for symbol in symbols}
+    except RedisError as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Price cache is unavailable, so no quote can be reported right now",
+        ) from exc

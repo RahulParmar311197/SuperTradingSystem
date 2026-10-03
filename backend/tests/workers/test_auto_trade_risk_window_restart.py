@@ -29,7 +29,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 
 from app.auth.security import hash_password
 from app.database.models.instruments import Instrument, MarketType
@@ -143,6 +143,15 @@ async def _cleanup(user_ids: list[uuid.UUID], instrument_ids: list[uuid.UUID]) -
     """Child rows first: `trades` references `positions`."""
     async with async_session_factory() as db:
         for user_id in user_ids:
+            # Round 178 journals paper/auto fills into `orders`, and
+            # `order_events` FKs to those, so both must go before the
+            # strategy/instrument/user rows they reference -- without this the
+            # deletes below raise orders_strategy_id_fkey.
+            await db.execute(
+                text("DELETE FROM order_events WHERE order_id IN (SELECT id FROM orders WHERE user_id = :u)"),
+                {"u": user_id},
+            )
+            await db.execute(text("DELETE FROM orders WHERE user_id = :u"), {"u": user_id})
             for model in (TradeRow, Position, Notification, AuditLog, RiskEvent, StrategyRow):
                 await db.execute(delete(model).where(model.user_id == user_id))
             await db.execute(delete(User).where(User.id == user_id))

@@ -30,7 +30,7 @@ from app.strategy.dsl import StrategyDefinition
 from app.strategy.engine import StrategyEngine, StrategyEvaluationResult
 from app.trading.execution import ExecutionEngine
 from app.trading.persistence import load_open_position_notionals_elsewhere
-from app.trading.order_manager import OrderManager
+from app.trading.order_manager import OrderManager, OrderRecord
 from app.trading.position_manager import PositionManager
 
 
@@ -69,6 +69,19 @@ class PaperTradeOutcome:
     # away, so callers can fire NotificationType.SL_HIT/TP_HIT (blueprint
     # §63) instead of a generic POSITION_CLOSED for every exit.
     exit_reason: Literal["stop_loss", "take_profit"] | None = None
+    # The entry and closing orders this candle actually produced, so the
+    # caller holding the DB session can mirror them into `orders` the way
+    # `app/api/orders.py` and `app/api/options.py` already do. Measured
+    # before these existed: a full autonomous run that opened and closed
+    # two positions on two instruments wrote 2 `positions` rows and 2
+    # `trades` rows and **0 `orders` rows** -- `persist_order` has exactly
+    # three callers and all three are request handlers, so every autonomous
+    # and paper fill was absent from `GET /admin/orders` (blueprint §116),
+    # the one place an operator reviews what was submitted. Same reason
+    # `order_status` and `risk_checks` exist: the engine already has the
+    # answer and used to drop it on return.
+    entry_order: OrderRecord | None = None
+    exit_order: OrderRecord | None = None
     # The real fill price behind `closed_position_pnl` -- `None` iff
     # `closed_position_pnl` is also `None`. `_maybe_exit` fills the closing
     # order at the stop/target level that triggered it, not at the
@@ -275,8 +288,11 @@ class PaperTradingEngine:
 
         position = self.position_manager.get(self.account_id, self.symbol)
         if position is not None and position.is_open:
-            closed_pnl, exit_reason, exit_price = await self._maybe_exit(position, candle)
-            return PaperTradeOutcome(signal=None, closed_position_pnl=closed_pnl, exit_reason=exit_reason, exit_price=exit_price)
+            closed_pnl, exit_reason, exit_price, exit_order = await self._maybe_exit(position, candle)
+            return PaperTradeOutcome(
+                signal=None, closed_position_pnl=closed_pnl, exit_reason=exit_reason,
+                exit_price=exit_price, exit_order=exit_order,
+            )
 
         if len(self.candles) < 3:
             return PaperTradeOutcome(signal=None)
@@ -498,12 +514,23 @@ class PaperTradingEngine:
         # Fill at the level the trade was sized and bracketed around, the same
         # way `_maybe_exit` pins the quote to the stop/target it is closing at.
         self.broker.set_quote(self.symbol, ltp=result.entry)
-        idempotency_key = f"{self.account_id}:{self.strategy.name}:{candle.timestamp.isoformat()}"
+        # The symbol is part of the identity. `AutoTradeSupervisor` runs one
+        # engine per (strategy, instrument) sharing this `account_id` (see
+        # `__init__`), and two instruments on the same timeframe necessarily
+        # share bar timestamps -- so without the symbol, one strategy
+        # entering on two instruments on the same bar computes one key for
+        # two different orders. That was harmless only while nothing
+        # persisted these orders: `persist_order` is idempotent ON this key,
+        # so the second instrument's entry would have been folded into the
+        # first one's row the moment journaling was wired up. The closing
+        # key below always named the symbol.
+        idempotency_key = f"{self.account_id}:{self.strategy.name}:{self.symbol}:{candle.timestamp.isoformat()}"
 
         order, created = self.order_manager.create_order(
             idempotency_key, self.account_id, self.symbol, direction, OrderType.MARKET, quantity
         )
         order_status: OrderStatus | None = None
+        entry_order: OrderRecord | None = None
         if created:
             self.order_manager.transition(order.id, OrderStatus.VALIDATING)
             self.order_manager.transition(order.id, OrderStatus.RISK_APPROVED)
@@ -514,6 +541,7 @@ class PaperTradingEngine:
             # app/api/orders.py's `place_order` for why.
             self.repeated_rejections = self.repeated_rejections + 1 if final_order.status == OrderStatus.REJECTED else 0
             order_status = final_order.status
+            entry_order = final_order
             new_position = self.position_manager.get(self.account_id, self.symbol)
             if new_position is not None:
                 new_position.stop = result.stop
@@ -526,12 +554,15 @@ class PaperTradingEngine:
                 new_position.strategy_id = self.strategy_id
 
         return PaperTradeOutcome(
-            signal=result, order_created=created, risk_checks=risk_checks, order_status=order_status
+            signal=result, order_created=created, risk_checks=risk_checks, order_status=order_status,
+            entry_order=entry_order,
         )
 
     async def _maybe_exit(
         self, position, candle: Candle
-    ) -> tuple[float | None, Literal["stop_loss", "take_profit"] | None, float | None]:
+    ) -> tuple[
+        float | None, Literal["stop_loss", "take_profit"] | None, float | None, OrderRecord | None
+    ]:
         is_long = position.is_long
         trigger_price = None
         exit_reason: Literal["stop_loss", "take_profit"] | None = None
@@ -551,7 +582,7 @@ class PaperTradingEngine:
                 exit_reason = "take_profit"
 
         if trigger_price is None:
-            return None, None, None
+            return None, None, None, None
 
         realized_before = position.realized_pnl
         self.broker.set_quote(self.symbol, ltp=trigger_price)
@@ -575,4 +606,4 @@ class PaperTradingEngine:
         # pre-execution local that happens to equal it only while this
         # engine's MockBroker has zero slippage.
         final_order = self.order_manager.get(order.id)
-        return pnl, exit_reason, final_order.average_fill_price
+        return pnl, exit_reason, final_order.average_fill_price, final_order

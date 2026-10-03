@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 
 from app.database.models.instruments import Instrument, MarketType
 from app.database.models.notifications import Notification, NotificationType
@@ -78,6 +78,15 @@ async def _create_strategy(client: TestClient, headers: dict, symbol: str) -> uu
 async def _cleanup(user_ids: list[uuid.UUID], strategy_ids: list[uuid.UUID], instrument_id: uuid.UUID | None = None) -> None:
     async with async_session_factory() as db:
         for user_id in user_ids:
+            # Round 178 journals paper/auto fills into `orders`, and
+            # `order_events` FKs to those, so both must go before the
+            # strategy/instrument/user rows they reference -- without this the
+            # deletes below raise orders_strategy_id_fkey.
+            await db.execute(
+                text("DELETE FROM order_events WHERE order_id IN (SELECT id FROM orders WHERE user_id = :u)"),
+                {"u": user_id},
+            )
+            await db.execute(text("DELETE FROM orders WHERE user_id = :u"), {"u": user_id})
             await db.execute(delete(Position).where(Position.user_id == user_id))
             await db.execute(delete(Trade).where(Trade.user_id == user_id))
             await db.execute(delete(Notification).where(Notification.user_id == user_id))

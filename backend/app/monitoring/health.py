@@ -6,11 +6,12 @@ import logging
 from enum import StrEnum
 
 from fastapi import APIRouter
-from sqlalchemy import text
+from sqlalchemy import select, text
 
 from app.core.redis import ping as redis_ping
 from app.core.redis import worker_is_alive
-from app.database.session import get_engine
+from app.database.models.users import BrokerAccount, BrokerAccountStatus, BrokerName
+from app.database.session import async_session_factory, get_engine
 
 logger = logging.getLogger("monitoring.health")
 
@@ -76,6 +77,80 @@ async def check_workers() -> dict[str, str]:
         return {name: ComponentStatus.DOWN.value for name in _WORKER_NAMES}
 
 
+# The brokers this endpoint reports on, and the response keys they use.
+# `BrokerName.PAPER` is deliberately absent: it is not an external service
+# whose reachability an operator can act on.
+_BROKER_COMPONENTS = ((BrokerName.DHAN, "dhan"), (BrokerName.UPSTOX, "upstox"))
+
+
+def _status_for(statuses: list[BrokerAccountStatus]) -> ComponentStatus:
+    """What this deployment's accounts for one broker add up to.
+
+    HEALTHY means at least one ACTIVE account, i.e. `resolve_broker` would
+    hand a real adapter to somebody and their orders would go to this
+    broker for real. DOWN means accounts exist but none is ACTIVE: it was
+    set up and is not usable now, which is the state worth paging on.
+    NOT_CONFIGURED means no account has ever been connected.
+    """
+    if not statuses:
+        return ComponentStatus.NOT_CONFIGURED
+    if BrokerAccountStatus.ACTIVE in statuses:
+        return ComponentStatus.HEALTHY
+    return ComponentStatus.DOWN
+
+
+async def check_brokers() -> dict[str, str]:
+    """Blueprint §117 "Brokers": whether orders can actually reach each one.
+
+    Both of these used to be the literal `ComponentStatus.NOT_CONFIGURED`,
+    never computed from anything. Measured against the real app:
+
+        nothing configured          upstox NOT_CONFIGURED  ai NOT_CONFIGURED
+        credentials set in settings upstox NOT_CONFIGURED  ai HEALTHY
+        one ACTIVE UPSTOX account   upstox NOT_CONFIGURED
+          (resolve_broker -> UpstoxBroker, so that user's orders are LIVE)
+
+    The middle line is the clearest proof it was a constant: `ai` on the
+    same response flips, and these two never did. The last line is the
+    harm. `/health` is public, unauthenticated, and -- as round 125 put it
+    when it stopped this endpoint 500ing -- "the one endpoint you consult
+    during an outage". It reported no broker connected while real orders
+    were routing to Upstox, which is the wrong direction for a monitoring
+    surface to be wrong in.
+
+    Derived from `broker_accounts` rather than from `settings`, although
+    `upstox_client_id`/`upstox_secret` exist and would have been the exact
+    parallel of the `ai` line above. Those settings gate only the OAuth
+    routes: `POST /brokers/connect` takes credentials directly and never
+    reads them, so an account can be ACTIVE -- and placing live orders --
+    on a deployment where they are unset. A settings-derived answer would
+    have left the measured case still reporting NOT_CONFIGURED.
+
+    This does disclose, to an unauthenticated caller, whether the
+    deployment has any connected account per broker. That is an aggregate
+    deployment fact of the same kind as the `ai`, `database` and `workers`
+    lines already here, it names no user and counts nothing, and it is the
+    fact the endpoint exists to report.
+
+    Guarded like `check_workers`, and for the same reason: a database
+    outage must not take `GET /health` down with it. DOWN rather than
+    NOT_CONFIGURED on that path because it is the true answer -- with the
+    database unreachable no order can be placed through any broker -- and
+    the `database: DOWN` line beside it is the explanation.
+    """
+    try:
+        async with async_session_factory() as db:
+            rows = (await db.execute(select(BrokerAccount.broker, BrokerAccount.status))).all()
+    except Exception:
+        logger.exception("Could not read broker accounts (database unreachable?); reporting every broker DOWN")
+        return {key: ComponentStatus.DOWN.value for _, key in _BROKER_COMPONENTS}
+
+    return {
+        key: _status_for([status for broker, status in rows if broker == name]).value
+        for name, key in _BROKER_COMPONENTS
+    }
+
+
 @router.get("/health")
 async def health() -> dict:
     from app.core.config import get_settings
@@ -87,7 +162,6 @@ async def health() -> dict:
         "database": (await check_database()).value,
         "redis": (await check_redis()).value,
         "ai": (ComponentStatus.HEALTHY if settings.ai_api_key else ComponentStatus.NOT_CONFIGURED).value,
-        "dhan": ComponentStatus.NOT_CONFIGURED.value,
-        "upstox": ComponentStatus.NOT_CONFIGURED.value,
+        **await check_brokers(),
         "workers": await check_workers(),
     }

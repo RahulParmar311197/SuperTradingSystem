@@ -27,6 +27,7 @@ and the wrong shape for an instant already known at the handshake.
 import asyncio
 import json
 import queue
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -43,9 +44,12 @@ from app.database.models.users import User, UserSession
 from app.database.session import async_session_factory
 from app.main import app
 
-# Long enough to open a socket, publish through it and check REST on the
-# way past; short enough that the whole file stays a few seconds.
-SHORT_LIFETIME = 3.0
+# Long enough to open a socket, get the first event through it (including
+# the republish loop below, which is budgeted at _PUBLISH_DEADLINE_SECONDS)
+# and check REST on the way past; short enough that the file stays quick.
+# A successful first receive therefore always leaves at least
+# SHORT_LIFETIME - _PUBLISH_DEADLINE_SECONDS of validity in hand.
+SHORT_LIFETIME = 6.0
 
 
 
@@ -79,6 +83,69 @@ def _expect_closed(ws, what: str) -> None:
     except WebSocketDisconnect:
         return
     raise AssertionError(f"{what}: the socket was still open and delivered {delivered}")
+
+
+_PUBLISH_DEADLINE_SECONDS = 2.5
+
+
+def _drain(ws) -> None:
+    """Discard anything already queued.
+
+    The republish loop below can land more than one copy once the
+    subscription is live, and a leftover duplicate would make a later
+    `_expect_closed` report the socket as still open. Safe to call right
+    after the first receive: the only other message these tests expect is
+    the close at token expiry, seconds later.
+    """
+    while True:
+        try:
+            ws._send_queue.get(timeout=0.05)
+        except queue.Empty:
+            return
+
+
+async def _publish_until_received(sockets, channel: str, payload: dict, what: str) -> None:
+    """Publish until every socket has had `payload`, then drain duplicates.
+
+    A relay subscribes to Redis *after* its handshake returns, and pub/sub
+    has no history, so a single publish racing that subscription is lost
+    forever -- there is nothing to redeliver. Measured under load on a
+    300-second token (so expiry could not confound it), 2 of 10 first
+    publishes never arrived at all within 30s.
+
+    On the short-lived tokens these tests use, that loss did not look like
+    a lost message: `_receive_json` waited, the expiry watcher closed the
+    socket at SHORT_LIFETIME, and the fixture assertion failed with
+    `WebSocketDisconnect` instead -- which is how this reached a suite run
+    as a one-test flake. Raising SHORT_LIFETIME would only have relabelled
+    it as "nothing arrived".
+
+    The file used to settle this with `asyncio.sleep(0.3)` in one test,
+    which is a margin, not a fix: handshakes of 0.52s were measured in the
+    same loaded run. Republishing is deterministic -- once the subscription
+    lands, the next publish delivers -- so no timing assumption is left.
+    """
+    pending = list(sockets)
+    deadline = time.monotonic() + _PUBLISH_DEADLINE_SECONDS
+    while pending and time.monotonic() < deadline:
+        await publish(channel, payload)
+        for ws in list(pending):
+            try:
+                message = ws._send_queue.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            if isinstance(message, BaseException):
+                raise message
+            ws._raise_on_close(message)
+            assert json.loads(message["text"]) == payload, f"{what}: first message was not {payload}"
+            pending.remove(ws)
+    if pending:
+        raise AssertionError(
+            f"{what}: {len(pending)} of {len(sockets)} socket(s) never received {payload} "
+            f"within {_PUBLISH_DEADLINE_SECONDS}s of repeated publishes"
+        )
+    for ws in sockets:
+        _drain(ws)
 
 
 async def _account(client) -> tuple[uuid.UUID, uuid.UUID, str]:
@@ -121,8 +188,10 @@ async def test_a_socket_closes_when_its_access_token_expires(require_infra):
         short = _token_lasting(SHORT_LIFETIME, user_id, session_id)
         try:
             with client.websocket_connect(f"/ws/orders?token={short}") as ws:
-                await publish(channel_name("orders", str(user_id)), {"event": "before"})
-                assert _receive_json(ws, "the first order event") == {"event": "before"}, "fixture: the stream must work first"
+                await _publish_until_received(
+                    [ws], channel_name("orders", str(user_id)), {"event": "before"},
+                    "fixture: the stream must work first",
+                )
 
                 await asyncio.sleep(SHORT_LIFETIME + 1.0)
 
@@ -145,8 +214,10 @@ async def test_every_authenticated_channel_gets_the_same_deadline(require_infra)
         short = _token_lasting(SHORT_LIFETIME, user_id, session_id)
         try:
             with client.websocket_connect(f"/ws/market?symbol=TESTSYM&token={short}") as ws:
-                await publish(channel_name("market", "TESTSYM"), {"tick": 1})
-                assert _receive_json(ws, "the first market tick") == {"tick": 1}, "fixture: the stream must work first"
+                await _publish_until_received(
+                    [ws], channel_name("market", "TESTSYM"), {"tick": 1},
+                    "fixture: the stream must work first",
+                )
 
                 await asyncio.sleep(SHORT_LIFETIME + 1.0)
                 await publish(channel_name("market", "TESTSYM"), {"tick": 2})
@@ -185,17 +256,14 @@ async def test_the_deadline_is_the_tokens_own_not_a_fixed_timeout(require_infra)
         try:
             with client.websocket_connect(f"/ws/orders?token={short}") as short_ws:
                 with client.websocket_connect(f"/ws/orders?token={longer}") as long_ws:
-                    # A relay subscribes to Redis after the handshake
-                    # returns, and pub/sub has no history: a message
-                    # published before the second subscription lands
-                    # reaches only the first socket. Measured -- without
-                    # this settle the second socket blocked through the
-                    # publish. Nothing about the fix, just what a fan-out
-                    # relay is.
-                    await asyncio.sleep(0.3)
-                    await publish(channel_name("orders", str(user_id)), {"event": "before"})
-                    assert _receive_json(short_ws, "short socket, before") == {"event": "before"}
-                    assert _receive_json(long_ws, "long socket, before") == {"event": "before"}
+                    # Both sockets must have subscribed before a publish
+                    # counts -- see `_publish_until_received`. This used to
+                    # be `asyncio.sleep(0.3)`, which the measured 0.52s
+                    # handshakes could outrun.
+                    await _publish_until_received(
+                        [short_ws, long_ws], channel_name("orders", str(user_id)),
+                        {"event": "before"}, "both sockets, before expiry",
+                    )
 
                     await asyncio.sleep(SHORT_LIFETIME + 1.0)
                     await publish(channel_name("orders", str(user_id)), {"event": "after"})

@@ -12042,6 +12042,56 @@ rows as DOWN (the NOT_CONFIGURED tests and 1 mapping row), and the outage
 guard re-raising instead of degrading (the outage test — which fails
 rather than hangs).
 
+### A flake fixed in passing: the websocket expiry tests lost their first publish
+
+Round 177's second verification run came back `1 failed, 1444 passed`
+(`test_a_socket_closes_when_its_access_token_expires`), where the first had
+been clean. Nothing to do with `/health` — a pre-existing flake in round
+156's own test file, surfaced by this round's verification, so it is fixed
+here rather than left to fail somebody else's run.
+
+Diagnosed by measurement after two wrong guesses. The first guess was that
+the 3-second token could not survive setup; measured mint-to-first-receive
+was **0.02–0.03s**, which falsified it. The second was the Redis
+subscription race; a probe reported 5 of 5 delivered, which looked clean —
+but it used 300-second tokens and too few trials. Re-measured properly
+under 8 cores of load, still on 300-second tokens so expiry could not
+confound the result:
+
+```
+8 of 10 delivered, worst 0.52s
+2 of 10 NEVER ARRIVED within 30s
+```
+
+So the publish really is lost, about 20% of the time under load: a relay
+subscribes to Redis *after* its handshake returns, and pub/sub has no
+history, so there is nothing to redeliver. On the short-lived tokens these
+tests use, that loss does not look like a lost message — `_receive_json`
+waits, the expiry watcher closes the socket at `SHORT_LIFETIME`, and the
+fixture assertion fails with `WebSocketDisconnect`. The saved traceback
+showed exactly that: `{'code': 1000, 'type': 'websocket.close'}`.
+
+Raising `SHORT_LIFETIME` would therefore have been the wrong fix — it would
+only have relabelled the flake as "nothing arrived". The file had also
+papered over the same race in one test with `asyncio.sleep(0.3)`, a margin
+the measured 0.52s handshakes can outrun.
+
+`_publish_until_received` republishes until every socket has the message,
+then drains duplicates (a leftover copy would make a later
+`_expect_closed` report the socket still open). Once the subscription
+lands the next publish delivers, so no timing assumption remains.
+`SHORT_LIFETIME` goes 3.0 → 6.0 purely to give that 2.5s retry budget
+headroom: a successful first receive now always has ≥3.5s of validity in
+hand.
+
+Verified against the failure, not just asserted: under the same 8-core
+load that previously failed 2 runs in 3, the file passed **4 of 4**. The
+file costs ~40s instead of ~22s, from the four post-expiry sleeps tracking
+the longer lifetime. And because this changed the mechanics of tests that
+exist to prove round 156's fix, round 156's original bug was re-injected —
+the deadline task never started — and 3 of the file's tests still fail, so
+their coverage survived the change.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

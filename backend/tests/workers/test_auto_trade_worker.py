@@ -440,8 +440,26 @@ async def test_supervisor_caps_trades_per_day_account_wide_across_instruments(db
         ), "expected a rejected RiskEvent naming max_trades_per_day"
 
         # The counter itself is shared, not duplicated per engine.
-        assert len(supervisor._risk_windows) == 1
-        assert next(iter(supervisor._risk_windows.values())).trades_today == 1
+        #
+        # Scoped to this user, as every sibling assertion in
+        # tests/workers/test_auto_trade_risk_window_restart.py already is.
+        # `len(supervisor._risk_windows) == 1` asserted that THIS user's
+        # window is the only one in the whole process, which is a claim
+        # about the database rather than about the code: `run_once`
+        # iterates every auto-trading user it finds, so one left behind by
+        # any other test failed this (measured: 6 windows, 5 of them
+        # strangers'). The claim that matters is below it and is not
+        # weakened -- this user ran TWO engines, one per instrument, and
+        # their shared window counted ONE trade. A window per engine makes
+        # that 2.
+        fed = {str(db_instrument.id), str(second_instrument_id)}
+        engines_on_the_fed_instruments = {
+            key for key in supervisor._engines if key[0] == str(user_id) and key[2] in fed
+        }
+        assert len(engines_on_the_fed_instruments) == 2, (
+            f"expected one engine per fed instrument, got {engines_on_the_fed_instruments}"
+        )
+        assert supervisor._risk_windows[str(user_id)].trades_today == 1
     finally:
         await _cleanup(user_id)
         async with async_session_factory() as db:

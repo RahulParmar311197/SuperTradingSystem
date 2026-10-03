@@ -51,7 +51,7 @@ from app.core.metrics import ORDER_COUNT, RISK_REJECTION_COUNT
 from app.database.models.instruments import Instrument, MarketType, OptionType
 from app.database.models.market import Candle as CandleRow
 from app.database.models.notifications import Notification
-from app.database.models.risk import AuditLog, RiskEvent
+from app.database.models.risk import AuditLog, RiskDecision, RiskEvent
 from app.database.models.strategy import Strategy as StrategyRow
 from app.database.models.strategy import StrategyVersion
 from app.database.models.trading import Order, OrderEvent, Position
@@ -238,6 +238,39 @@ async def _capped_rejections(user_id: uuid.UUID) -> list[RiskEvent]:
     return [e for e in events if e.checks is not None and e.checks.get("max_trades_per_day") is False]
 
 
+async def _rejections_written_between(start: datetime, end: datetime) -> list[RiskEvent]:
+    """Every REJECT row written in a window, by ANY user.
+
+    `RISK_REJECTION_COUNT` is a process-wide counter with no user label,
+    so a delta on it cannot be attributed to one account -- and
+    `AutoTradeSupervisor.run_once` iterates every auto-trading user it
+    finds, not just the one under test. Comparing the delta against the
+    test user's own rows therefore asserts something about the contents
+    of the database (that nobody else is eligible) rather than about the
+    code, and it failed the moment another test's user was left behind:
+    the counter moved 7 while this user had written 2.
+
+    Counting every REJECT row in the window keeps the claim exact and
+    one-for-one -- which is the actual parity being guarded -- while
+    surviving a second actor. Sound here because the only thing running
+    inside the window is this supervisor, and the autonomous path is one
+    the counter is supposed to count; `/paper` is deliberately excluded
+    (round 164) but no `/paper` session is driven during this window.
+    """
+    async with async_session_factory() as db:
+        return list(
+            (
+                await db.execute(
+                    select(RiskEvent).where(
+                        RiskEvent.decision == RiskDecision.REJECT,
+                        RiskEvent.created_at >= start,
+                        RiskEvent.created_at <= end,
+                    )
+                )
+            ).scalars().all()
+        )
+
+
 # --- the finding ----------------------------------------------------------
 
 
@@ -294,15 +327,21 @@ async def test_an_autonomous_rejection_reaches_the_rejection_counter(require_inf
 
         await _feed(supervisor, a.id, candles, 9)
 
+        window_start = datetime.now(timezone.utc)
         before = _rejections()
         await _feed(supervisor, b.id, candles, 9)
         after = _rejections()
+        window_end = datetime.now(timezone.utc)
 
         capped = await _capped_rejections(user_id)
         # Non-vacuity: the run must really have produced refusals naming
         # the cap, or this test would pass on a supervisor that did nothing.
         assert capped, "the second instrument must have been refused by max_trades_per_day"
-        assert after - before == float(len(capped)), (
+        # Counted across every user, not just this one -- the counter has no
+        # user label and this supervisor drives every eligible account.
+        # See `_rejections_written_between`.
+        written = await _rejections_written_between(window_start, window_end)
+        assert after - before == float(len(written)), (
             "every autonomous risk rejection must reach the counter, one for one"
         )
     finally:

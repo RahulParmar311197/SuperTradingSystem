@@ -12092,6 +12092,164 @@ exist to prove round 156's fix, round 156's original bug was re-injected —
 the deadline task never started — and 3 of the file's tests still fail, so
 their coverage survived the change.
 
+## Round 178: the orders autonomous and paper trading actually submit
+
+`persist_order` had exactly three callers and all three were request
+handlers — `app/api/orders.py` twice and `app/api/options.py` once.
+Neither `AutoTradeSupervisor` nor the paper engine's callers ever reached
+it, so **no autonomous or sandbox order was journaled at all**. Measured
+on a supervisor run that opened and closed one position on each of two
+instruments:
+
+```
+POSITIONS:  2   A and B, both opened and closed
+TRADE rows: 2   A and B, source=auto_trade, pnl=2000.00, mode=PAPER
+ORDER ROWS: 0
+```
+
+Two real fills, correctly journaled as trades, and nothing in `orders`.
+`GET /admin/orders` (blueprint §116) is where an operator reviews what was
+actually submitted, and autonomous trading — the one path running
+unattended with nobody watching it — was the one path absent from it. A
+`trades` row is not a substitute: it records a completed round trip, so it
+cannot show an order that was submitted and refused, and it only appears
+once the position closes. Same shape as round 164 for the risk/order
+counters and round 177 for `GET /health`: the unwatched path was also the
+invisible one.
+
+After, same probe: `ORDER ROWS: 4` — entry and exit for each instrument,
+four distinct keys.
+
+**The idempotency key had to change first**, and that is why the two
+halves are one change rather than two. `_maybe_enter` built its key as
+`{account}:{strategy}:{timestamp}` with no symbol, while the closing key
+two methods down always named one. The supervisor runs one engine per
+(strategy, instrument) sharing an `account_id`, and two instruments on one
+timeframe necessarily share bar timestamps — so one strategy entering on
+two instruments on the same bar computed **one key for two different
+orders**. That was harmless only while nothing persisted them.
+`persist_order` selects on `idempotency_key` and UPDATEs the row it finds,
+so journaling without fixing the key first would have folded the second
+instrument's entry into the first one's row. The keys now read:
+
+```
+...:Bullish FVG retest:ABR91CA75A:2026-10-03T04:35:00+00:00
+...:Bullish FVG retest:ABR502BCCE:2026-10-03T04:35:00+00:00
+```
+
+The engine itself cannot persist — it holds no DB session — so
+`PaperTradeOutcome` carries the entry and closing `OrderRecord`s out to the
+callers that do, exactly as it already carries `order_status`,
+`risk_checks` and `exit_reason` for the same reason.
+
+`strategy_version` on an order is the version live when **that order** was
+submitted, which is what an order is: a point-in-time instruction. The
+`Trade` row keeps round 173's different and deliberate rule — the version
+that OPENED the position.
+
+A judgment call, stated rather than buried: round 164 deliberately kept the
+`/paper` sandbox OUT of the process-wide Prometheus counters, because one
+replay could emit thousands of increments and drown the signal those
+counters carry. This extends order journaling TO `/paper` anyway, because a
+table row is filterable by `execution_mode` and by user where an unlabelled
+counter is not, and because `/paper` already journals its trades and
+positions — orders were the inconsistent omission, not a new inclusion.
+
+### The suite failure that was not the change, and what it was
+
+Mid-round the suite went from 1445 passing to **25 failures**, every one in
+`tests/workers/test_auto_trade_*`, all of the shape `assert closed_pnl is
+not None` → `assert None is not None`. Reverting all three production files
+to `HEAD~1` left the failures exactly in place, which is what identified
+them as environmental rather than a regression — reading the diff would not
+have.
+
+The cause is a test-isolation defect worth recording because it is
+self-reinforcing. `instruments` has ten incoming foreign keys and no
+cascade delete, and two actors write against **every active instrument**
+rather than one they were handed:
+
+- `ScannerWorker` (`app/workers/scanner_worker.py:48`) selects every
+  `Instrument.active.is_(True)` and writes `Signal` and `Setup` rows keyed
+  by `instrument_id` alone. Those rows belong to no user, so no user-scoped
+  delete can reach them.
+- `AutoTradeSupervisor.run_once` (`app/workers/auto_trade_worker.py:214`)
+  does the same select and pairs *every eligible user's* strategies with
+  it, so another test's user holds positions and orders on an instrument
+  this test created.
+
+A teardown that deletes only its own user's rows and then the instrument
+therefore raises on the instrument — and the **rollback** is the damage,
+not the raise. The instrument survives *with its candles*, and a 15m bar
+stays inside `MAX_CANDLE_AGE_IN_BARS` for a full hour. For that hour the
+leaked instrument is live, tradeable input for every later test: the
+supervisor pairs it with each new test's brand-new user and, because round
+79 seeds a fresh engine with the instrument's whole stored history, fires
+an entry on the very first bar that test feeds. Measured against three
+leaked `XPA*` instruments, driving a brand-new user with its own
+brand-new instrument:
+
+```
+bar 0   results for my user: 4
+        my instrument order_created=False
+        three FOREIGN instruments order_created=True
+bars 1-9  my instrument order_created=False on every bar,
+        including bar 8, its entry bar
+```
+
+The stray fills consumed the account-wide book the supervisor shares per
+user, so the test's own entry never filled and its exit never came. The
+leak is confirmed in the other direction too: once those candles aged past
+the freshness window the same file went from 1 passing to **12 of 13**
+with no code change at all.
+
+`tests/instrument_cleanup.py::purge_instrument` deletes every referencing
+row child-first and scoped by instrument, and both teardowns that delete
+instruments now use it. The thirteenth test was a separate isolation
+assumption in the same family: `assert len(supervisor._risk_windows) == 1`
+is a claim about the database, not the code, since `run_once` iterates
+every auto-trading user it finds (measured: 6 windows, 5 of them
+strangers'). It is now scoped to the user under test, keeping the
+non-vacuous half — two engines, one shared window, `trades_today == 1`.
+
+Two further sites in the same family, both found by running the whole
+suite rather than by reading: `tests/api/test_money_field_bounds.py` was
+an eighth cleanup needing the `orders`/`order_events` deletes this
+round's journaling requires, and
+`test_an_autonomous_rejection_reaches_the_rejection_counter` compared a
+delta on the process-wide `RISK_REJECTION_COUNT` -- which carries no user
+label -- against *one user's* `RiskEvent` rows. `run_once` drives every
+eligible account, so that asserted something about the database rather
+than about the code, and it failed as soon as another test's user was
+left behind: the counter moved 7 while this user had written 2. It now
+counts every REJECT row written inside the measured window, by any user,
+which keeps the parity claim exact and one-for-one while surviving a
+second actor.
+
+### Every claim here injected back, in both directions
+
+Four injections, each run against the tests that are supposed to carry it:
+
+| injected | result |
+| --- | --- |
+| the autonomous `persist_order` loop removed | both auto-trade journal tests **fail** |
+| the symbol taken back out of the entry key | the two-instrument test **fails with 3 order rows, not 4**; the single-instrument test still **passes** |
+| the `/paper` `persist_order` loop removed | the `/paper` test **fails**; both auto-trade tests still **pass** |
+| `purge_instrument` stops deleting `signals`/`setups` | the teardown tests **fail** on a real `setups_instrument_id_fkey` violation |
+
+The second row is the one worth reading twice. The single-instrument test
+passes under that injection and *should* — a symbol-less key is still
+unique when there is only one symbol, so that test structurally cannot
+see this bug and the two-instrument test is the only thing covering it.
+The `3` is the collapse itself: two entries folded onto one key, leaving
+one entry row and two exit rows for two real fills. It also shows the two
+halves of this round are genuinely coupled rather than bundled —
+journaling without the key fix produces a journal that is *wrong*, not
+one that is missing.
+
+Rows three and four are the two-layer check: neither layer's tests cover
+the other, so removing either is caught by its own and only its own.
+
 ## Multi-leg options execution (§37-40)
 
 `POST /options/execute` takes the legs a client already built via

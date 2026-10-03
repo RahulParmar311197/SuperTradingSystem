@@ -63,7 +63,6 @@ from app.auth.security import hash_password
 from app.core.config import get_settings
 from app.core.redis import _TRADE_LOCK_PREFIX, acquire_trade_lock, get_redis, release_trade_lock, set_latest_price
 from app.database.models.instruments import Instrument, MarketType
-from app.database.models.market import Candle as CandleRow
 from app.database.models.notifications import Notification
 from app.database.models.risk import AuditLog, RiskEvent
 from app.database.models.strategy import Strategy as StrategyRow
@@ -77,6 +76,7 @@ from app.market.repository import upsert_candles
 from app.smc.types import Candle
 from app.workers import auto_trade_worker
 from app.workers.auto_trade_worker import AutoTradeSupervisor
+from tests.instrument_cleanup import purge_instrument
 
 # Every wait in this file is bounded. A control that hangs reports
 # nothing, and the regression guarded here is precisely the kind that can
@@ -264,9 +264,18 @@ async def _cleanup(user_id: uuid.UUID, instruments: list[Instrument]) -> None:
         for model in (Notification, RiskEvent, AuditLog, UserSession, StrategyRow):
             await db.execute(delete(model).where(model.user_id == user_id))
         await db.execute(delete(User).where(User.id == user_id))
+        # Scoped by instrument, not by user. The user-scoped deletes above
+        # cannot reach the `signals`/`setups` rows `ScannerWorker` writes
+        # against every active instrument (they belong to no user), nor
+        # the positions another eligible user's supervisor opened here --
+        # and with either of those left, `delete(Instrument)` raises and
+        # takes this whole transaction, user included, down with it. The
+        # instrument then survives *with its candles*, which stay inside
+        # the supervisor's freshness window for an hour and silently
+        # trade against every test that runs next. See
+        # tests/instrument_cleanup.py.
         for row in instruments:
-            await db.execute(delete(CandleRow).where(CandleRow.instrument_id == row.id))
-            await db.execute(delete(Instrument).where(Instrument.id == row.id))
+            await purge_instrument(db, row.id)
         await db.commit()
     for cache in (orders_module._STACKS, orders_module._STACK_LOCKS, orders_module._TRADE_LOCKS):
         cache.pop(user_id, None)

@@ -5,13 +5,10 @@ from __future__ import annotations
 import uuid
 
 import pytest
-from sqlalchemy import delete
 
 from app.database.models.instruments import Instrument, MarketType
-from app.database.models.market import Candle as CandleRow
-from app.database.models.strategy import Setup as SetupRow
-from app.database.models.strategy import Signal as SignalRow
 from app.database.session import async_session_factory
+from tests.instrument_cleanup import purge_instrument
 
 
 @pytest.fixture
@@ -27,10 +24,14 @@ async def db_instrument(require_infra):
         await db.commit()
         await db.refresh(instrument)
         yield instrument
-        # clear anything the test created that references this instrument,
-        # since the schema intentionally has no cascade delete here
-        await db.execute(delete(SignalRow).where(SignalRow.instrument_id == instrument.id))
-        await db.execute(delete(SetupRow).where(SetupRow.instrument_id == instrument.id))
-        await db.execute(delete(CandleRow).where(CandleRow.instrument_id == instrument.id))
-        await db.delete(instrument)
+        # Clear everything referencing this instrument, since the schema
+        # intentionally has no cascade delete here. Scoped by instrument,
+        # not by user: `AutoTradeSupervisor.run_once` pairs *every*
+        # eligible user with every active instrument, so another test's
+        # user routinely holds positions/orders here. Leaving those
+        # behind made `delete(instrument)` raise
+        # `positions_instrument_id_fkey` and roll the whole teardown
+        # back, leaking the instrument *with its fresh candles* -- see
+        # tests/instrument_cleanup.py for what that then cost.
+        await purge_instrument(db, instrument.id)
         await db.commit()

@@ -9,9 +9,10 @@ from app.database.models.instruments import Instrument, MarketType
 from app.database.models.notifications import Notification, NotificationType
 from app.database.models.risk import AuditLog, RiskEvent
 from app.database.models.risk import RiskDecision as RiskEventDecision
+from app.database.models.strategy import Direction
 from app.database.models.strategy import Strategy as StrategyRow
 from app.database.models.strategy import StrategyVersion as StrategyVersionRow
-from app.database.models.trading import ExecutionMode, Position, Trade
+from app.database.models.trading import ExecutionMode, Order, OrderStatus, Position, Trade
 from app.database.models.users import User, UserSession
 from app.database.session import async_session_factory
 from app.main import app
@@ -232,6 +233,70 @@ async def test_paper_trading_persists_trade_and_notification_on_close(require_in
                 # comment on _SETUP), so this must be TP_HIT specifically,
                 # not the generic POSITION_CLOSED every close used to fire
                 # regardless of which side of the bracket actually closed it.
+        finally:
+            await _cleanup([user_id], [strategy_id], instrument.id)
+
+
+async def test_paper_trading_journals_the_orders_it_submits(require_infra):
+    # Round 178: the sandbox journaled its `trades` and its `positions`
+    # and not the orders in between. `persist_order` had three callers
+    # and all three were in app/api/orders.py and app/api/options.py, so
+    # a /paper session's real `execution_engine.submit` calls left
+    # nothing behind -- a `trades` row says a round trip completed, and
+    # cannot show the instruction that produced it.
+    #
+    # A JUDGMENT CALL worth restating here because it is the opposite of
+    # round 164's: that round deliberately kept /paper OUT of the
+    # process-wide Prometheus counters, since one replay could emit
+    # thousands of unlabelled increments. An `orders` row is filterable
+    # by `execution_mode` and by user, where a counter is not, so the
+    # same objection does not apply -- and /paper already journals its
+    # trades and positions, which is what made orders the inconsistent
+    # omission rather than a new inclusion.
+    with TestClient(app) as client:
+        token, user_id = await _register(client, "paperorders")
+        headers = {"Authorization": f"Bearer {token}"}
+        instrument = await _make_instrument()
+        strategy_id = await _create_strategy(client, headers, instrument.symbol)
+
+        try:
+            r = client.post("/paper", json={"strategy_id": str(strategy_id), "symbol": instrument.symbol}, headers=headers)
+            assert r.status_code == 200, r.text
+            session_id = r.json()["session_id"]
+
+            start = datetime(2026, 1, 5, 9, 15, tzinfo=timezone.utc)
+            for i, (o, h, low, c) in enumerate(_SETUP):
+                ts = (start + timedelta(minutes=i)).isoformat()
+                r = client.post(
+                    f"/paper/{session_id}/candle",
+                    json={"timestamp": ts, "open": o, "high": h, "low": low, "close": c, "volume": 10},
+                    headers=headers,
+                )
+                assert r.status_code == 200, r.text
+
+            async with async_session_factory() as db:
+                orders = (
+                    await db.execute(
+                        select(Order).where(Order.user_id == user_id).order_by(Order.created_at)
+                    )
+                ).scalars().all()
+
+            # The measurement this test exists for: this was 0.
+            assert len(orders) == 2, f"expected an entry and an exit order row, got {len(orders)}"
+            entry, exit_ = orders
+            assert entry.direction is Direction.LONG
+            assert exit_.direction is Direction.SHORT
+            assert len({order.idempotency_key for order in orders}) == 2
+            for order in orders:
+                # Measured, not assumed. `ExecutionEngine.submit`
+                # (app/trading/execution.py:72) moves ANY fully-filled
+                # order on to MONITORING, the closing one included.
+                assert order.status is OrderStatus.MONITORING
+                assert order.execution_mode is ExecutionMode.PAPER
+                assert order.instrument_id == instrument.id
+                assert order.strategy_id == strategy_id
+                # `persist_order`'s own docstring: None for paper.
+                assert order.broker_account_id is None
         finally:
             await _cleanup([user_id], [strategy_id], instrument.id)
 

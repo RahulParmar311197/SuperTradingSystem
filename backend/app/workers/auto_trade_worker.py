@@ -59,6 +59,7 @@ from app.trading.persistence import (
     load_auto_trade_entries_since,
     load_auto_trade_realized_pnl_since,
     load_open_positions,
+    persist_order,
     persist_position,
     risk_window_starts,
 )
@@ -629,6 +630,36 @@ class AutoTradeSupervisor:
                 await persist_position(
                     db, user.id, instrument.id, position_after, execution_mode=ExecutionMode.PAPER, source_key=AUTO_SOURCE_KEY
                 )
+
+            # Mirror whatever orders this candle produced into `orders`,
+            # beside the position above and for the same reason.
+            # `persist_order`'s only callers were the three request
+            # handlers, so no autonomous order was ever journaled at all.
+            # Measured on a full run that opened and closed two positions
+            # on two instruments: 2 `positions` rows, 2 `trades` rows, and
+            # 0 `orders` rows. `GET /admin/orders` (blueprint §116) is
+            # where an operator reviews what was actually submitted, and
+            # autonomous trading -- the one path with nobody watching it --
+            # was the one path absent from it. A `trades` row only records
+            # a completed round trip; it cannot show an order that was
+            # submitted and rejected.
+            #
+            # `strategy_version` here is the version live when THIS order
+            # was submitted, which is what an order is: a point-in-time
+            # instruction. The `Trade` row further down keeps round 173's
+            # different and equally deliberate rule -- the version that
+            # OPENED the position, not whatever is current at its close.
+            for submitted in (outcome.entry_order, outcome.exit_order):
+                if submitted is not None:
+                    await persist_order(
+                        db,
+                        submitted,
+                        user.id,
+                        instrument.id,
+                        strategy_id=strategy_row.id,
+                        strategy_version=strategy_row.version,
+                        execution_mode=ExecutionMode.PAPER,
+                    )
 
             if outcome.risk_checks is not None:
                 # Same audit gap and fix as app/api/paper.py's feed_candle -- this

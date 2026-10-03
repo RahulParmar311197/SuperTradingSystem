@@ -38,10 +38,9 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 
 from app.database.models.instruments import Instrument, MarketType
-from app.database.models.market import Candle as CandleRow
 from app.database.models.notifications import Notification
 from app.database.models.risk import AuditLog, RiskEvent
 from app.database.models.strategy import Strategy as StrategyRow
@@ -52,6 +51,7 @@ from app.database.session import async_session_factory
 from app.main import app
 from app.market.repository import upsert_candles
 from app.smc.types import Candle
+from tests.instrument_cleanup import purge_instrument
 
 pytestmark = pytest.mark.asyncio
 
@@ -141,6 +141,15 @@ def _post_raw(client: TestClient, headers: dict, path: str, body: str):
 async def _cleanup(user_ids: list[uuid.UUID], strategy_ids: list[str], instrument_ids: list[uuid.UUID]) -> None:
     async with async_session_factory() as db:
         for user_id in user_ids:
+            # Round 178 journals paper/auto fills into `orders`, and
+            # `order_events` FKs to those, so both must go before the
+            # strategy/instrument/user rows they reference -- without this
+            # the deletes below raise orders_strategy_id_fkey.
+            await db.execute(
+                text("DELETE FROM order_events WHERE order_id IN (SELECT id FROM orders WHERE user_id = :u)"),
+                {"u": user_id},
+            )
+            await db.execute(text("DELETE FROM orders WHERE user_id = :u"), {"u": user_id})
             for model in (Trade, Position, RiskEvent, Notification, AuditLog, UserSession):
                 await db.execute(delete(model).where(model.user_id == user_id))
         for strategy_id in strategy_ids:
@@ -149,9 +158,9 @@ async def _cleanup(user_ids: list[uuid.UUID], strategy_ids: list[str], instrumen
             await db.execute(delete(StrategyRow).where(StrategyRow.id == sid))
         for user_id in user_ids:
             await db.execute(delete(User).where(User.id == user_id))
+        # Scoped by instrument, not by user -- see tests/instrument_cleanup.py.
         for instrument_id in instrument_ids:
-            await db.execute(delete(CandleRow).where(CandleRow.instrument_id == instrument_id))
-            await db.execute(delete(Instrument).where(Instrument.id == instrument_id))
+            await purge_instrument(db, instrument_id)
         await db.commit()
 
 

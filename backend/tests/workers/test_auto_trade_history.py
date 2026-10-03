@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 
 from app.auth.security import hash_password
 from app.database.models.instruments import Instrument, MarketType
@@ -142,6 +142,15 @@ async def _seed_bars(symbol: str, bars) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID
 
 async def _cleanup(instrument_id: uuid.UUID, user_id: uuid.UUID, strategy_id: uuid.UUID) -> None:
     async with async_session_factory() as db:
+        # Round 178 journals paper/auto fills into `orders`, and
+        # `order_events` FKs to those, so both must go before the
+        # strategy/instrument/user rows they reference -- without this the
+        # deletes below raise orders_strategy_id_fkey.
+        await db.execute(
+            text("DELETE FROM order_events WHERE order_id IN (SELECT id FROM orders WHERE user_id = :u)"),
+            {"u": user_id},
+        )
+        await db.execute(text("DELETE FROM orders WHERE user_id = :u"), {"u": user_id})
         for model in (TradeRow, Position, RiskEvent, Notification, AuditLog):
             await db.execute(delete(model).where(model.user_id == user_id))
         await db.execute(delete(SignalRow).where(SignalRow.instrument_id == instrument_id))

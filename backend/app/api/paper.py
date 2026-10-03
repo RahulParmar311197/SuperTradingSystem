@@ -25,6 +25,7 @@ from app.api.stored_strategies import parse_stored_definition
 from app.trading.persistence import (
     PAPER_SANDBOX_TRADE_SOURCE,
     abandon_position_mirrors,
+    persist_order,
     persist_position,
 )
 
@@ -204,6 +205,33 @@ async def feed_candle(
             # two independent engines with their own MockBroker balances.
             source_key=f"paper:{session_id}",
         )
+
+    # The order journal, beside the position above and for the same reason:
+    # `persist_order`'s only callers were request handlers that place orders
+    # directly, so a sandbox fill -- like an autonomous one -- never reached
+    # `orders` at all, and `GET /admin/orders` (blueprint §116) could not
+    # show it. `execution_mode=PAPER` and the session-scoped `source_key` on
+    # the position beside it are what keep these distinguishable from the
+    # account's own trading; round 164's decision to keep the sandbox OUT of
+    # the process-wide Prometheus counters does not apply here, because a
+    # table row is filterable by exactly those columns where a counter
+    # with no user label is not.
+    #
+    # The session pins `strategy_version` when it is created (the reference
+    # implementation round 173 pointed the autonomous path at), so this is
+    # both the version live at submission and the version that opened the
+    # position.
+    for submitted in (outcome.entry_order, outcome.exit_order):
+        if submitted is not None:
+            await persist_order(
+                db,
+                submitted,
+                user.id,
+                session.instrument_id,
+                strategy_id=session.strategy_id,
+                strategy_version=session.strategy_version,
+                execution_mode=ExecutionMode.PAPER,
+            )
 
     if outcome.risk_checks is not None:
         # Blueprint's `risk_events` table (see AI_TRADING_PLATFORM_BLUEPRINT.md)

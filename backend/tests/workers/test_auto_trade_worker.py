@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 
 from app.auth.security import hash_password
 from app.database.models.instruments import Instrument, MarketType
@@ -80,6 +80,15 @@ def _recent_start() -> datetime:
 
 async def _cleanup(user_id: uuid.UUID) -> None:
     async with async_session_factory() as db:
+        # Round 178 journals paper/auto fills into `orders`, and
+        # `order_events` FKs to those, so both must go before the
+        # strategy/instrument/user rows they reference -- without this the
+        # deletes below raise orders_strategy_id_fkey.
+        await db.execute(
+            text("DELETE FROM order_events WHERE order_id IN (SELECT id FROM orders WHERE user_id = :u)"),
+            {"u": user_id},
+        )
+        await db.execute(text("DELETE FROM orders WHERE user_id = :u"), {"u": user_id})
         await db.execute(delete(Position).where(Position.user_id == user_id))
         await db.execute(delete(TradeRow).where(TradeRow.user_id == user_id))
         await db.execute(delete(Notification).where(Notification.user_id == user_id))
@@ -431,8 +440,26 @@ async def test_supervisor_caps_trades_per_day_account_wide_across_instruments(db
         ), "expected a rejected RiskEvent naming max_trades_per_day"
 
         # The counter itself is shared, not duplicated per engine.
-        assert len(supervisor._risk_windows) == 1
-        assert next(iter(supervisor._risk_windows.values())).trades_today == 1
+        #
+        # Scoped to this user, as every sibling assertion in
+        # tests/workers/test_auto_trade_risk_window_restart.py already is.
+        # `len(supervisor._risk_windows) == 1` asserted that THIS user's
+        # window is the only one in the whole process, which is a claim
+        # about the database rather than about the code: `run_once`
+        # iterates every auto-trading user it finds, so one left behind by
+        # any other test failed this (measured: 6 windows, 5 of them
+        # strangers'). The claim that matters is below it and is not
+        # weakened -- this user ran TWO engines, one per instrument, and
+        # their shared window counted ONE trade. A window per engine makes
+        # that 2.
+        fed = {str(db_instrument.id), str(second_instrument_id)}
+        engines_on_the_fed_instruments = {
+            key for key in supervisor._engines if key[0] == str(user_id) and key[2] in fed
+        }
+        assert len(engines_on_the_fed_instruments) == 2, (
+            f"expected one engine per fed instrument, got {engines_on_the_fed_instruments}"
+        )
+        assert supervisor._risk_windows[str(user_id)].trades_today == 1
     finally:
         await _cleanup(user_id)
         async with async_session_factory() as db:
